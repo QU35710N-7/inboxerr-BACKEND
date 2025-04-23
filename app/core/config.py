@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     API_KEY_HEADER: str = "X-API-Key"
     
     # Database
-    DATABASE_URL: str = "sqlite:///./inboxerr.db"
+    DATABASE_URL: str = "sqlite+aiosqlite:///./inboxerr.db"
     
     # SMS Gateway
     SMS_GATEWAY_URL: str = "https://endpointnumber1.work.gd/api/3rdparty/v1"
@@ -41,9 +41,7 @@ class Settings(BaseSettings):
     SMS_GATEWAY_PASSWORD: str = ""
     
     # Webhook
-    WEBHOOK_HOST: str = "0.0.0.0"
-    WEBHOOK_PORT: int = 5000
-    WEBHOOK_PATH: str = "/webhooks"
+    API_BASE_URL: str = "http://localhost:8000"  # Base URL for webhooks
     WEBHOOK_SIGNATURE_KEY: Optional[str] = None
     WEBHOOK_TIMESTAMP_TOLERANCE: int = 300  # 5 minutes
     

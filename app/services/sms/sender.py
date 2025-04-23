@@ -4,6 +4,7 @@ SMS sender service for interacting with the Android SMS Gateway.
 import asyncio
 import logging
 import uuid
+import time
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple, Union
 
@@ -59,7 +60,12 @@ class SMSSender:
         user_id: str,
         scheduled_at: Optional[datetime] = None,
         custom_id: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
+        campaign_id: Optional[str] = None,
+        priority: int = 0,
+        ttl: Optional[int] = None,
+        sim_number: Optional[int] = None,
+        is_encrypted: bool = False
     ) -> Dict[str, Any]:
         """
         Send a single SMS message.
@@ -71,6 +77,11 @@ class SMSSender:
             scheduled_at: Optional scheduled delivery time
             custom_id: Optional custom ID for tracking
             metadata: Optional additional data
+            campaign_id: Optional campaign ID
+            priority: Message priority (0-127, ≥100 bypasses limits)
+            ttl: Time-to-live in seconds
+            sim_number: SIM card to use (1-3)
+            is_encrypted: Whether message is encrypted
             
         Returns:
             Dict: Message details with status
@@ -91,7 +102,8 @@ class SMSSender:
             user_id=user_id,
             custom_id=custom_id,
             scheduled_at=scheduled_at,
-            metadata=metadata
+            metadata=metadata or {},
+            campaign_id=campaign_id
         )
         
         # If scheduled for future, return message details
@@ -113,11 +125,16 @@ class SMSSender:
         
         # Otherwise, send immediately
         try:
-            # Send to gateway
+            # Send to gateway - use db_message.id as custom_id for 1:1 mapping
+            # This ensures webhooks can easily find the corresponding message
             result = await self._send_to_gateway(
                 phone_number=formatted_number,
                 message_text=message_text,
-                custom_id=db_message.custom_id
+                custom_id=db_message.id,  # Use our database ID directly
+                priority=priority,
+                ttl=ttl,
+                sim_number=sim_number,
+                is_encrypted=is_encrypted
             )
             
             # Update message status
@@ -159,7 +176,8 @@ class SMSSender:
         *,
         messages: List[MessageCreate],
         user_id: str,
-        options: Optional[BatchOptions] = None
+        options: Optional[BatchOptions] = None,
+        campaign_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Send a batch of SMS messages.
@@ -168,6 +186,7 @@ class SMSSender:
             messages: List of messages to send
             user_id: User ID
             options: Optional batch processing options
+            campaign_id: Optional campaign ID
             
         Returns:
             Dict: Batch details with status
@@ -200,6 +219,7 @@ class SMSSender:
                 messages=messages,
                 user_id=user_id,
                 batch_id=batch.id,
+                campaign_id=campaign_id,
                 options=options
             )
         )
@@ -221,6 +241,7 @@ class SMSSender:
         messages: List[MessageCreate],
         user_id: str,
         batch_id: str,
+        campaign_id: Optional[str] = None,
         options: BatchOptions
     ) -> None:
         """
@@ -230,50 +251,75 @@ class SMSSender:
             messages: List of messages to send
             user_id: User ID
             batch_id: Batch ID
+            campaign_id: Optional campaign ID
             options: Batch processing options
         """
         processed = 0
         successful = 0
         failed = 0
         
-        for message in messages:
-            try:
-                # Send message
-                await self.send_message(
-                    phone_number=message.phone_number,
-                    message_text=message.message,
-                    user_id=user_id,
-                    scheduled_at=message.scheduled_at,
-                    custom_id=message.custom_id,
-                    metadata={"batch_id": batch_id}
+        # Calculate chunk size based on total messages
+        # Use smaller chunks for larger batches to avoid overwhelming the system
+        total_messages = len(messages)
+        if total_messages <= 100:
+            chunk_size = 10
+        elif total_messages <= 1000:
+            chunk_size = 25
+        else:
+            chunk_size = 50
+            
+        # Process in chunks for better performance
+        for i in range(0, total_messages, chunk_size):
+            chunk = messages[i:i+chunk_size]
+            
+            # Process chunk with concurrent tasks
+            tasks = []
+            for message in chunk:
+                # Create task for each message
+                task = asyncio.create_task(
+                    self._process_single_message(
+                        message=message,
+                        user_id=user_id,
+                        batch_id=batch_id,
+                        campaign_id=campaign_id
+                    )
                 )
-                
-                # Update counters
+                tasks.append(task)
+            
+            # Wait for all tasks to complete
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Process results
+            for result in results:
                 processed += 1
-                successful += 1
                 
-            except Exception as e:
-                # Update counters
-                processed += 1
-                failed += 1
-                
-                logger.error(f"Error in batch {batch_id}: {str(e)}")
-                
-                # Stop on first error if configured
-                if options.fail_on_first_error:
-                    break
+                if isinstance(result, Exception):
+                    # Failed message
+                    failed += 1
+                    logger.error(f"Error in batch {batch_id}: {str(result)}")
+                    
+                    # Stop on first error if configured
+                    if options.fail_on_first_error:
+                        break
+                else:
+                    # Successful message
+                    successful += 1
             
             # Update batch progress
             await self.message_repository.update_batch_progress(
                 batch_id=batch_id,
-                increment_processed=1,
-                increment_successful=1 if failed == 0 else 0,
-                increment_failed=1 if failed > 0 else 0
+                increment_processed=len(chunk),
+                increment_successful=sum(1 for r in results if not isinstance(r, Exception)),
+                increment_failed=sum(1 for r in results if isinstance(r, Exception))
             )
             
-            # Delay between messages
-            if options.delay_between_messages > 0:
-                await asyncio.sleep(options.delay_between_messages)
+            # Check if we should stop due to first error
+            if options.fail_on_first_error and failed > 0:
+                break
+                
+            # Delay between chunks to avoid overwhelming gateway
+            if i + chunk_size < total_messages:
+                await asyncio.sleep(options.delay_between_messages * 2)  # Double delay between chunks
         
         # Update batch status
         status = MessageStatus.PROCESSED
@@ -292,6 +338,7 @@ class SMSSender:
             EventType.BATCH_COMPLETED,
             {
                 "batch_id": batch_id,
+                "campaign_id": campaign_id,
                 "total": len(messages),
                 "processed": processed,
                 "successful": successful,
@@ -301,13 +348,229 @@ class SMSSender:
             }
         )
     
+    async def _process_single_message(
+        self,
+        *,
+        message: MessageCreate,
+        user_id: str,
+        batch_id: Optional[str] = None,
+        campaign_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Process a single message within a batch.
+        
+        Args:
+            message: Message to send
+            user_id: User ID
+            batch_id: Optional batch ID
+            campaign_id: Optional campaign ID
+            
+        Returns:
+            Dict: Result of message processing
+            
+        Raises:
+            Exception: Any error during processing
+        """
+        # Build metadata
+        metadata = {}
+        if batch_id:
+            metadata["batch_id"] = batch_id
+        if campaign_id:
+            metadata["campaign_id"] = campaign_id
+            
+        # Set priority based on campaign
+        # Campaigns get slightly higher priority but still below urgent messages
+        priority = 50 if campaign_id else 0
+            
+        # Send message
+        return await self.send_message(
+            phone_number=message.phone_number,
+            message_text=message.message,
+            user_id=user_id,
+            scheduled_at=message.scheduled_at,
+            custom_id=message.custom_id,
+            metadata=metadata,
+            campaign_id=campaign_id,
+            priority=priority
+        )
+    
+    async def send_messages_bulk(
+        self,
+        *,
+        messages: List[Dict[str, Any]],
+        user_id: str,
+        campaign_id: Optional[str] = None,
+        batch_id: Optional[str] = None,
+        chunk_size: int = 50
+    ) -> List[Dict[str, Any]]:
+        """
+        Send multiple messages efficiently in bulk.
+        
+        Args:
+            messages: List of message dictionaries with recipient and content
+            user_id: User ID
+            campaign_id: Optional campaign ID
+            batch_id: Optional batch ID
+            chunk_size: Number of messages to process in each chunk
+            
+        Returns:
+            List[Dict]: List of results for each message
+        """
+        results = []
+        
+        # Process in chunks
+        for i in range(0, len(messages), chunk_size):
+            chunk = messages[i:i+chunk_size]
+            chunk_results = await self._process_message_chunk(
+                messages=chunk,
+                user_id=user_id,
+                campaign_id=campaign_id,
+                batch_id=batch_id
+            )
+            results.extend(chunk_results)
+            
+            # Small delay between chunks to prevent overloading
+            if i + chunk_size < len(messages):
+                await asyncio.sleep(1)
+        
+        return results
+    
+    async def _process_message_chunk(
+        self, 
+        messages: List[Dict[str, Any]],
+        user_id: str,
+        campaign_id: Optional[str] = None,
+        batch_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Process a chunk of messages concurrently.
+        
+        Args:
+            messages: List of message dictionaries to process
+            user_id: User ID
+            campaign_id: Optional campaign ID
+            batch_id: Optional batch ID
+            
+        Returns:
+            List[Dict]: Results for each message
+        """
+        # Create tasks for all messages
+        tasks = []
+        for msg in messages:
+            # Create database entries first to get IDs
+            db_message = await self.message_repository.create_message(
+                phone_number=msg["phone_number"],
+                message_text=msg["message_text"],
+                user_id=user_id,
+                custom_id=msg.get("custom_id"),
+                scheduled_at=msg.get("scheduled_at"),
+                metadata=msg.get("metadata", {}),
+                campaign_id=campaign_id
+            )
+            
+            # Skip if scheduled for the future
+            if db_message.scheduled_at and db_message.scheduled_at > datetime.utcnow():
+                tasks.append(asyncio.create_task(
+                    asyncio.sleep(0)  # Dummy task for scheduled messages
+                ))
+                continue
+                
+            # Create task to send via gateway
+            task = asyncio.create_task(
+                self._send_message_with_error_handling(
+                    db_message=db_message,
+                    phone_number=msg["phone_number"],
+                    message_text=msg["message_text"],
+                    priority=msg.get("priority", 0),
+                    ttl=msg.get("ttl"),
+                    sim_number=msg.get("sim_number"),
+                    is_encrypted=msg.get("is_encrypted", False)
+                )
+            )
+            tasks.append(task)
+        
+        # Wait for all tasks to complete
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            return [r for r in results if not isinstance(r, Exception)]
+        
+        return []
+    
+    async def _send_message_with_error_handling(
+        self,
+        *,
+        db_message: Any,
+        phone_number: str,
+        message_text: str,
+        priority: int = 0,
+        ttl: Optional[int] = None,
+        sim_number: Optional[int] = None,
+        is_encrypted: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Send message with error handling and status updates.
+        
+        Args:
+            db_message: Database message object
+            phone_number: Recipient phone number
+            message_text: Message content
+            priority: Message priority
+            ttl: Time-to-live in seconds
+            sim_number: SIM card to use
+            is_encrypted: Whether message is encrypted
+            
+        Returns:
+            Dict: Result of message sending
+        """
+        try:
+            # Send to gateway
+            result = await self._send_to_gateway(
+                phone_number=phone_number,
+                message_text=message_text,
+                custom_id=db_message.id,  # Use database ID directly
+                priority=priority,
+                ttl=ttl,
+                sim_number=sim_number,
+                is_encrypted=is_encrypted
+            )
+            
+            # Update message status
+            await self.message_repository.update_message_status(
+                message_id=db_message.id,
+                status=result.get("status", MessageStatus.PENDING),
+                event_type="gateway_response",
+                gateway_message_id=result.get("gateway_message_id"),
+                data=result
+            )
+            
+            return result
+            
+        except Exception as e:
+            # Handle error
+            error_status = MessageStatus.FAILED
+            error_message = str(e)
+            logger.error(f"Error sending message {db_message.id}: {error_message}")
+            
+            # Update message status
+            await self.message_repository.update_message_status(
+                message_id=db_message.id,
+                status=error_status,
+                event_type="send_error",
+                reason=error_message,
+                data={"error": error_message}
+            )
+            
+            # Re-raise to be caught by caller
+            raise
+    
     async def schedule_batch_from_numbers(
         self,
         *,
         phone_numbers: List[str],
         message_text: str,
         user_id: str,
-        scheduled_at: Optional[datetime] = None
+        scheduled_at: Optional[datetime] = None,
+        campaign_id: Optional[str] = None
     ) -> str:
         """
         Schedule a batch of messages from a list of phone numbers.
@@ -317,6 +580,7 @@ class SMSSender:
             message_text: Message content
             user_id: User ID
             scheduled_at: Optional scheduled delivery time
+            campaign_id: Optional campaign ID
             
         Returns:
             str: Batch ID
@@ -349,6 +613,7 @@ class SMSSender:
         result = await self.send_batch(
             messages=messages,
             user_id=user_id,
+            campaign_id=campaign_id,
             options=BatchOptions(
                 delay_between_messages=settings.DELAY_BETWEEN_SMS,
                 fail_on_first_error=False,
@@ -416,6 +681,7 @@ class SMSSender:
             phone_number=filters.get("phone_number"),
             from_date=filters.get("from_date"),
             to_date=filters.get("to_date"),
+            campaign_id=filters.get("campaign_id"),  # Support filtering by campaign
             skip=skip,
             limit=limit
         )
@@ -534,7 +800,11 @@ class SMSSender:
         *,
         phone_number: str,
         message_text: str,
-        custom_id: str
+        custom_id: str,
+        priority: int = 0,
+        ttl: Optional[int] = None,
+        sim_number: Optional[int] = None,
+        is_encrypted: bool = False
     ) -> Dict[str, Any]:
         """
         Send message to SMS gateway.
@@ -542,7 +812,11 @@ class SMSSender:
         Args:
             phone_number: Recipient phone number
             message_text: Message content
-            custom_id: Custom ID for tracking
+            custom_id: Custom ID for tracking (usually our database ID)
+            priority: Message priority (0-127, ≥100 bypasses limits)
+            ttl: Time-to-live in seconds
+            sim_number: SIM card to use (1-3)
+            is_encrypted: Whether message is encrypted
             
         Returns:
             Dict: Gateway response
@@ -551,8 +825,9 @@ class SMSSender:
             SMSGatewayError: If there's an error sending the message
             RetryableError: If the error is temporary and can be retried
         """
-        # Enforce rate limit
-        await self._enforce_rate_limit()
+        # Enforce rate limit (only for non-high-priority messages)
+        if priority < 100:
+            await self._enforce_rate_limit()
         
         # Check if gateway client is available
         if not SMS_GATEWAY_AVAILABLE:
@@ -577,20 +852,32 @@ class SMSSender:
                     password=settings.SMS_GATEWAY_PASSWORD,
                     base_url=settings.SMS_GATEWAY_URL
                 ) as sms_client:
+                    # Build message with additional parameters
+                    message_params = {
+                        "id": custom_id,
+                        "message": message_text,
+                        "phone_numbers": [phone_number],
+                        "with_delivery_report": True,
+                        "priority": priority
+                    }
+                    
+                    # Add optional parameters if provided
+                    if ttl is not None:
+                        message_params["ttl"] = ttl
+                    if sim_number is not None:
+                        message_params["sim_number"] = sim_number
+                    if is_encrypted:
+                        message_params["is_encrypted"] = True
+                    
                     # Create message
-                    message = domain.Message(
-                        id=custom_id,
-                        message=message_text,
-                        phone_numbers=[phone_number],
-                        with_delivery_report=True
-                    )
+                    message = domain.Message(**message_params)
                     
                     # Send message
                     logger.debug(f"Sending to gateway: {phone_number}, message: {message_text[:30]}...")
                     response = await sms_client.send(message)
                     logger.debug(f"Gateway response: {response}")
                     
-                    # Check for errors
+                    # Check for errors in recipients
                     recipient_state = response.recipients[0] if response.recipients else None
                     if recipient_state and recipient_state.error:
                         raise SMSGatewayError(message=recipient_state.error)
@@ -634,13 +921,13 @@ class SMSSender:
 
 
 # Dependency injection function
-def get_sms_sender():
+async def get_sms_sender():
     """Get SMS sender service instance."""
     from app.db.session import get_repository
     from app.db.repositories.messages import MessageRepository
     from app.services.event_bus.bus import get_event_bus
     
-    message_repository = get_repository(MessageRepository)
+    message_repository = await get_repository(MessageRepository)
     event_bus = get_event_bus()
     
     return SMSSender(message_repository, event_bus)

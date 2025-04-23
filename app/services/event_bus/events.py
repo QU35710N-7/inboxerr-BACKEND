@@ -20,11 +20,22 @@ class EventType(str, Enum):
     MESSAGE_DELIVERED = "message:delivered"
     MESSAGE_FAILED = "message:failed"
     MESSAGE_SCHEDULED = "message:scheduled"
+    MESSAGE_RETRIED = "message:retried"
+    MESSAGE_RETRY_FAILED = "message:retry_failed"
     
     # Batch events
     BATCH_CREATED = "batch:created"
     BATCH_UPDATED = "batch:updated"
     BATCH_COMPLETED = "batch:completed"
+
+    # Campaign events
+    CAMPAIGN_CREATED = "campaign:created"
+    CAMPAIGN_UPDATED = "campaign:updated"
+    CAMPAIGN_STARTED = "campaign:started"
+    CAMPAIGN_PAUSED = "campaign:paused"
+    CAMPAIGN_COMPLETED = "campaign:completed"
+    CAMPAIGN_CANCELLED = "campaign:cancelled"
+    CAMPAIGN_FAILED = "campaign:failed"
     
     # SMS Gateway events
     SMS_RECEIVED = "sms:received"

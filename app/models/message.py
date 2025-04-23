@@ -18,6 +18,10 @@ class Message(Base):
     phone_number = Column(String, nullable=False, index=True)
     message = Column(Text, nullable=False)
     status = Column(String, nullable=False, default="pending", index=True)
+
+    # Campaign relationship
+    campaign_id = Column(String, ForeignKey("campaign.id"), nullable=True, index=True)
+    campaign = relationship("Campaign", back_populates="messages")
     
     # Timestamps for status tracking
     scheduled_at = Column(DateTime, nullable=True, index=True)
@@ -29,7 +33,7 @@ class Message(Base):
     reason = Column(String, nullable=True)
     gateway_message_id = Column(String, nullable=True, index=True)
     user_id = Column(String, ForeignKey("user.id"), nullable=False, index=True)
-    metadata = Column(JSON, nullable=True)
+    meta_data = Column(JSON, nullable=True)  # Changed from 'metadata' to 'meta_data'
     
     # SMS parts tracking
     parts_count = Column(Integer, default=1, nullable=False)

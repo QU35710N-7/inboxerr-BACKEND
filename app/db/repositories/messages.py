@@ -61,7 +61,7 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
             status=initial_status,
             scheduled_at=scheduled_at,
             user_id=user_id,
-            metadata=metadata or {},
+            meta_data=metadata or {},  # Use meta_data instead of metadata
             parts_count=parts_count,
             batch_id=batch_id
         )
@@ -90,19 +90,19 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
         self,
         *,
         message_id: str,
-        status: MessageStatus,
+        status: str,
         event_type: str,
         reason: Optional[str] = None,
         gateway_message_id: Optional[str] = None,
         data: Optional[Dict[str, Any]] = None
     ) -> Optional[Message]:
         """
-        Update message status and add an event.
+        Update message status.
         
         Args:
             message_id: Message ID
             status: New status
-            event_type: Event type
+            event_type: Event type triggering this update
             reason: Optional reason for status change
             gateway_message_id: Optional gateway message ID
             data: Optional additional data
@@ -110,176 +110,68 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
         Returns:
             Message: Updated message or None
         """
-        # Get message
+        # Get the message
         message = await self.get_by_id(message_id)
         if not message:
             return None
         
-        # Update fields based on status
-        update_fields = {"status": status}
-        
-        # Update timestamp based on status
+        # Update status-specific timestamp
         now = datetime.utcnow()
-        if status == MessageStatus.SENT:
-            update_fields["sent_at"] = now
-        elif status == MessageStatus.DELIVERED:
-            update_fields["delivered_at"] = now
-        elif status == MessageStatus.FAILED:
-            update_fields["failed_at"] = now
-            update_fields["reason"] = reason
-        
-        # Update gateway message ID if provided
-        if gateway_message_id:
-            update_fields["gateway_message_id"] = gateway_message_id
-        
-        # Create event data combining provided data and status-specific fields
-        event_data = data or {}
-        event_data.update({
+        update_data = {
             "status": status,
-            "timestamp": now.isoformat(),
-            "reason": reason
-        })
+            "updated_at": now,
+        }
         
-        # Create event
+        if status == MessageStatus.SENT:
+            update_data["sent_at"] = now
+        elif status == MessageStatus.DELIVERED:
+            update_data["delivered_at"] = now
+        elif status == MessageStatus.FAILED:
+            update_data["failed_at"] = now
+            update_data["reason"] = reason
+        
+        # Set gateway message ID if provided
+        if gateway_message_id:
+            update_data["gateway_message_id"] = gateway_message_id
+        
+        # Update the message
+        await self.session.execute(
+            update(Message)
+            .where(Message.id == message_id)
+            .values(**update_data)
+        )
+        
+        # Create event for status change
         event = MessageEvent(
             id=str(uuid4()),
             message_id=message_id,
             event_type=event_type,
             status=status,
-            data=event_data
+            data=data or {}
         )
         
-        # Update message
-        for field, value in update_fields.items():
-            setattr(message, field, value)
-        
-        # Save changes
-        self.session.add(message)
         self.session.add(event)
         await self.session.commit()
+        
+        # Refresh the message
         await self.session.refresh(message)
         
         return message
-    
-    async def get_message_with_events(self, message_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Get message with all its events.
-        
-        Args:
-            message_id: Message ID
-            
-        Returns:
-            Dict: Message with events or None
-        """
-        message = await self.get_by_id(message_id)
-        if not message:
-            return None
-        
-        # Get events
-        query = select(MessageEvent).where(MessageEvent.message_id == message_id).order_by(MessageEvent.created_at)
-        result = await self.session.execute(query)
-        events = result.scalars().all()
-        
-        # Convert to dict
-        message_dict = message.dict()
-        message_dict["events"] = [event.dict() for event in events]
-        
-        return message_dict
-    
-    async def get_by_custom_id(self, custom_id: str) -> Optional[Message]:
-        """
-        Get message by custom ID.
-        
-        Args:
-            custom_id: Custom ID
-            
-        Returns:
-            Message: Found message or None
-        """
-        return await self.get_by_attribute("custom_id", custom_id)
-    
-    async def get_by_gateway_id(self, gateway_id: str) -> Optional[Message]:
-        """
-        Get message by gateway message ID.
-        
-        Args:
-            gateway_id: Gateway message ID
-            
-        Returns:
-            Message: Found message or None
-        """
-        return await self.get_by_attribute("gateway_message_id", gateway_id)
-    
-    async def list_messages_for_user(
-        self,
-        *,
-        user_id: str,
-        status: Optional[str] = None,
-        phone_number: Optional[str] = None,
-        from_date: Optional[datetime] = None,
-        to_date: Optional[datetime] = None,
-        skip: int = 0,
-        limit: int = 100
-    ) -> Tuple[List[Message], int]:
-        """
-        List messages for a user with filtering and pagination.
-        
-        Args:
-            user_id: User ID
-            status: Optional status filter
-            phone_number: Optional phone number filter
-            from_date: Optional start date filter
-            to_date: Optional end date filter
-            skip: Number of records to skip
-            limit: Maximum number of records to return
-            
-        Returns:
-            Tuple[List[Message], int]: List of messages and total count
-        """
-        # Base query
-        query = select(Message).where(Message.user_id == user_id)
-        
-        # Apply filters
-        if status:
-            query = query.where(Message.status == status)
-        
-        if phone_number:
-            query = query.where(Message.phone_number == phone_number)
-        
-        if from_date:
-            query = query.where(Message.created_at >= from_date)
-        
-        if to_date:
-            query = query.where(Message.created_at <= to_date)
-        
-        # Get total count before pagination
-        count_query = select(func.count()).select_from(Message).where(query.whereclause)
-        count_result = await self.session.execute(count_query)
-        total_count = count_result.scalar_one()
-        
-        # Apply sorting and pagination
-        query = query.order_by(desc(Message.created_at)).offset(skip).limit(limit)
-        
-        # Execute query
-        result = await self.session.execute(query)
-        messages = result.scalars().all()
-        
-        return messages, total_count
-    
+
     async def create_batch(
         self,
         *,
         user_id: str,
-        name: Optional[str] = None,
-        total: int = 0
+        name: str,
+        total: int
     ) -> MessageBatch:
         """
         Create a new message batch.
         
         Args:
             user_id: User ID
-            name: Optional batch name
-            total: Total number of messages in batch
+            name: Batch name
+            total: Total number of messages
             
         Returns:
             MessageBatch: Created batch
@@ -300,7 +192,7 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
         await self.session.refresh(batch)
         
         return batch
-    
+
     async def update_batch_progress(
         self,
         *,
@@ -315,23 +207,19 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
         
         Args:
             batch_id: Batch ID
-            increment_processed: Number to increment processed count
-            increment_successful: Number to increment successful count
-            increment_failed: Number to increment failed count
+            increment_processed: Increment processed count
+            increment_successful: Increment successful count
+            increment_failed: Increment failed count
             status: Optional new status
             
         Returns:
             MessageBatch: Updated batch or None
         """
-        # Get batch
-        query = select(MessageBatch).where(MessageBatch.id == batch_id)
-        result = await self.session.execute(query)
-        batch = result.scalar_one_or_none()
-        
+        batch = await self.get_by_id(batch_id)
         if not batch:
             return None
         
-        # Update fields
+        # Update counts
         batch.processed += increment_processed
         batch.successful += increment_successful
         batch.failed += increment_failed
@@ -340,50 +228,123 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
         if status:
             batch.status = status
             
-        # Mark as completed if all messages are processed
+        # If all messages processed, update status and completion time
         if batch.processed >= batch.total:
-            batch.status = MessageStatus.PROCESSED
+            batch.status = MessageStatus.PROCESSED if batch.failed == 0 else "partial"
             batch.completed_at = datetime.utcnow()
         
-        # Save changes
         self.session.add(batch)
         await self.session.commit()
         await self.session.refresh(batch)
         
         return batch
-    
-    async def get_scheduled_messages(
-        self,
-        *,
-        limit: int = 100
-    ) -> List[Message]:
+
+    async def get_by_custom_id(self, custom_id: str) -> Optional[Message]:
         """
-        Get messages scheduled for sending.
+        Get message by custom ID.
         
         Args:
-            limit: Maximum number of messages to return
+            custom_id: Custom ID
             
         Returns:
-            List[Message]: List of scheduled messages
+            Message: Found message or None
         """
-        now = datetime.utcnow()
+        return await self.get_by_attribute("custom_id", custom_id)
+
+    async def get_by_gateway_id(self, gateway_id: str) -> Optional[Message]:
+        """
+        Get message by gateway ID.
         
-        query = select(Message).where(
-            and_(
-                Message.status == MessageStatus.SCHEDULED,
-                Message.scheduled_at <= now
-            )
-        ).order_by(Message.scheduled_at).limit(limit)
+        Args:
+            gateway_id: Gateway message ID
+            
+        Returns:
+            Message: Found message or None
+        """
+        return await self.get_by_attribute("gateway_message_id", gateway_id)
+
+    async def list_messages_for_user(
+        self,
+        *,
+        user_id: str,
+        status: Optional[str] = None,
+        phone_number: Optional[str] = None,
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+        campaign_id: Optional[str] = None,
+        skip: int = 0,
+        limit: int = 20
+    ) -> Tuple[List[Message], int]:
+        """
+        List messages for user with filtering.
         
+        Args:
+            user_id: User ID
+            status: Optional status filter
+            phone_number: Optional phone number filter
+            from_date: Optional from date filter
+            to_date: Optional to date filter
+            campaign_id: Optional campaign ID filter
+            skip: Number of records to skip
+            limit: Maximum number of records to return
+            
+        Returns:
+            Tuple[List[Message], int]: List of messages and total count
+        """
+        # Base query
+        query = select(Message).where(Message.user_id == user_id)
+        count_query = select(func.count()).select_from(Message).where(Message.user_id == user_id)
+        
+        # Apply filters
+        if status:
+            query = query.where(Message.status == status)
+            count_query = count_query.where(Message.status == status)
+        
+        if phone_number:
+            query = query.where(Message.phone_number == phone_number)
+            count_query = count_query.where(Message.phone_number == phone_number)
+
+        if campaign_id:
+            query = query.where(Message.campaign_id == campaign_id)
+            count_query = count_query.where(Message.campaign_id == campaign_id)
+        
+        if from_date:
+            try:
+                from_date_obj = datetime.fromisoformat(from_date.replace('Z', '+00:00'))
+                query = query.where(Message.created_at >= from_date_obj)
+                count_query = count_query.where(Message.created_at >= from_date_obj)
+            except ValueError:
+                pass
+        
+        if to_date:
+            try:
+                to_date_obj = datetime.fromisoformat(to_date.replace('Z', '+00:00'))
+                query = query.where(Message.created_at <= to_date_obj)
+                count_query = count_query.where(Message.created_at <= to_date_obj)
+            except ValueError:
+                pass
+        
+        # Order by created_at desc
+        query = query.order_by(desc(Message.created_at))
+        
+        # Pagination
+        query = query.offset(skip).limit(limit)
+        
+        # Execute queries
         result = await self.session.execute(query)
-        return result.scalars().all()
-    
+        count_result = await self.session.execute(count_query)
+        
+        messages = result.scalars().all()
+        total = count_result.scalar_one()
+        
+        return messages, total
+
     async def get_messages_for_batch(
         self,
         *,
         batch_id: str,
         skip: int = 0,
-        limit: int = 100
+        limit: int = 20
     ) -> Tuple[List[Message], int]:
         """
         Get messages for a batch.
@@ -398,100 +359,95 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
         """
         # Base query
         query = select(Message).where(Message.batch_id == batch_id)
-        
-        # Get total count before pagination
         count_query = select(func.count()).select_from(Message).where(Message.batch_id == batch_id)
-        count_result = await self.session.execute(count_query)
-        total_count = count_result.scalar_one()
         
-        # Apply sorting and pagination
-        query = query.order_by(desc(Message.created_at)).offset(skip).limit(limit)
+        # Order by created_at desc
+        query = query.order_by(desc(Message.created_at))
         
-        # Execute query
+        # Pagination
+        query = query.offset(skip).limit(limit)
+        
+        # Execute queries
         result = await self.session.execute(query)
+        count_result = await self.session.execute(count_query)
+        
         messages = result.scalars().all()
+        total = count_result.scalar_one()
         
-        return messages, total_count
+        return messages, total
     
-    async def create_template(
+    async def get_messages_for_campaign(
         self,
         *,
-        name: str,
-        content: str,
-        user_id: str,
-        description: Optional[str] = None,
-        variables: Optional[List[str]] = None
-    ) -> MessageTemplate:
-        """
-        Create a message template.
-        
-        Args:
-            name: Template name
-            content: Template content
-            user_id: User ID
-            description: Optional description
-            variables: Optional list of variables
-            
-        Returns:
-            MessageTemplate: Created template
-        """
-        template = MessageTemplate(
-            id=str(uuid4()),
-            name=name,
-            content=content,
-            description=description,
-            is_active=True,
-            user_id=user_id,
-            variables=variables or []
-        )
-        
-        self.session.add(template)
-        await self.session.commit()
-        await self.session.refresh(template)
-        
-        return template
-    
-    async def get_templates_for_user(
-        self,
-        *,
-        user_id: str,
+        campaign_id: str,
+        status: Optional[str] = None,
         skip: int = 0,
-        limit: int = 100
-    ) -> Tuple[List[MessageTemplate], int]:
+        limit: int = 20
+    ) -> Tuple[List[Message], int]:
         """
-        Get message templates for a user.
+        Get messages for a campaign.
         
         Args:
-            user_id: User ID
+            campaign_id: Campaign ID
+            status: Optional status filter
             skip: Number of records to skip
             limit: Maximum number of records to return
             
         Returns:
-            Tuple[List[MessageTemplate], int]: List of templates and total count
+            Tuple[List[Message], int]: List of messages and total count
         """
         # Base query
-        query = select(MessageTemplate).where(
-            and_(
-                MessageTemplate.user_id == user_id,
-                MessageTemplate.is_active == True
-            )
-        )
+        query = select(Message).where(Message.campaign_id == campaign_id)
+        count_query = select(func.count()).select_from(Message).where(Message.campaign_id == campaign_id)
         
-        # Get total count before pagination
-        count_query = select(func.count()).select_from(MessageTemplate).where(
-            and_(
-                MessageTemplate.user_id == user_id,
-                MessageTemplate.is_active == True
-            )
-        )
-        count_result = await self.session.execute(count_query)
-        total_count = count_result.scalar_one()
+        # Apply status filter
+        if status:
+            query = query.where(Message.status == status)
+            count_query = count_query.where(Message.status == status)
         
-        # Apply sorting and pagination
-        query = query.order_by(MessageTemplate.name).offset(skip).limit(limit)
+        # Order by created_at desc
+        query = query.order_by(desc(Message.created_at))
         
-        # Execute query
+        # Apply pagination
+        query = query.offset(skip).limit(limit)
+        
+        # Execute queries
         result = await self.session.execute(query)
-        templates = result.scalars().all()
+        count_result = await self.session.execute(count_query)
         
-        return templates, total_count
+        messages = result.scalars().all()
+        total = count_result.scalar_one()
+        
+        return messages, total
+
+    async def get_retryable_messages(
+        self,
+        *,
+        max_retries: int = 3,
+        limit: int = 50
+    ) -> List[Message]:
+        """
+        Get messages that can be retried.
+        
+        Args:
+            max_retries: Maximum number of retry attempts
+            limit: Maximum number of messages to return
+            
+        Returns:
+            List[Message]: List of retryable messages
+        """
+        # Query for failed messages that can be retried
+        query = select(Message).where(
+            and_(
+                Message.status == MessageStatus.FAILED,
+                or_(
+                    # Either no retry count in metadata
+                    ~Message.meta_data.has_key("retry_count"),
+                    # Or retry count less than max
+                    Message.meta_data["retry_count"].as_integer() < max_retries
+                )
+            )
+        ).order_by(Message.failed_at).limit(limit)
+        
+        result = await self.session.execute(query)
+        return result.scalars().all()
