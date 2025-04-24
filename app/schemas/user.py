@@ -64,7 +64,7 @@ class User(UserBase):
     
     class Config:
         """Pydantic config."""
-        orm_mode = True
+        from_attributes = True
 
 
 class UserInDB(User):
@@ -100,7 +100,7 @@ class APIKey(BaseModel):
     
     class Config:
         """Pydantic config."""
-        orm_mode = True
+        from_attributes = True
 
 
 class APIKeyCreate(BaseModel):

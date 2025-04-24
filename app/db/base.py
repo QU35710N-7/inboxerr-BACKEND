@@ -6,6 +6,7 @@ from app.models.base import Base
 
 # Import all models
 from app.models.user import User, APIKey
+from app.models.campaign import Campaign
 from app.models.message import Message, MessageEvent, MessageBatch, MessageTemplate
 from app.models.webhook import Webhook, WebhookDelivery, WebhookEvent
 

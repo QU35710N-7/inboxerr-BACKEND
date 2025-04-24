@@ -31,9 +31,9 @@ class Settings(BaseSettings):
     SECRET_KEY: str = "CHANGEME_IN_PRODUCTION"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 1 day
     API_KEY_HEADER: str = "X-API-Key"
-    
+
     # Database
-    DATABASE_URL: str = "sqlite+aiosqlite:///./inboxerr.db"
+    DATABASE_URL: str = "postgresql+asyncpg://postgres:admin@localhost:5432/inboxerr"
     
     # SMS Gateway
     SMS_GATEWAY_URL: str = "https://endpointnumber1.work.gd/api/3rdparty/v1"
@@ -48,7 +48,7 @@ class Settings(BaseSettings):
     # SMS Processing
     BATCH_SIZE: int = 100
     DELAY_BETWEEN_SMS: float = 0.3  # seconds
-    RETRY_ENABLED: bool = True
+    RETRY_ENABLED: bool = False
     RETRY_MAX_ATTEMPTS: int = 3
     RETRY_INTERVAL_SECONDS: int = 60
     

@@ -1,6 +1,7 @@
 # app/services/sms/retry_engine.py
 import asyncio
 import logging
+import uuid
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 
@@ -91,37 +92,44 @@ class RetryEngine:
         now = datetime.utcnow()
         max_retries = settings.RETRY_MAX_ATTEMPTS
         
-        # Query for messages that:
-        # 1. Are in a failed state
-        # 2. Have not exceeded max retry attempts
-        # 3. Have a retryable error or no error specified
-        # 4. Last retry attempt was long enough ago (based on exponential backoff)
-        
-        # This is a simplified implementation - in production you might want
-        # more sophisticated filtering and prioritization
-        failed_messages = await self.message_repository.get_retryable_messages(
-            max_retries=max_retries,
-            limit=50  # Limit number of messages to process in one cycle
-        )
-        
-        # Filter messages based on retry delay (exponential backoff)
-        retry_candidates = []
-        
-        for message in failed_messages:
-            # Get retry attempt count (from message metadata or events)
-            retry_count = self._get_retry_count(message)
+        try:
+            # Query for messages that:
+            # 1. Are in a failed state
+            # 2. Have not exceeded max retry attempts
+            # 3. Have a retryable error or no error specified
+            # 4. Last retry attempt was long enough ago (based on exponential backoff)
             
-            # Calculate backoff delay - 30s, 2m, 8m, 30m, 2h, etc.
-            backoff_seconds = 30 * (2 ** retry_count)
+            # This is a simplified implementation - in production you might want
+            # more sophisticated filtering and prioritization
+            failed_messages = await self.message_repository.get_retryable_messages(
+                max_retries=max_retries,
+                limit=50  # Limit number of messages to process in one cycle
+            )
             
-            # Get timestamp of last attempt
-            last_attempt = message.failed_at or message.updated_at
+            # Filter messages based on retry delay (exponential backoff)
+            retry_candidates = []
             
-            # Check if enough time has passed for retry
-            if now - last_attempt > timedelta(seconds=backoff_seconds):
-                retry_candidates.append(message)
+            for message in failed_messages:
+                # Get retry attempt count (from message metadata or events)
+                retry_count = self._get_retry_count(message)
+                
+                # Calculate backoff delay - 30s, 2m, 8m, 30m, 2h, etc.
+                backoff_seconds = 30 * (2 ** retry_count)
+                
+                # Get timestamp of last attempt
+                last_attempt = message.failed_at or message.updated_at
+                
+                # Check if enough time has passed for retry
+                if now - last_attempt > timedelta(seconds=backoff_seconds):
+                    retry_candidates.append(message)
+            
+            return retry_candidates
         
-        return retry_candidates
+        except Exception as e:
+            logger.error(f"Error getting retry candidates: {e}", exc_info=True)
+            # Return empty list on error to prevent crashing the retry engine
+            return []
+    
     
     def _get_retry_count(self, message: Any) -> int:
         """
@@ -246,7 +254,7 @@ class RetryEngine:
 # Singleton instance
 _retry_engine = None
 
-def get_retry_engine():
+async def get_retry_engine():
     """Get the singleton retry engine instance."""
     global _retry_engine
     
@@ -256,9 +264,9 @@ def get_retry_engine():
         from app.services.event_bus.bus import get_event_bus
         from app.services.sms.sender import get_sms_sender
         
-        message_repository = get_repository(MessageRepository)
+        message_repository = await get_repository(MessageRepository)
         event_bus = get_event_bus()
-        sms_sender = get_sms_sender()
+        sms_sender = await get_sms_sender()
         
         _retry_engine = RetryEngine(
             message_repository=message_repository,

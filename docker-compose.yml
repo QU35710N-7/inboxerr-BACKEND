@@ -20,7 +20,10 @@ services:
       - WEBHOOK_PORT=5000
       - LOG_LEVEL=DEBUG
     depends_on:
-      - db
+      db:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
     networks:
       - inboxerr-network
     restart: unless-stopped
@@ -39,7 +42,38 @@ services:
       - "5432:5432"
     networks:
       - inboxerr-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
+
+  # Database initialization service
+  db-init:
+    build: .
+    container_name: inboxerr-db-init
+    command: >
+      sh -c "
+        echo 'Waiting for database to be ready...' &&
+        sleep 5 &&
+        echo 'Running database migrations...' &&
+        alembic upgrade head &&
+        echo 'Creating admin user...' &&
+        python app/scripts/create_admin.py &&
+        echo 'Database initialization completed.'
+      "
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/inboxerr
+      - SECRET_KEY=${SECRET_KEY:-CHANGEME_IN_PRODUCTION}
+    volumes:
+      - .:/app
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - inboxerr-network
+    restart: "no"  # Run once and exit
 
   # Optional: Redis for caching and task queue
   redis:

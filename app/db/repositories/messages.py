@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from sqlalchemy import select, update, delete, and_, or_, desc, func
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.dialects.postgresql import JSONB
 
 from app.db.repositories.base import BaseRepository
 from app.models.message import Message, MessageEvent, MessageBatch, MessageTemplate
@@ -441,10 +442,9 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
             and_(
                 Message.status == MessageStatus.FAILED,
                 or_(
-                    # Either no retry count in metadata
-                    ~Message.meta_data.has_key("retry_count"),
-                    # Or retry count less than max
-                    Message.meta_data["retry_count"].as_integer() < max_retries
+                    Message.meta_data.is_(None),  # No metadata at all
+                    ~Message.meta_data.contains({"retry_count": 0}),  # retry_count key is absent
+                    Message.meta_data["retry_count"].as_integer() < max_retries  # retry_count too low
                 )
             )
         ).order_by(Message.failed_at).limit(limit)

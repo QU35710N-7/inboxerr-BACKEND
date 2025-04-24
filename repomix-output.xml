@@ -44,6 +44,10 @@ The content is organized as follows:
 
 <directory_structure>
 .gitignore
+alembic.ini
+alembic/env.py
+alembic/README
+alembic/script.py.mako
 app/api/router.py
 app/api/v1/dependencies.py
 app/api/v1/endpoints/auth.py
@@ -88,10 +92,668 @@ Dockerfile
 project_structure.md
 README.md
 requirements.txt
+scripts/reset_db.py
+scripts/seed_db.py
 </directory_structure>
 
 <files>
 This section contains the contents of the repository's files.
+
+<file path="alembic.ini">
+# A generic, single database configuration.
+
+[alembic]
+# path to migration scripts
+# Use forward slashes (/) also on windows to provide an os agnostic path
+script_location = alembic
+
+# template used to generate migration file names; The default value is %%(rev)s_%%(slug)s
+# Uncomment the line below if you want the files to be prepended with date and time
+# see https://alembic.sqlalchemy.org/en/latest/tutorial.html#editing-the-ini-file
+# for all available tokens
+# file_template = %%(year)d_%%(month).2d_%%(day).2d_%%(hour).2d%%(minute).2d-%%(rev)s_%%(slug)s
+
+# sys.path path, will be prepended to sys.path if present.
+# defaults to the current working directory.
+prepend_sys_path = .
+
+# timezone to use when rendering the date within the migration file
+# as well as the filename.
+# If specified, requires the python>=3.9 or backports.zoneinfo library and tzdata library.
+# Any required deps can installed by adding `alembic[tz]` to the pip requirements
+# string value is passed to ZoneInfo()
+# leave blank for localtime
+# timezone =
+
+# max length of characters to apply to the "slug" field
+# truncate_slug_length = 40
+
+# set to 'true' to run the environment during
+# the 'revision' command, regardless of autogenerate
+# revision_environment = false
+
+# set to 'true' to allow .pyc and .pyo files without
+# a source .py file to be detected as revisions in the
+# versions/ directory
+# sourceless = false
+
+# version location specification; This defaults
+# to alembic/versions.  When using multiple version
+# directories, initial revisions must be specified with --version-path.
+# The path separator used here should be the separator specified by "version_path_separator" below.
+# version_locations = %(here)s/bar:%(here)s/bat:alembic/versions
+
+# version path separator; As mentioned above, this is the character used to split
+# version_locations. The default within new alembic.ini files is "os", which uses os.pathsep.
+# If this key is omitted entirely, it falls back to the legacy behavior of splitting on spaces and/or commas.
+# Valid values for version_path_separator are:
+#
+# version_path_separator = :
+# version_path_separator = ;
+# version_path_separator = space
+# version_path_separator = newline
+#
+# Use os.pathsep. Default configuration used for new projects.
+version_path_separator = os
+
+# set to 'true' to search source files recursively
+# in each "version_locations" directory
+# new in Alembic version 1.10
+# recursive_version_locations = false
+
+# the output encoding used when revision files
+# are written from script.py.mako
+# output_encoding = utf-8
+
+sqlalchemy.url = driver://user:pass@localhost/dbname
+
+
+[post_write_hooks]
+# post_write_hooks defines scripts or Python functions that are run
+# on newly generated revision scripts.  See the documentation for further
+# detail and examples
+
+# format using "black" - use the console_scripts runner, against the "black" entrypoint
+# hooks = black
+# black.type = console_scripts
+# black.entrypoint = black
+# black.options = -l 79 REVISION_SCRIPT_FILENAME
+
+# lint with attempts to fix using "ruff" - use the exec runner, execute a binary
+# hooks = ruff
+# ruff.type = exec
+# ruff.executable = %(here)s/.venv/bin/ruff
+# ruff.options = check --fix REVISION_SCRIPT_FILENAME
+
+# Logging configuration
+[loggers]
+keys = root,sqlalchemy,alembic
+
+[handlers]
+keys = console
+
+[formatters]
+keys = generic
+
+[logger_root]
+level = WARNING
+handlers = console
+qualname =
+
+[logger_sqlalchemy]
+level = WARNING
+handlers =
+qualname = sqlalchemy.engine
+
+[logger_alembic]
+level = INFO
+handlers =
+qualname = alembic
+
+[handler_console]
+class = StreamHandler
+args = (sys.stderr,)
+level = NOTSET
+formatter = generic
+
+[formatter_generic]
+format = %(levelname)-5.5s [%(name)s] %(message)s
+datefmt = %H:%M:%S
+</file>
+
+<file path="scripts/reset_db.py">
+"""
+Reset the development database by deleting the current DB file,
+running all Alembic migrations, and seeding initial data for testing.
+"""
+import sys
+import os
+import subprocess
+from pathlib import Path
+
+# Path to the SQLite DB file
+DB_PATH = "app.db"
+
+# Resolve project root dynamically
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+def reset_database() -> None:
+    """
+    Delete the dev database, run Alembic migrations, and seed initial data.
+    This should only be used in development environments.
+    """
+    db_file = PROJECT_ROOT / DB_PATH
+    if db_file.exists():
+        db_file.unlink()
+        print(f"✅ Removed existing DB at {DB_PATH}")
+    else:
+        print("ℹ️ No existing DB found")
+
+    print("🚀 Running Alembic migrations...")
+    subprocess.run(["alembic", "upgrade", "head"], check=True, cwd=PROJECT_ROOT)
+
+    print("🌱 Seeding initial data...")
+    subprocess.run(
+        [sys.executable, "scripts/seed_db.py"], 
+        check=True, 
+        cwd=PROJECT_ROOT,
+        env={**os.environ, "PYTHONPATH": str(PROJECT_ROOT)}
+    )
+
+    print("✅ Database reset and seeded successfully!")
+
+if __name__ == "__main__":
+    reset_database()
+</file>
+
+<file path="alembic/env.py">
+from logging.config import fileConfig
+
+from sqlalchemy import engine_from_config
+from sqlalchemy import pool
+
+from alembic import context
+from app.core.config import settings
+from app.db.base import Base
+
+
+# this is the Alembic Config object, which provides
+# access to the values within the .ini file in use.
+config = context.config
+
+# Interpret the config file for Python logging.
+# This line sets up loggers basically.
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+
+# add your model's MetaData object here
+# for 'autogenerate' support
+# from myapp import mymodel
+# target_metadata = mymodel.Base.metadata
+target_metadata = Base.metadata
+
+# other values from the config, defined by the needs of env.py,
+# can be acquired:
+# my_important_option = config.get_main_option("my_important_option")
+# ... etc.
+
+
+def run_migrations_offline() -> None:
+    """Run migrations in 'offline' mode.
+
+    This configures the context with just a URL
+    and not an Engine, though an Engine is acceptable
+    here as well.  By skipping the Engine creation
+    we don't even need a DBAPI to be available.
+
+    Calls to context.execute() here emit the given string to the
+    script output.
+
+    """
+    config.set_main_option("sqlalchemy.url", settings.DATABASE_URL.replace("sqlite+aiosqlite", "sqlite"))
+    url = config.get_main_option("sqlalchemy.url")
+    
+    context.configure(
+        url=url,
+        target_metadata=target_metadata,
+        literal_binds=True,
+        dialect_opts={"paramstyle": "named"},
+    )
+
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+def run_migrations_online() -> None:
+    """Run migrations in 'online' mode.
+
+    In this scenario we need to create an Engine
+    and associate a connection with the context.
+
+    """
+
+    # 🔧 Inject corrected DB URL for Alembic
+    config.set_main_option("sqlalchemy.url", settings.DATABASE_URL.replace("sqlite+aiosqlite", "sqlite"))
+
+    connectable = engine_from_config(
+        config.get_section(config.config_ini_section, {}),
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
+    )
+
+    with connectable.connect() as connection:
+        context.configure(
+            connection=connection, target_metadata=target_metadata
+        )
+
+        with context.begin_transaction():
+            context.run_migrations()
+
+
+if context.is_offline_mode():
+    run_migrations_offline()
+else:
+    run_migrations_online()
+</file>
+
+<file path="alembic/README">
+Generic single-database configuration.
+</file>
+
+<file path="alembic/script.py.mako">
+"""${message}
+
+Revision ID: ${up_revision}
+Revises: ${down_revision | comma,n}
+Create Date: ${create_date}
+
+"""
+from typing import Sequence, Union
+
+from alembic import op
+import sqlalchemy as sa
+${imports if imports else ""}
+
+# revision identifiers, used by Alembic.
+revision: str = ${repr(up_revision)}
+down_revision: Union[str, None] = ${repr(down_revision)}
+branch_labels: Union[str, Sequence[str], None] = ${repr(branch_labels)}
+depends_on: Union[str, Sequence[str], None] = ${repr(depends_on)}
+
+
+def upgrade() -> None:
+    """Upgrade schema."""
+    ${upgrades if upgrades else "pass"}
+
+
+def downgrade() -> None:
+    """Downgrade schema."""
+    ${downgrades if downgrades else "pass"}
+</file>
+
+<file path="app/api/v1/dependencies.py">
+"""
+Dependencies for API endpoints.
+"""
+from fastapi import Depends, HTTPException, status, Header
+from fastapi.security import OAuth2PasswordBearer
+from typing import Optional, List
+import jwt
+from datetime import datetime, timedelta
+
+from app.core.config import settings
+from app.core.exceptions import AuthenticationError, AuthorizationError
+from app.schemas.user import User, TokenData, UserRole
+from app.db.repositories.users import UserRepository
+from app.services.rate_limiter import RateLimiter
+
+# OAuth2 scheme for token authentication
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"{settings.API_PREFIX}/auth/token")
+
+
+async def get_user_repository():
+    """Get user repository."""
+    from app.db.session import get_repository
+    return await get_repository(UserRepository)
+
+
+async def get_rate_limiter():
+    """Get rate limiter service."""
+    return RateLimiter()
+
+
+async def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    user_repository = Depends(get_user_repository)
+) -> User:
+    """
+    Get the current authenticated user from the JWT token.
+    
+    Args:
+        token: JWT token from Authorization header
+        user_repository: User repository for database access
+        
+    Returns:
+        User: The authenticated user
+        
+    Raises:
+        AuthenticationError: If the token is invalid or expired
+    """
+    try:
+        # Decode JWT token
+        payload = jwt.decode(
+            token, 
+            settings.SECRET_KEY, 
+            algorithms=["HS256"]
+        )
+        token_data = TokenData(**payload)
+        
+        # Check if token is expired
+        if token_data.exp and datetime.utcnow() > token_data.exp:
+            raise AuthenticationError("Token has expired")
+        
+        # Get user from database
+        user = await user_repository.get_by_id(token_data.sub)
+        if not user:
+            raise AuthenticationError("User not found")
+        
+        # Check if user is active
+        if not user.is_active:
+            raise AuthenticationError("User is inactive")
+        
+        return user
+        
+    except jwt.PyJWTError:
+        raise AuthenticationError("Invalid token")
+
+
+async def verify_api_key(
+    api_key: str = Header(..., alias=settings.API_KEY_HEADER),
+    user_repository = Depends(get_user_repository)
+) -> User:
+    """
+    Verify API key and return the associated user.
+    
+    Args:
+        api_key: API key from header
+        user_repository: User repository for database access
+        
+    Returns:
+        User: The authenticated user
+        
+    Raises:
+        AuthenticationError: If the API key is invalid
+    """
+    try:
+        # Get API key from database
+        api_key_record = await user_repository.get_api_key(api_key)
+        if not api_key_record:
+            raise AuthenticationError("Invalid API key")
+        
+        # Check if API key is active
+        if not api_key_record.is_active:
+            raise AuthenticationError("API key is inactive")
+        
+        # Check if API key is expired
+        if api_key_record.expires_at and datetime.utcnow() > api_key_record.expires_at:
+            raise AuthenticationError("API key has expired")
+        
+        # Get user associated with API key
+        user = await user_repository.get_by_id(api_key_record.user_id)
+        if not user:
+            raise AuthenticationError("User not found")
+        
+        # Check if user is active
+        if not user.is_active:
+            raise AuthenticationError("User is inactive")
+        
+        # Update last used timestamp
+        await user_repository.update_api_key_usage(api_key)
+        
+        return user
+        
+    except Exception as e:
+        if isinstance(e, AuthenticationError):
+            raise
+        raise AuthenticationError("API key verification failed")
+
+
+async def get_current_active_user(
+    current_user: User = Depends(get_current_user)
+) -> User:
+    """
+    Get the current active user.
+    
+    Args:
+        current_user: Current authenticated user
+        
+    Returns:
+        User: The authenticated active user
+        
+    Raises:
+        AuthenticationError: If the user is inactive
+    """
+    if not current_user.is_active:
+        raise AuthenticationError("Inactive user")
+    return current_user
+
+
+async def validate_permissions(
+    required_permissions: List[str],
+    current_user: User = Depends(get_current_user)
+) -> None:
+    """
+    Validate that the current user has the required permissions.
+    
+    Args:
+        required_permissions: List of required permissions
+        current_user: Current authenticated user
+        
+    Raises:
+        AuthorizationError: If the user doesn't have the required permissions
+    """
+    # Admin role has all permissions
+    if current_user.role == UserRole.ADMIN:
+        return
+    
+    # TODO: Implement proper permission checking
+    # For now, just verify role-based access
+    if current_user.role != UserRole.API and "api" in required_permissions:
+        raise AuthorizationError("Insufficient permissions")
+</file>
+
+<file path="app/api/v1/endpoints/auth.py">
+"""
+API endpoints for authentication.
+"""
+from datetime import datetime, timedelta
+from typing import List, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, status, Body
+from fastapi.security import OAuth2PasswordRequestForm
+
+from app.core.config import settings
+from app.core.exceptions import AuthenticationError, AuthorizationError, NotFoundError
+from app.api.v1.dependencies import (
+    get_current_user,
+    get_user_repository,
+    validate_permissions
+)
+from app.schemas.user import (
+    User,
+    UserCreate,
+    Token,
+    APIKey,
+    APIKeyCreate
+)
+from app.core.security import (
+    create_access_token,
+    verify_password,
+    get_password_hash
+)
+
+router = APIRouter()
+
+
+@router.post("/token", response_model=Token)
+async def login_for_access_token(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    user_repository = Depends(get_user_repository)
+):
+    """
+    OAuth2 compatible token login, get an access token for future requests.
+    """
+    try:
+        # Authenticate user
+        user = await user_repository.get_by_email(form_data.username)
+        if not user:
+            raise AuthenticationError("Incorrect email or password")
+        
+        # Verify password
+        if not verify_password(form_data.password, user.hashed_password):
+            raise AuthenticationError("Incorrect email or password")
+        
+        # Check if user is active
+        if not user.is_active:
+            raise AuthenticationError("Inactive user")
+        
+        # Create access token
+        access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+        expires_at = datetime.utcnow() + access_token_expires
+        
+        access_token = create_access_token(
+            data={
+                "sub": str(user.id),
+                "role": user.role,
+                "exp": expires_at
+            },
+            expires_delta=access_token_expires
+        )
+        
+        return {
+            "access_token": access_token,
+            "token_type": "bearer",
+            "expires_at": expires_at
+        }
+        
+    except AuthenticationError as e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=str(e),
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+@router.post("/register", response_model=User, status_code=status.HTTP_201_CREATED)
+async def register_user(
+    user_data: UserCreate,
+    user_repository = Depends(get_user_repository)
+):
+    """
+    Register a new user.
+    """
+    # Check if user already exists
+    existing_user = await user_repository.get_by_email(user_data.email)
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Email already registered"
+        )
+    
+    # Create new user
+    hashed_password = get_password_hash(user_data.password)
+    
+    user = await user_repository.create(
+        email=user_data.email,
+        hashed_password=hashed_password,
+        full_name=user_data.full_name,
+        is_active=user_data.is_active,
+        role=user_data.role
+    )
+    
+    return user
+
+
+@router.get("/me", response_model=User)
+async def read_users_me(
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Get current user information.
+    """
+    return current_user
+
+
+@router.post("/keys", response_model=APIKey)
+async def create_api_key(
+    api_key_data: APIKeyCreate,
+    current_user: User = Depends(get_current_user),
+    user_repository = Depends(get_user_repository)
+):
+    """
+    Create a new API key.
+    
+    This is the only time the full API key will be returned.
+    """
+    # Create API key
+    api_key = await user_repository.create_api_key(
+        user_id=current_user.id,
+        name=api_key_data.name,
+        expires_at=api_key_data.expires_at,
+        permissions=api_key_data.permissions
+    )
+    
+    return api_key
+
+
+@router.get("/keys", response_model=List[APIKey])
+async def list_api_keys(
+    current_user: User = Depends(get_current_user),
+    user_repository = Depends(get_user_repository)
+):
+    """
+    List all API keys for the current user.
+    
+    Note: The full API key value is not returned, only the ID and metadata.
+    """
+    # List API keys
+    api_keys = await user_repository.list_api_keys(user_id=current_user.id)
+    
+    # Remove sensitive information
+    for key in api_keys:
+        key.key = f"{key.key[:8]}..." if key.key else None
+    
+    return api_keys
+
+
+@router.delete("/keys/{key_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_api_key(
+    key_id: str,
+    current_user: User = Depends(get_current_user),
+    user_repository = Depends(get_user_repository)
+):
+    """
+    Delete an API key.
+    """
+    # Get API key
+    api_key = await user_repository.get_api_key_by_id(key_id)
+    if not api_key:
+        raise NotFoundError(message="API key not found")
+    
+    # Check ownership
+    if api_key.user_id != str(current_user.id) and current_user.role != "admin":
+        raise AuthorizationError(message="Not authorized to delete this API key")
+    
+    # Delete API key
+    success = await user_repository.delete_api_key(key_id)
+    if not success:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to delete API key"
+        )
+    
+    return None
+</file>
 
 <file path="app/api/v1/endpoints/campaigns.py">
 # app/api/v1/endpoints/campaigns.py
@@ -573,1656 +1235,6 @@ async def delete_campaign(
        raise HTTPException(status_code=500, detail=f"Error deleting campaign: {str(e)}")
 </file>
 
-<file path="app/db/repositories/campaigns.py">
-# app/db/repositories/campaigns.py
-from datetime import datetime
-from typing import List, Optional, Dict, Any, Tuple
-from uuid import uuid4
-
-from sqlalchemy import select, update, and_, or_, desc, func
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.db.repositories.base import BaseRepository
-from app.models.campaign import Campaign
-from app.models.message import Message
-
-
-class CampaignRepository(BaseRepository[Campaign, Dict[str, Any], Dict[str, Any]]):
-    """Campaign repository for campaign operations."""
-    
-    def __init__(self, session: AsyncSession):
-        """Initialize repository with session."""
-        super().__init__(session=session, model=Campaign)
-    
-    async def create_campaign(
-        self,
-        *,
-        name: str,
-        user_id: str,
-        description: Optional[str] = None,
-        scheduled_start_at: Optional[datetime] = None,
-        scheduled_end_at: Optional[datetime] = None,
-        settings: Optional[Dict[str, Any]] = None
-    ) -> Campaign:
-        """
-        Create a new campaign.
-        
-        Args:
-            name: Campaign name
-            user_id: User ID
-            description: Optional campaign description
-            scheduled_start_at: Optional scheduled start time
-            scheduled_end_at: Optional scheduled end time
-            settings: Optional campaign settings
-            
-        Returns:
-            Campaign: Created campaign
-        """
-        campaign = Campaign(
-            id=str(uuid4()),
-            name=name,
-            description=description,
-            status="draft",
-            user_id=user_id,
-            scheduled_start_at=scheduled_start_at,
-            scheduled_end_at=scheduled_end_at,
-            settings=settings or {}
-        )
-        
-        self.session.add(campaign)
-        await self.session.commit()
-        await self.session.refresh(campaign)
-        
-        return campaign
-    
-    async def update_campaign_status(
-        self,
-        *,
-        campaign_id: str,
-        status: str,
-        started_at: Optional[datetime] = None,
-        completed_at: Optional[datetime] = None
-    ) -> Optional[Campaign]:
-        """
-        Update campaign status.
-        
-        Args:
-            campaign_id: Campaign ID
-            status: New status
-            started_at: Optional start timestamp
-            completed_at: Optional completion timestamp
-            
-        Returns:
-            Campaign: Updated campaign or None
-        """
-        campaign = await self.get_by_id(campaign_id)
-        if not campaign:
-            return None
-        
-        campaign.status = status
-        
-        if started_at:
-            campaign.started_at = started_at
-        
-        if completed_at:
-            campaign.completed_at = completed_at
-        
-        # If status is active and no start time, set it now
-        if status == "active" and not campaign.started_at:
-            campaign.started_at = datetime.utcnow()
-        
-        # If status is completed and no completion time, set it now
-        if status in ["completed", "cancelled", "failed"] and not campaign.completed_at:
-            campaign.completed_at = datetime.utcnow()
-        
-        self.session.add(campaign)
-        await self.session.commit()
-        await self.session.refresh(campaign)
-        
-        return campaign
-    
-    async def update_campaign_stats(
-        self,
-        *,
-        campaign_id: str,
-        increment_sent: int = 0,
-        increment_delivered: int = 0,
-        increment_failed: int = 0
-    ) -> Optional[Campaign]:
-        """
-        Update campaign statistics.
-        
-        Args:
-            campaign_id: Campaign ID
-            increment_sent: Increment sent count
-            increment_delivered: Increment delivered count
-            increment_failed: Increment failed count
-            
-        Returns:
-            Campaign: Updated campaign or None
-        """
-        campaign = await self.get_by_id(campaign_id)
-        if not campaign:
-            return None
-        
-        # Update counts
-        campaign.sent_count += increment_sent
-        campaign.delivered_count += increment_delivered
-        campaign.failed_count += increment_failed
-        
-        # Check if campaign is complete
-        total_processed = campaign.sent_count + campaign.failed_count
-        if total_processed >= campaign.total_messages and campaign.total_messages > 0:
-            campaign.status = "completed"
-            campaign.completed_at = datetime.utcnow()
-        
-        self.session.add(campaign)
-        await self.session.commit()
-        await self.session.refresh(campaign)
-        
-        return campaign
-    
-    async def get_campaigns_for_user(
-        self,
-        *,
-        user_id: str,
-        status: Optional[str] = None,
-        skip: int = 0,
-        limit: int = 20
-    ) -> Tuple[List[Campaign], int]:
-        """
-        Get campaigns for a user with optional filtering.
-        
-        Args:
-            user_id: User ID
-            status: Optional status filter
-            skip: Number of records to skip
-            limit: Maximum number of records to return
-            
-        Returns:
-            Tuple[List[Campaign], int]: List of campaigns and total count
-        """
-        # Base query
-        query = select(Campaign).where(Campaign.user_id == user_id)
-        count_query = select(func.count()).select_from(Campaign).where(Campaign.user_id == user_id)
-        
-        # Apply status filter
-        if status:
-            query = query.where(Campaign.status == status)
-            count_query = count_query.where(Campaign.status == status)
-        
-        # Order by created_at desc
-        query = query.order_by(desc(Campaign.created_at))
-        
-        # Apply pagination
-        query = query.offset(skip).limit(limit)
-        
-        # Execute queries
-        result = await self.session.execute(query)
-        count_result = await self.session.execute(count_query)
-        
-        campaigns = result.scalars().all()
-        total = count_result.scalar_one()
-        
-        return campaigns, total
-    
-    async def add_messages_to_campaign(
-        self,
-        *,
-        campaign_id: str,
-        phone_numbers: List[str],
-        message_text: str,
-        user_id: str
-    ) -> int:
-        """
-        Add messages to a campaign.
-        
-        Args:
-            campaign_id: Campaign ID
-            phone_numbers: List of recipient phone numbers
-            message_text: Message content
-            user_id: User ID
-            
-        Returns:
-            int: Number of messages added
-        """
-        from app.db.repositories.messages import MessageRepository
-        from app.utils.phone import validate_phone
-        
-        # Get campaign
-        campaign = await self.get_by_id(campaign_id)
-        if not campaign:
-            return 0
-        
-        # Validate campaign belongs to user
-        if campaign.user_id != user_id:
-            return 0
-        
-        # TODO: Implement bulk insertion for better performance
-        message_repo = MessageRepository(self.session)
-        added_count = 0
-        
-        for phone in phone_numbers:
-            # Basic validation
-            is_valid, formatted_number, _ = validate_phone(phone)
-            if is_valid:
-                # Add message to campaign
-                await message_repo.create_message(
-                    phone_number=formatted_number,
-                    message_text=message_text,
-                    user_id=user_id,
-                    scheduled_at=campaign.scheduled_start_at,
-                    metadata={"campaign_id": campaign_id},
-                    campaign_id=campaign_id  # Direct link to campaign
-                )
-                added_count += 1
-        
-        # Update campaign message count
-        if added_count > 0:
-            campaign.total_messages += added_count
-            self.session.add(campaign)
-            await self.session.commit()
-        
-        return added_count
-</file>
-
-<file path="app/models/campaign.py">
-# app/models/campaign.py
-from datetime import datetime
-from typing import List, Optional
-
-from sqlalchemy import Column, String, DateTime, Boolean, JSON, Integer, ForeignKey, Text
-from sqlalchemy.orm import relationship
-
-from app.models.base import Base
-
-
-class Campaign(Base):
-    """Campaign model for bulk SMS messaging."""
-    
-    # Basic campaign information
-    name = Column(String, nullable=False, index=True)
-    description = Column(Text, nullable=True)
-    
-    # Campaign status
-    status = Column(String, nullable=False, default="draft", index=True)  # draft, active, paused, completed, cancelled, failed
-    
-    # Campaign statistics
-    total_messages = Column(Integer, default=0, nullable=False)
-    sent_count = Column(Integer, default=0, nullable=False)
-    delivered_count = Column(Integer, default=0, nullable=False)
-    failed_count = Column(Integer, default=0, nullable=False)
-    
-    # Campaign configuration
-    scheduled_start_at = Column(DateTime, nullable=True, index=True)
-    scheduled_end_at = Column(DateTime, nullable=True)
-    started_at = Column(DateTime, nullable=True)
-    completed_at = Column(DateTime, nullable=True)
-    
-    # Campaign settings
-    settings = Column(JSON, nullable=True, default=dict)  # Store campaign-specific settings
-    
-    # Ownership
-    user_id = Column(String, ForeignKey("user.id"), nullable=False, index=True)
-    
-    # Relationships
-    user = relationship("User")
-    messages = relationship("Message", back_populates="campaign")
-    
-    # Helper properties
-    @property
-    def progress_percentage(self) -> float:
-        """Calculate the campaign progress percentage."""
-        if self.total_messages == 0:
-            return 0
-        return round((self.sent_count / self.total_messages) * 100, 2)
-    
-    @property
-    def delivery_success_rate(self) -> float:
-        """Calculate the delivery success rate."""
-        if self.sent_count == 0:
-            return 0
-        return round((self.delivered_count / self.sent_count) * 100, 2)
-</file>
-
-<file path="app/schemas/campaign.py">
-# app/schemas/campaign.py
-from typing import List, Optional, Dict, Any
-from datetime import datetime
-from uuid import UUID
-
-from pydantic import BaseModel, Field, validator
-
-
-class CampaignBase(BaseModel):
-    """Base schema for campaign data."""
-    name: str = Field(..., description="Campaign name")
-    description: Optional[str] = Field(None, description="Campaign description")
-    scheduled_start_at: Optional[datetime] = Field(None, description="Scheduled start time")
-    scheduled_end_at: Optional[datetime] = Field(None, description="Scheduled end time")
-    settings: Optional[Dict[str, Any]] = Field(default={}, description="Campaign settings")
-
-
-class CampaignCreate(CampaignBase):
-    """Schema for creating a new campaign."""
-    pass
-
-
-class CampaignCreateFromCSV(BaseModel):
-    """Schema for creating a campaign from CSV file."""
-    name: str = Field(..., description="Campaign name")
-    description: Optional[str] = Field(None, description="Campaign description")
-    message_template: str = Field(..., description="Message template to send")
-    scheduled_start_at: Optional[datetime] = Field(None, description="Scheduled start time")
-    scheduled_end_at: Optional[datetime] = Field(None, description="Scheduled end time")
-    settings: Optional[Dict[str, Any]] = Field(default={}, description="Campaign settings")
-
-
-class CampaignUpdate(BaseModel):
-    """Schema for updating a campaign."""
-    name: Optional[str] = Field(None, description="Campaign name")
-    description: Optional[str] = Field(None, description="Campaign description")
-    scheduled_start_at: Optional[datetime] = Field(None, description="Scheduled start time")
-    scheduled_end_at: Optional[datetime] = Field(None, description="Scheduled end time")
-    settings: Optional[Dict[str, Any]] = Field(None, description="Campaign settings")
-
-
-class CampaignStatus(BaseModel):
-    """Schema for campaign status update."""
-    status: str = Field(..., description="Campaign status")
-    
-    @validator("status")
-    def validate_status(cls, v):
-        """Validate status value."""
-        valid_statuses = ["draft", "active", "paused", "completed", "cancelled", "failed"]
-        if v not in valid_statuses:
-            raise ValueError(f"Status must be one of: {', '.join(valid_statuses)}")
-        return v
-
-
-class CampaignResponse(CampaignBase):
-    """Schema for campaign response."""
-    id: str = Field(..., description="Campaign ID")
-    status: str = Field(..., description="Campaign status")
-    total_messages: int = Field(..., description="Total number of messages")
-    sent_count: int = Field(..., description="Number of sent messages")
-    delivered_count: int = Field(..., description="Number of delivered messages")
-    failed_count: int = Field(..., description="Number of failed messages")
-    created_at: datetime = Field(..., description="Creation timestamp")
-    updated_at: datetime = Field(..., description="Last update timestamp")
-    started_at: Optional[datetime] = Field(None, description="Start timestamp")
-    completed_at: Optional[datetime] = Field(None, description="Completion timestamp")
-    user_id: str = Field(..., description="User ID")
-    
-    # Add computed fields
-    progress_percentage: float = Field(0, description="Progress percentage")
-    delivery_success_rate: float = Field(0, description="Delivery success rate")
-    
-    class Config:
-        """Pydantic config."""
-        orm_mode = True
-
-
-class CampaignListResponse(BaseModel):
-    """Schema for campaign list response with pagination."""
-    items: List[CampaignResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
-</file>
-
-<file path="app/scripts/create_admin.py">
-# scripts/create_admin.py
-import asyncio
-import sys
-from pathlib import Path
-
-# Add parent directory to path
-sys.path.append(str(Path(__file__).parent.parent))
-
-from app.db.session import async_session_factory, initialize_database
-from app.db.repositories.users import UserRepository
-from app.core.security import get_password_hash
-
-async def create_admin_user():
-    """Create an admin user if none exists."""
-    # Initialize database
-    await initialize_database()
-    
-    # Use session properly with context manager
-    async with async_session_factory() as session:
-        # Create repository with session
-        user_repo = UserRepository(session)
-        
-        # Check if admin exists
-        admin = await user_repo.get_by_email("admin@inboxerr.com")
-        
-        if admin:
-            print("Admin user already exists")
-            return
-        
-        # Create admin user
-        password = "Admin123!"
-        hashed_password = get_password_hash(password)
-        
-        admin = await user_repo.create(
-            email="admin@inboxerr.com",
-            hashed_password=hashed_password,
-            full_name="Admin User",
-            is_active=True,
-            role="admin"
-        )
-        
-        print(f"Admin user created with ID: {admin.id}")
-        print(f"Email: admin@inboxerr.com")
-        print(f"Password: {password}")
-
-if __name__ == "__main__":
-    asyncio.run(create_admin_user())
-</file>
-
-<file path="app/services/campaigns/processor.py">
-# app/services/campaigns/processor.py
-import asyncio
-import logging
-from datetime import datetime
-from typing import List, Dict, Any, Optional
-import uuid
-
-from app.core.config import settings
-from app.db.repositories.campaigns import CampaignRepository
-from app.db.repositories.messages import MessageRepository
-from app.schemas.message import MessageStatus
-from app.services.event_bus.bus import get_event_bus
-from app.services.event_bus.events import EventType
-from app.services.sms.sender import SMSSender
-
-logger = logging.getLogger("inboxerr.campaigns")
-
-class CampaignProcessor:
-    """
-    Service for processing SMS campaigns.
-    
-    Manages campaign execution, chunked processing, and status tracking.
-    """
-    
-    def __init__(
-        self,
-        campaign_repository: CampaignRepository,
-        message_repository: MessageRepository,
-        sms_sender: SMSSender,
-        event_bus: Any
-    ):
-        """Initialize campaign processor with required dependencies."""
-        self.campaign_repository = campaign_repository
-        self.message_repository = message_repository
-        self.sms_sender = sms_sender
-        self.event_bus = event_bus
-        self._processing_campaigns = set()
-        self._chunk_size = settings.BATCH_SIZE  # Default from settings
-        self._semaphore = asyncio.Semaphore(5)  # Limit concurrent campaigns
-    
-    async def start_campaign(self, campaign_id: str, user_id: str) -> bool:
-        """
-        Start a campaign.
-        
-        Args:
-            campaign_id: Campaign ID
-            user_id: User ID for authorization
-            
-        Returns:
-            bool: True if campaign was started, False otherwise
-        """
-        # Get campaign
-        campaign = await self.campaign_repository.get_by_id(campaign_id)
-        if not campaign:
-            return False
-        
-        # Validate ownership
-        if campaign.user_id != user_id:
-            return False
-        
-        # Check if campaign can be started
-        if campaign.status != "draft" and campaign.status != "paused":
-            return False
-        
-        # Update status to active
-        updated = await self.campaign_repository.update_campaign_status(
-            campaign_id=campaign_id,
-            status="active",
-            started_at=datetime.utcnow()
-        )
-        
-        if not updated:
-            return False
-        
-        # Start processing in background
-        asyncio.create_task(self._process_campaign(campaign_id))
-        
-        # Publish event
-        await self.event_bus.publish(
-            EventType.BATCH_CREATED,
-            {
-                "campaign_id": campaign_id,
-                "user_id": user_id,
-                "total_messages": campaign.total_messages
-            }
-        )
-        
-        return True
-    
-    async def pause_campaign(self, campaign_id: str, user_id: str) -> bool:
-        """
-        Pause a campaign.
-        
-        Args:
-            campaign_id: Campaign ID
-            user_id: User ID for authorization
-            
-        Returns:
-            bool: True if campaign was paused, False otherwise
-        """
-        # Get campaign
-        campaign = await self.campaign_repository.get_by_id(campaign_id)
-        if not campaign:
-            return False
-        
-        # Validate ownership
-        if campaign.user_id != user_id:
-            return False
-        
-        # Check if campaign can be paused
-        if campaign.status != "active":
-            return False
-        
-        # Update status to paused
-        updated = await self.campaign_repository.update_campaign_status(
-            campaign_id=campaign_id,
-            status="paused"
-        )
-        
-        return updated is not None
-    
-    async def cancel_campaign(self, campaign_id: str, user_id: str) -> bool:
-        """
-        Cancel a campaign.
-        
-        Args:
-            campaign_id: Campaign ID
-            user_id: User ID for authorization
-            
-        Returns:
-            bool: True if campaign was cancelled, False otherwise
-        """
-        # Get campaign
-        campaign = await self.campaign_repository.get_by_id(campaign_id)
-        if not campaign:
-            return False
-        
-        # Validate ownership
-        if campaign.user_id != user_id:
-            return False
-        
-        # Check if campaign can be cancelled
-        if campaign.status in ["completed", "cancelled", "failed"]:
-            return False
-        
-        # Update status to cancelled
-        updated = await self.campaign_repository.update_campaign_status(
-            campaign_id=campaign_id,
-            status="cancelled",
-            completed_at=datetime.utcnow()
-        )
-        
-        return updated is not None
-    
-    async def _process_campaign(self, campaign_id: str) -> None:
-        """
-        Process a campaign in the background.
-        
-        Args:
-            campaign_id: Campaign ID
-        """
-        if campaign_id in self._processing_campaigns:
-            logger.warning(f"Campaign {campaign_id} is already being processed")
-            return
-        
-        # Mark as processing
-        self._processing_campaigns.add(campaign_id)
-        
-        try:
-            # Get campaign
-            campaign = await self.campaign_repository.get_by_id(campaign_id)
-            if not campaign or campaign.status != "active":
-                return
-            
-            # Process in chunks until complete
-            async with self._semaphore:
-                await self._process_campaign_chunks(campaign)
-                
-        except Exception as e:
-            logger.error(f"Error processing campaign {campaign_id}: {e}", exc_info=True)
-            # Update campaign status to failed
-            await self.campaign_repository.update_campaign_status(
-                campaign_id=campaign_id,
-                status="failed",
-                completed_at=datetime.utcnow()
-            )
-        finally:
-            # Remove from processing set
-            self._processing_campaigns.remove(campaign_id)
-    
-    async def _process_campaign_chunks(self, campaign) -> None:
-        """
-        Process campaign messages in chunks.
-        
-        Args:
-            campaign: Campaign object
-        """
-        # Query pending messages in chunks
-        offset = 0
-        
-        while True:
-            # Check if campaign is still active
-            campaign = await self.campaign_repository.get_by_id(campaign.id)
-            if not campaign or campaign.status != "active":
-                logger.info(f"Campaign {campaign.id} is no longer active, stopping processing")
-                return
-            
-            # Get next chunk of messages
-            messages, _ = await self.message_repository.get_messages_for_campaign(
-                campaign_id=campaign.id,
-                status=MessageStatus.PENDING,
-                skip=offset,
-                limit=self._chunk_size
-            )
-            
-            # If no more messages, campaign is complete
-            if not messages:
-                logger.info(f"No more pending messages for campaign {campaign.id}")
-                await self.campaign_repository.update_campaign_status(
-                    campaign_id=campaign.id,
-                    status="completed",
-                    completed_at=datetime.utcnow()
-                )
-                return
-            
-            # Process this chunk
-            await self._process_message_chunk(campaign.id, messages)
-            
-            # Update offset for next chunk
-            offset += len(messages)
-            
-            # Small delay between chunks to avoid overloading
-            await asyncio.sleep(0.5)
-    
-    async def _process_message_chunk(self, campaign_id: str, messages: List[Any]) -> None:
-        """
-        Process a chunk of messages.
-        
-        Args:
-            campaign_id: Campaign ID
-            messages: List of message objects
-        """
-        # Process each message in the chunk
-        success_count = 0
-        fail_count = 0
-        
-        for message in messages:
-            try:
-                # Use SMS sender to send the message
-                # Note: This is not optimal for bulk processing and would be improved in future versions
-                result = await self.sms_sender._send_to_gateway(
-                    phone_number=message.phone_number,
-                    message_text=message.message,
-                    custom_id=message.custom_id or str(uuid.uuid4())
-                )
-                
-                # Update message status
-                await self.message_repository.update_message_status(
-                    message_id=message.id,
-                    status=result.get("status", MessageStatus.PENDING),
-                    event_type="campaign_process",
-                    gateway_message_id=result.get("gateway_message_id"),
-                    data=result
-                )
-                
-                success_count += 1
-                
-                # Add delay between messages to avoid overloading gateway
-                await asyncio.sleep(settings.DELAY_BETWEEN_SMS)
-                
-            except Exception as e:
-                logger.error(f"Error processing message {message.id}: {e}")
-                
-                # Update message status to failed
-                await self.message_repository.update_message_status(
-                    message_id=message.id,
-                    status=MessageStatus.FAILED,
-                    event_type="campaign_process_error",
-                    reason=str(e),
-                    data={"error": str(e)}
-                )
-                
-                fail_count += 1
-        
-        # Update campaign stats
-        await self.campaign_repository.update_campaign_stats(
-            campaign_id=campaign_id,
-            increment_sent=success_count,
-            increment_failed=fail_count
-        )
-        
-        logger.info(f"Processed chunk for campaign {campaign_id}: {success_count} sent, {fail_count} failed")
-
-
-# Dependency injection function
-async def get_campaign_processor():
-    """Get campaign processor service instance."""
-    from app.db.session import get_repository
-    from app.db.repositories.campaigns import CampaignRepository
-    from app.db.repositories.messages import MessageRepository
-    from app.services.event_bus.bus import get_event_bus
-    from app.services.sms.sender import get_sms_sender
-    
-    campaign_repository = await get_repository(CampaignRepository)
-    message_repository = await get_repository(MessageRepository)
-    sms_sender = await get_sms_sender()
-    event_bus = get_event_bus()
-    
-    return CampaignProcessor(
-        campaign_repository=campaign_repository,
-        message_repository=message_repository,
-        sms_sender=sms_sender,
-        event_bus=event_bus
-    )
-</file>
-
-<file path="app/services/rate_limiter.py">
-"""
-Rate limiting service for API request throttling.
-"""
-import asyncio
-import time
-from typing import Dict, Any, Optional, Tuple
-import logging
-from datetime import datetime
-
-from app.core.config import settings
-
-logger = logging.getLogger("inboxerr.rate_limiter")
-
-class RateLimiter:
-    """
-    Service for enforcing rate limits on API requests.
-    
-    Uses a simple in-memory storage for tracking request counts.
-    For production, consider using Redis or another distributed storage.
-    """
-    
-    def __init__(self):
-        """Initialize the rate limiter with default limits."""
-        self._requests = {}
-        self._lock = asyncio.Lock()
-        
-        # Default rate limits by operation type
-        self._rate_limits = {
-            "send_message": {"requests": 60, "period": 60},  # 60 requests per minute
-            "send_batch": {"requests": 10, "period": 60},    # 10 batch requests per minute
-            "import_messages": {"requests": 5, "period": 300},  # 5 imports per 5 minutes
-            "default": {"requests": 100, "period": 60},      # Default: 100 requests per minute
-        }
-    
-    async def check_rate_limit(
-        self, 
-        user_id: str, 
-        operation: str = "default"
-    ) -> bool:
-        """
-        Check if a request is within rate limits.
-        
-        Args:
-            user_id: ID of the user making the request
-            operation: Type of operation being performed
-            
-        Returns:
-            bool: True if request is allowed, raises exception otherwise
-            
-        Raises:
-            HTTPException: If rate limit is exceeded
-        """
-        from fastapi import HTTPException, status
-        
-        # Get rate limit for operation
-        limit = self._rate_limits.get(operation, self._rate_limits["default"])
-        
-        # Create key for this user and operation
-        key = f"{user_id}:{operation}"
-        
-        current_time = time.time()
-        
-        async with self._lock:
-            # Initialize if not exists
-            if key not in self._requests:
-                self._requests[key] = {"count": 0, "reset_at": current_time + limit["period"]}
-            
-            # Check if we need to reset the counter
-            if current_time > self._requests[key]["reset_at"]:
-                self._requests[key] = {"count": 0, "reset_at": current_time + limit["period"]}
-            
-            # Check if we're over the limit
-            if self._requests[key]["count"] >= limit["requests"]:
-                reset_in = int(self._requests[key]["reset_at"] - current_time)
-                logger.warning(f"Rate limit exceeded for {key}. Reset in {reset_in} seconds.")
-                
-                # Calculate when the rate limit will reset
-                reset_at = datetime.fromtimestamp(self._requests[key]["reset_at"])
-                
-                raise HTTPException(
-                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                    detail=f"Rate limit exceeded. Try again in {reset_in} seconds.",
-                    headers={"Retry-After": str(reset_in)}
-                )
-            
-            # Increment counter
-            self._requests[key]["count"] += 1
-            
-            logger.debug(f"Rate limit for {key}: {self._requests[key]['count']}/{limit['requests']}")
-            
-            return True
-    
-    def set_limit(self, operation: str, requests: int, period: int) -> None:
-        """
-        Set a custom rate limit for an operation.
-        
-        Args:
-            operation: Operation type to set limit for
-            requests: Maximum number of requests allowed
-            period: Time period in seconds
-        """
-        self._rate_limits[operation] = {"requests": requests, "period": period}
-    
-    async def get_limit_status(self, user_id: str, operation: str = "default") -> Dict[str, Any]:
-        """
-        Get current rate limit status for a user and operation.
-        
-        Args:
-            user_id: User ID
-            operation: Operation type
-            
-        Returns:
-            Dict: Rate limit status information
-        """
-        # Get rate limit for operation
-        limit = self._rate_limits.get(operation, self._rate_limits["default"])
-        
-        # Create key for this user and operation
-        key = f"{user_id}:{operation}"
-        
-        current_time = time.time()
-        
-        async with self._lock:
-            # Handle case where user hasn't made any requests yet
-            if key not in self._requests:
-                return {
-                    "limit": limit["requests"],
-                    "remaining": limit["requests"],
-                    "reset": int(current_time + limit["period"]),
-                    "used": 0
-                }
-            
-            # Reset counter if needed
-            if current_time > self._requests[key]["reset_at"]:
-                self._requests[key] = {"count": 0, "reset_at": current_time + limit["period"]}
-            
-            # Return current status
-            return {
-                "limit": limit["requests"],
-                "remaining": max(0, limit["requests"] - self._requests[key]["count"]),
-                "reset": int(self._requests[key]["reset_at"]),
-                "used": self._requests[key]["count"]
-            }
-
-
-# Singleton instance for dependency injection
-_rate_limiter = RateLimiter()
-
-def get_rate_limiter() -> RateLimiter:
-    """Get the singleton rate limiter instance."""
-    return _rate_limiter
-</file>
-
-<file path="app/services/sms/retry_engine.py">
-# app/services/sms/retry_engine.py
-import asyncio
-import logging
-from datetime import datetime, timedelta
-from typing import List, Dict, Any, Optional
-
-from app.core.config import settings
-from app.db.repositories.messages import MessageRepository
-from app.schemas.message import MessageStatus
-from app.services.event_bus.events import EventType
-from app.services.event_bus.bus import get_event_bus
-from app.core.exceptions import SMSGatewayError, RetryableError
-
-logger = logging.getLogger("inboxerr.retry")
-
-class RetryEngine:
-    """
-    Service for retrying failed messages.
-    
-    Periodically checks for failed messages and attempts to resend them.
-    """
-    
-    def __init__(self, message_repository: MessageRepository, event_bus: Any, sms_sender: Any):
-        """
-        Initialize retry engine with required dependencies.
-        
-        Args:
-            message_repository: Repository for message access
-            event_bus: Event bus for publishing events
-            sms_sender: SMS sender service for resending messages
-        """
-        self.message_repository = message_repository
-        self.event_bus = event_bus
-        self.sms_sender = sms_sender
-        self._running = False
-        self._semaphore = asyncio.Semaphore(5)  # Limit concurrent retries
-        
-    async def start(self) -> None:
-        """Start the retry engine."""
-        if self._running:
-            return
-            
-        self._running = True
-        logger.info("Starting retry engine")
-        
-        while self._running:
-            try:
-                await self._process_retries()
-            except Exception as e:
-                logger.error(f"Error in retry engine: {e}", exc_info=True)
-                
-            # Wait before next cycle
-            await asyncio.sleep(settings.RETRY_INTERVAL_SECONDS)
-            
-    async def stop(self) -> None:
-        """Stop the retry engine."""
-        self._running = False
-        logger.info("Retry engine stopped")
-    
-    async def _process_retries(self) -> None:
-        """Process messages pending retry."""
-        # Get messages that need retry
-        retry_candidates = await self._get_retry_candidates()
-        
-        if not retry_candidates:
-            logger.debug("No messages to retry")
-            return
-            
-        logger.info(f"Found {len(retry_candidates)} messages to retry")
-        
-        # Process retries with concurrency limit
-        tasks = []
-        for message in retry_candidates:
-            tasks.append(self._retry_message(message))
-            
-        if tasks:
-            # Process retries concurrently but with limit
-            for i in range(0, len(tasks), 5):  # Process in chunks of 5
-                chunk = tasks[i:i+5]
-                await asyncio.gather(*chunk)
-                await asyncio.sleep(1)  # Short delay between chunks
-    
-    async def _get_retry_candidates(self) -> List[Dict[str, Any]]:
-        """
-        Get messages that are candidates for retry.
-        
-        Returns:
-            List[Dict]: List of messages that should be retried
-        """
-        # Parameters for retry candidate selection
-        now = datetime.utcnow()
-        max_retries = settings.RETRY_MAX_ATTEMPTS
-        
-        # Query for messages that:
-        # 1. Are in a failed state
-        # 2. Have not exceeded max retry attempts
-        # 3. Have a retryable error or no error specified
-        # 4. Last retry attempt was long enough ago (based on exponential backoff)
-        
-        # This is a simplified implementation - in production you might want
-        # more sophisticated filtering and prioritization
-        failed_messages = await self.message_repository.get_retryable_messages(
-            max_retries=max_retries,
-            limit=50  # Limit number of messages to process in one cycle
-        )
-        
-        # Filter messages based on retry delay (exponential backoff)
-        retry_candidates = []
-        
-        for message in failed_messages:
-            # Get retry attempt count (from message metadata or events)
-            retry_count = self._get_retry_count(message)
-            
-            # Calculate backoff delay - 30s, 2m, 8m, 30m, 2h, etc.
-            backoff_seconds = 30 * (2 ** retry_count)
-            
-            # Get timestamp of last attempt
-            last_attempt = message.failed_at or message.updated_at
-            
-            # Check if enough time has passed for retry
-            if now - last_attempt > timedelta(seconds=backoff_seconds):
-                retry_candidates.append(message)
-        
-        return retry_candidates
-    
-    def _get_retry_count(self, message: Any) -> int:
-        """
-        Get the retry count for a message.
-        
-        Args:
-            message: Message object
-            
-        Returns:
-            int: Number of retry attempts
-        """
-        # Check if retry count is in metadata
-        meta_data = getattr(message, 'meta_data', {}) or {}
-        if isinstance(meta_data, dict) and 'retry_count' in meta_data:
-            return meta_data.get('retry_count', 0)
-            
-        # Fallback - count events of type "retry"
-        retry_events = [e for e in getattr(message, 'events', []) 
-                       if getattr(e, 'event_type', '') == 'retry']
-        return len(retry_events)
-    
-    async def _retry_message(self, message: Any) -> None:
-        """
-        Retry sending a message.
-        
-        Args:
-            message: Message to retry
-        """
-        message_id = message.id
-        phone_number = message.phone_number
-        message_text = message.message
-        custom_id = message.custom_id
-        
-        # Get current retry count
-        retry_count = self._get_retry_count(message)
-        
-        try:
-            logger.info(f"Retrying message {message_id} (attempt {retry_count + 1})")
-            
-            # Use semaphore to limit concurrent retries
-            async with self._semaphore:
-                # Reset status to pending for retry
-                await self.message_repository.update_message_status(
-                    message_id=message_id,
-                    status=MessageStatus.PENDING,
-                    event_type="retry",
-                    data={
-                        "retry_count": retry_count + 1,
-                        "previous_error": message.reason
-                    }
-                )
-                
-                # Update metadata to track retry count
-                meta_data = getattr(message, 'meta_data', {}) or {}
-                if isinstance(meta_data, dict):
-                    meta_data['retry_count'] = retry_count + 1
-                    await self.message_repository.update(
-                        id=message_id,
-                        obj_in={"meta_data": meta_data}
-                    )
-                
-                # Attempt to send again
-                result = await self.sms_sender._send_to_gateway(
-                    phone_number=phone_number,
-                    message_text=message_text,
-                    custom_id=custom_id or str(uuid.uuid4())
-                )
-                
-                # Update message status
-                await self.message_repository.update_message_status(
-                    message_id=message_id,
-                    status=result.get("status", MessageStatus.PENDING),
-                    event_type="retry_success",
-                    gateway_message_id=result.get("gateway_message_id"),
-                    data=result
-                )
-                
-                # Publish event
-                await self.event_bus.publish(
-                    EventType.MESSAGE_RETRIED,
-                    {
-                        "message_id": message_id,
-                        "phone_number": phone_number,
-                        "retry_count": retry_count + 1,
-                        "status": result.get("status", MessageStatus.PENDING)
-                    }
-                )
-                
-                logger.info(f"Successfully retried message {message_id}")
-                
-        except Exception as e:
-            logger.error(f"Error retrying message {message_id}: {e}")
-            
-            # Update status to failed with incremented retry count
-            error_message = str(e)
-            is_retryable = isinstance(e, RetryableError)
-            
-            await self.message_repository.update_message_status(
-                message_id=message_id,
-                status=MessageStatus.FAILED,
-                event_type="retry_failed",
-                reason=error_message,
-                data={
-                    "retry_count": retry_count + 1,
-                    "retryable": is_retryable
-                }
-            )
-            
-            # Publish event
-            await self.event_bus.publish(
-                EventType.MESSAGE_RETRY_FAILED,
-                {
-                    "message_id": message_id,
-                    "phone_number": phone_number,
-                    "retry_count": retry_count + 1,
-                    "error": error_message,
-                    "retryable": is_retryable
-                }
-            )
-
-
-# Singleton instance
-_retry_engine = None
-
-def get_retry_engine():
-    """Get the singleton retry engine instance."""
-    global _retry_engine
-    
-    if _retry_engine is None:
-        from app.db.session import get_repository
-        from app.db.repositories.messages import MessageRepository
-        from app.services.event_bus.bus import get_event_bus
-        from app.services.sms.sender import get_sms_sender
-        
-        message_repository = get_repository(MessageRepository)
-        event_bus = get_event_bus()
-        sms_sender = get_sms_sender()
-        
-        _retry_engine = RetryEngine(
-            message_repository=message_repository,
-            event_bus=event_bus,
-            sms_sender=sms_sender
-        )
-        
-    return _retry_engine
-</file>
-
-<file path="app/services/webhooks/models.py">
-# app/services/webhooks/models.py
-"""
-Pydantic models for webhook payloads from SMS Gateway.
-"""
-from datetime import datetime
-from typing import Dict, Any, Optional, Literal
-from pydantic import BaseModel, Field
-
-class SmsReceivedPayload(BaseModel):
-    """Payload for sms:received event."""
-    message_id: str = Field(..., alias="messageId")
-    message: str
-    phone_number: str = Field(..., alias="phoneNumber")
-    sim_number: Optional[int] = Field(None, alias="simNumber")
-    received_at: datetime = Field(..., alias="receivedAt")
-    
-class SmsSentPayload(BaseModel):
-    """Payload for sms:sent event."""
-    message_id: str = Field(..., alias="messageId")
-    phone_number: str = Field(..., alias="phoneNumber")
-    sim_number: Optional[int] = Field(None, alias="simNumber")
-    sent_at: datetime = Field(..., alias="sentAt")
-    
-class SmsDeliveredPayload(BaseModel):
-    """Payload for sms:delivered event."""
-    message_id: str = Field(..., alias="messageId")
-    phone_number: str = Field(..., alias="phoneNumber")
-    sim_number: Optional[int] = Field(None, alias="simNumber")
-    delivered_at: datetime = Field(..., alias="deliveredAt")
-    
-class SmsFailedPayload(BaseModel):
-    """Payload for sms:failed event."""
-    message_id: str = Field(..., alias="messageId")
-    phone_number: str = Field(..., alias="phoneNumber")
-    sim_number: Optional[int] = Field(None, alias="simNumber")
-    failed_at: datetime = Field(..., alias="failedAt")
-    reason: str
-    
-class SystemPingPayload(BaseModel):
-    """Payload for system:ping event."""
-    health: Dict[str, Any]
-    
-EventType = Literal["sms:received", "sms:sent", "sms:delivered", "sms:failed", "system:ping"]
-
-class WebhookPayload(BaseModel):
-    """Base webhook payload from SMS Gateway."""
-    device_id: str = Field(..., alias="deviceId")
-    event: EventType
-    id: str
-    webhook_id: str = Field(..., alias="webhookId")
-    payload: Dict[str, Any]  # Will be converted to specific payload types based on event
-</file>
-
-<file path="app/api/router.py">
-"""
-Main API router that includes all endpoint routers.
-"""
-from fastapi import APIRouter
-
-from app.api.v1.endpoints import auth, messages, webhooks, metrics, campaigns
-
-
-# Create main API router
-api_router = APIRouter()
-
-# Include all endpoint routers with appropriate tags
-api_router.include_router(
-    auth.router, 
-    prefix="/auth", 
-    tags=["Authentication"]
-)
-api_router.include_router(
-    messages.router, 
-    prefix="/messages", 
-    tags=["Messages"]
-)
-api_router.include_router(
-    campaigns.router, 
-    prefix="/campaigns", 
-    tags=["Campaigns"]
-)
-api_router.include_router(
-    webhooks.router, 
-    prefix="/webhooks", 
-    tags=["Webhooks"]
-)
-api_router.include_router(
-    metrics.router, 
-    prefix="/metrics", 
-    tags=["Metrics"]
-)
-</file>
-
-<file path="app/api/v1/dependencies.py">
-"""
-Dependencies for API endpoints.
-"""
-from fastapi import Depends, HTTPException, status, Header
-from fastapi.security import OAuth2PasswordBearer
-from typing import Optional, List
-import jwt
-from datetime import datetime, timedelta
-
-from app.core.config import settings
-from app.core.exceptions import AuthenticationError, AuthorizationError
-from app.schemas.user import User, TokenData, UserRole
-from app.db.repositories.users import UserRepository
-from app.services.rate_limiter import RateLimiter
-
-# OAuth2 scheme for token authentication
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"{settings.API_PREFIX}/auth/token")
-
-
-async def get_user_repository():
-    """Get user repository."""
-    from app.db.session import get_repository
-    return await get_repository(UserRepository)
-
-
-async def get_rate_limiter():
-    """Get rate limiter service."""
-    return RateLimiter()
-
-
-async def get_current_user(
-    token: str = Depends(oauth2_scheme),
-    user_repository = Depends(get_user_repository)
-) -> User:
-    """
-    Get the current authenticated user from the JWT token.
-    
-    Args:
-        token: JWT token from Authorization header
-        user_repository: User repository for database access
-        
-    Returns:
-        User: The authenticated user
-        
-    Raises:
-        AuthenticationError: If the token is invalid or expired
-    """
-    try:
-        # Decode JWT token
-        payload = jwt.decode(
-            token, 
-            settings.SECRET_KEY, 
-            algorithms=["HS256"]
-        )
-        token_data = TokenData(**payload)
-        
-        # Check if token is expired
-        if token_data.exp and datetime.utcnow() > token_data.exp:
-            raise AuthenticationError("Token has expired")
-        
-        # Get user from database
-        user = await user_repository.get_by_id(token_data.sub)
-        if not user:
-            raise AuthenticationError("User not found")
-        
-        # Check if user is active
-        if not user.is_active:
-            raise AuthenticationError("User is inactive")
-        
-        return user
-        
-    except jwt.PyJWTError:
-        raise AuthenticationError("Invalid token")
-
-
-async def verify_api_key(
-    api_key: str = Header(..., alias=settings.API_KEY_HEADER),
-    user_repository = Depends(get_user_repository)
-) -> User:
-    """
-    Verify API key and return the associated user.
-    
-    Args:
-        api_key: API key from header
-        user_repository: User repository for database access
-        
-    Returns:
-        User: The authenticated user
-        
-    Raises:
-        AuthenticationError: If the API key is invalid
-    """
-    try:
-        # Get API key from database
-        api_key_record = await user_repository.get_api_key(api_key)
-        if not api_key_record:
-            raise AuthenticationError("Invalid API key")
-        
-        # Check if API key is active
-        if not api_key_record.is_active:
-            raise AuthenticationError("API key is inactive")
-        
-        # Check if API key is expired
-        if api_key_record.expires_at and datetime.utcnow() > api_key_record.expires_at:
-            raise AuthenticationError("API key has expired")
-        
-        # Get user associated with API key
-        user = await user_repository.get_by_id(api_key_record.user_id)
-        if not user:
-            raise AuthenticationError("User not found")
-        
-        # Check if user is active
-        if not user.is_active:
-            raise AuthenticationError("User is inactive")
-        
-        # Update last used timestamp
-        await user_repository.update_api_key_usage(api_key)
-        
-        return user
-        
-    except Exception as e:
-        if isinstance(e, AuthenticationError):
-            raise
-        raise AuthenticationError("API key verification failed")
-
-
-async def get_current_active_user(
-    current_user: User = Depends(get_current_user)
-) -> User:
-    """
-    Get the current active user.
-    
-    Args:
-        current_user: Current authenticated user
-        
-    Returns:
-        User: The authenticated active user
-        
-    Raises:
-        AuthenticationError: If the user is inactive
-    """
-    if not current_user.is_active:
-        raise AuthenticationError("Inactive user")
-    return current_user
-
-
-async def validate_permissions(
-    required_permissions: List[str],
-    current_user: User = Depends(get_current_user)
-) -> None:
-    """
-    Validate that the current user has the required permissions.
-    
-    Args:
-        required_permissions: List of required permissions
-        current_user: Current authenticated user
-        
-    Raises:
-        AuthorizationError: If the user doesn't have the required permissions
-    """
-    # Admin role has all permissions
-    if current_user.role == UserRole.ADMIN:
-        return
-    
-    # TODO: Implement proper permission checking
-    # For now, just verify role-based access
-    if current_user.role != UserRole.API and "api" in required_permissions:
-        raise AuthorizationError("Insufficient permissions")
-</file>
-
-<file path="app/api/v1/endpoints/auth.py">
-"""
-API endpoints for authentication.
-"""
-from datetime import datetime, timedelta
-from typing import List, Optional
-
-from fastapi import APIRouter, Depends, HTTPException, status, Body
-from fastapi.security import OAuth2PasswordRequestForm
-
-from app.core.config import settings
-from app.core.exceptions import AuthenticationError, AuthorizationError, NotFoundError
-from app.api.v1.dependencies import (
-    get_current_user,
-    get_user_repository,
-    validate_permissions
-)
-from app.schemas.user import (
-    User,
-    UserCreate,
-    Token,
-    APIKey,
-    APIKeyCreate
-)
-from app.core.security import (
-    create_access_token,
-    verify_password,
-    get_password_hash
-)
-
-router = APIRouter()
-
-
-@router.post("/token", response_model=Token)
-async def login_for_access_token(
-    form_data: OAuth2PasswordRequestForm = Depends(),
-    user_repository = Depends(get_user_repository)
-):
-    """
-    OAuth2 compatible token login, get an access token for future requests.
-    """
-    try:
-        # Authenticate user
-        user = await user_repository.get_by_email(form_data.username)
-        if not user:
-            raise AuthenticationError("Incorrect email or password")
-        
-        # Verify password
-        if not verify_password(form_data.password, user.hashed_password):
-            raise AuthenticationError("Incorrect email or password")
-        
-        # Check if user is active
-        if not user.is_active:
-            raise AuthenticationError("Inactive user")
-        
-        # Create access token
-        access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-        expires_at = datetime.utcnow() + access_token_expires
-        
-        access_token = create_access_token(
-            data={
-                "sub": str(user.id),
-                "role": user.role,
-                "exp": expires_at
-            },
-            expires_delta=access_token_expires
-        )
-        
-        return {
-            "access_token": access_token,
-            "token_type": "bearer",
-            "expires_at": expires_at
-        }
-        
-    except AuthenticationError as e:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=str(e),
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-
-@router.post("/register", response_model=User, status_code=status.HTTP_201_CREATED)
-async def register_user(
-    user_data: UserCreate,
-    user_repository = Depends(get_user_repository)
-):
-    """
-    Register a new user.
-    """
-    # Check if user already exists
-    existing_user = await user_repository.get_by_email(user_data.email)
-    if existing_user:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Email already registered"
-        )
-    
-    # Create new user
-    hashed_password = get_password_hash(user_data.password)
-    
-    user = await user_repository.create(
-        email=user_data.email,
-        hashed_password=hashed_password,
-        full_name=user_data.full_name,
-        is_active=user_data.is_active,
-        role=user_data.role
-    )
-    
-    return user
-
-
-@router.get("/me", response_model=User)
-async def read_users_me(
-    current_user: User = Depends(get_current_user)
-):
-    """
-    Get current user information.
-    """
-    return current_user
-
-
-@router.post("/keys", response_model=APIKey)
-async def create_api_key(
-    api_key_data: APIKeyCreate,
-    current_user: User = Depends(get_current_user),
-    user_repository = Depends(get_user_repository)
-):
-    """
-    Create a new API key.
-    
-    This is the only time the full API key will be returned.
-    """
-    # Create API key
-    api_key = await user_repository.create_api_key(
-        user_id=current_user.id,
-        name=api_key_data.name,
-        expires_at=api_key_data.expires_at,
-        permissions=api_key_data.permissions
-    )
-    
-    return api_key
-
-
-@router.get("/keys", response_model=List[APIKey])
-async def list_api_keys(
-    current_user: User = Depends(get_current_user),
-    user_repository = Depends(get_user_repository)
-):
-    """
-    List all API keys for the current user.
-    
-    Note: The full API key value is not returned, only the ID and metadata.
-    """
-    # List API keys
-    api_keys = await user_repository.list_api_keys(user_id=current_user.id)
-    
-    # Remove sensitive information
-    for key in api_keys:
-        key.key = f"{key.key[:8]}..." if key.key else None
-    
-    return api_keys
-
-
-@router.delete("/keys/{key_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_api_key(
-    key_id: str,
-    current_user: User = Depends(get_current_user),
-    user_repository = Depends(get_user_repository)
-):
-    """
-    Delete an API key.
-    """
-    # Get API key
-    api_key = await user_repository.get_api_key_by_id(key_id)
-    if not api_key:
-        raise NotFoundError(message="API key not found")
-    
-    # Check ownership
-    if api_key.user_id != str(current_user.id) and current_user.role != "admin":
-        raise AuthorizationError(message="Not authorized to delete this API key")
-    
-    # Delete API key
-    success = await user_repository.delete_api_key(key_id)
-    if not success:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to delete API key"
-        )
-    
-    return None
-</file>
-
 <file path="app/api/v1/endpoints/messages.py">
 """
 API endpoints for SMS message management.
@@ -2553,181 +1565,6 @@ async def get_task_status(
         raise HTTPException(status_code=500, detail=f"Error retrieving task status: {str(e)}")
 </file>
 
-<file path="app/api/v1/endpoints/metrics.py">
-"""
-API endpoints for metrics and reporting.
-"""
-from fastapi import APIRouter, Depends, HTTPException
-
-from app.api.v1.dependencies import get_current_user
-from app.schemas.user import User
-
-router = APIRouter()
-
-@router.get("/")
-async def get_metrics(
-    current_user: User = Depends(get_current_user)
-):
-    """
-    Get system metrics and statistics.
-    """
-    # This is a stub - implementation will be added later
-    return {
-        "message_count": {
-            "total": 0,
-            "sent": 0,
-            "delivered": 0,
-            "failed": 0
-        },
-        "user_count": 1,
-        "webhook_count": 0
-    }
-
-@router.get("/usage")
-async def get_usage_metrics(
-    current_user: User = Depends(get_current_user)
-):
-    """
-    Get usage metrics for the current user.
-    """
-    # This is a stub - implementation will be added later
-    return {
-        "message_count": 0,
-        "quota": {
-            "used": 0,
-            "total": 1000
-        }
-    }
-</file>
-
-<file path="app/api/v1/endpoints/webhooks.py">
-# app/api/v1/endpoints/webhooks.py
-"""
-API endpoints for webhook management.
-"""
-import logging
-from typing import Dict, Any
-from fastapi import APIRouter, Depends, HTTPException, Request, Body, Header, status
-
-from app.api.v1.dependencies import get_current_user
-from app.schemas.user import User
-from app.services.webhooks.manager import process_gateway_webhook
-
-router = APIRouter()
-logger = logging.getLogger("inboxerr.webhooks")
-
-@router.get("/")
-async def list_webhooks(
-    current_user: User = Depends(get_current_user)
-):
-    """
-    List all webhooks for the current user.
-    """
-    # This is a stub - implementation will be added later
-    return {"message": "Webhook listing not implemented yet"}
-
-@router.post("/gateway", status_code=status.HTTP_200_OK)
-async def webhook_receiver(
-    request: Request,
-    x_signature: str = Header(None),
-    x_timestamp: str = Header(None)
-):
-    """
-    Receive webhooks from the SMS Gateway.
-    
-    This endpoint is called by the SMS Gateway when events occur.
-    No authentication is required as we validate using signatures.
-    """
-    # Get raw body for signature validation
-    body = await request.body()
-    
-    # Prepare headers for signature verification
-    headers = {
-        "X-Signature": x_signature,
-        "X-Timestamp": x_timestamp
-    }
-    
-    # Process the webhook
-    success, result = await process_gateway_webhook(body, headers)
-    
-    if not success:
-        logger.error(f"Error processing webhook: {result.get('error')}")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=result.get('error', 'Error processing webhook')
-        )
-    
-    return result
-</file>
-
-<file path="app/core/config.py">
-"""
-Application settings and configuration management.
-"""
-from typing import List, Optional, Union
-from pydantic import AnyHttpUrl, validator, field_validator
-from pydantic_settings import BaseSettings
-
-
-class Settings(BaseSettings):
-    """Application settings."""
-    # Base
-    PROJECT_NAME: str = "Inboxerr Backend"
-    PROJECT_DESCRIPTION: str = "API backend for SMS management and delivery"
-    VERSION: str = "0.1.0"
-    API_PREFIX: str = "/api/v1"
-    DEBUG: bool = False
-    
-    # CORS
-    BACKEND_CORS_ORIGINS: List[Union[str, AnyHttpUrl]] = []
-
-    @field_validator("BACKEND_CORS_ORIGINS", mode='before')
-    def assemble_cors_origins(cls, v: Union[str, List[str]]) -> Union[List[str], str]:
-        """Parse CORS origins from string or list."""
-        if isinstance(v, str) and not v.startswith("["):
-            return [i.strip() for i in v.split(",")]
-        elif isinstance(v, (list, str)):
-            return v
-        raise ValueError(v)
-    
-    # Authentication
-    SECRET_KEY: str = "CHANGEME_IN_PRODUCTION"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 1 day
-    API_KEY_HEADER: str = "X-API-Key"
-    
-    # Database
-    DATABASE_URL: str = "sqlite+aiosqlite:///./inboxerr.db"
-    
-    # SMS Gateway
-    SMS_GATEWAY_URL: str = "https://endpointnumber1.work.gd/api/3rdparty/v1"
-    SMS_GATEWAY_LOGIN: str = ""
-    SMS_GATEWAY_PASSWORD: str = ""
-    
-    # Webhook
-    API_BASE_URL: str = "http://localhost:8000"  # Base URL for webhooks
-    WEBHOOK_SIGNATURE_KEY: Optional[str] = None
-    WEBHOOK_TIMESTAMP_TOLERANCE: int = 300  # 5 minutes
-    
-    # SMS Processing
-    BATCH_SIZE: int = 100
-    DELAY_BETWEEN_SMS: float = 0.3  # seconds
-    RETRY_ENABLED: bool = True
-    RETRY_MAX_ATTEMPTS: int = 3
-    RETRY_INTERVAL_SECONDS: int = 60
-    
-    # Logging
-    LOG_LEVEL: str = "INFO"
-    
-    class Config:
-        """Pydantic config."""
-        case_sensitive = True
-        env_file = ".env"
-
-
-# Create singleton settings instance
-settings = Settings()
-</file>
-
 <file path="app/core/events.py">
 """
 Event handlers for application lifecycle events.
@@ -2776,7 +1613,7 @@ async def startup_event_handler() -> None:
     if settings.RETRY_ENABLED:
         try:
             from app.services.sms.retry_engine import get_retry_engine
-            retry_engine = get_retry_engine()
+            retry_engine = await get_retry_engine()
             retry_task = asyncio.create_task(retry_engine.start())
             background_tasks.append(retry_task)
             logger.info("Retry engine started successfully")
@@ -3174,6 +2011,7 @@ from app.models.base import Base
 
 # Import all models
 from app.models.user import User, APIKey
+from app.models.campaign import Campaign
 from app.models.message import Message, MessageEvent, MessageBatch, MessageTemplate
 from app.models.webhook import Webhook, WebhookDelivery, WebhookEvent
 
@@ -3390,416 +2228,186 @@ class BaseRepository(Generic[ModelType, CreateSchemaType, UpdateSchemaType]):
         return result.scalar_one()
 </file>
 
-<file path="app/db/repositories/messages.py">
-"""
-Message repository for database operations related to SMS messages.
-"""
+<file path="app/db/repositories/campaigns.py">
+# app/db/repositories/campaigns.py
 from datetime import datetime
 from typing import List, Optional, Dict, Any, Tuple
 from uuid import uuid4
 
-from sqlalchemy import select, update, delete, and_, or_, desc, func
+from sqlalchemy import select, update, and_, or_, desc, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.repositories.base import BaseRepository
-from app.models.message import Message, MessageEvent, MessageBatch, MessageTemplate
-from app.schemas.message import MessageCreate, MessageStatus
+from app.models.campaign import Campaign
+from app.models.message import Message
 
 
-class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
-    """Message repository for database operations."""
+class CampaignRepository(BaseRepository[Campaign, Dict[str, Any], Dict[str, Any]]):
+    """Campaign repository for campaign operations."""
     
     def __init__(self, session: AsyncSession):
-        """Initialize with session and Message model."""
-        super().__init__(session=session, model=Message)
+        """Initialize repository with session."""
+        super().__init__(session=session, model=Campaign)
     
-    async def create_message(
+    async def create_campaign(
         self,
         *,
-        phone_number: str,
-        message_text: str,
-        user_id: str,
-        custom_id: Optional[str] = None,
-        scheduled_at: Optional[datetime] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        batch_id: Optional[str] = None
-    ) -> Message:
-        """
-        Create a new message.
-        
-        Args:
-            phone_number: Recipient phone number
-            message_text: Message content
-            user_id: User who is sending the message
-            custom_id: Optional custom ID for tracking
-            scheduled_at: Optional scheduled time
-            metadata: Optional additional data
-            batch_id: Optional batch ID
-            
-        Returns:
-            Message: Created message
-        """
-        # Set initial status based on scheduling
-        initial_status = MessageStatus.SCHEDULED if scheduled_at else MessageStatus.PENDING
-        
-        # Calculate SMS parts (simple calculation, can be improved)
-        parts_count = (len(message_text) + 159) // 160  # 160 chars per SMS part, rounded up
-        
-        # Create message
-        message = Message(
-            id=str(uuid4()),
-            custom_id=custom_id or str(uuid4()),
-            phone_number=phone_number,
-            message=message_text,
-            status=initial_status,
-            scheduled_at=scheduled_at,
-            user_id=user_id,
-            meta_data=metadata or {},  # Use meta_data instead of metadata
-            parts_count=parts_count,
-            batch_id=batch_id
-        )
-        
-        self.session.add(message)
-        
-        # Create initial event
-        event = MessageEvent(
-            id=str(uuid4()),
-            message_id=message.id,
-            event_type="created",
-            status=initial_status,
-            data={
-                "phone_number": phone_number,
-                "scheduled_at": scheduled_at.isoformat() if scheduled_at else None
-            }
-        )
-        
-        self.session.add(event)
-        await self.session.commit()
-        await self.session.refresh(message)
-        
-        return message
-    
-    async def update_message_status(
-        self,
-        *,
-        message_id: str,
-        status: str,
-        event_type: str,
-        reason: Optional[str] = None,
-        gateway_message_id: Optional[str] = None,
-        data: Optional[Dict[str, Any]] = None
-    ) -> Optional[Message]:
-        """
-        Update message status.
-        
-        Args:
-            message_id: Message ID
-            status: New status
-            event_type: Event type triggering this update
-            reason: Optional reason for status change
-            gateway_message_id: Optional gateway message ID
-            data: Optional additional data
-            
-        Returns:
-            Message: Updated message or None
-        """
-        # Get the message
-        message = await self.get_by_id(message_id)
-        if not message:
-            return None
-        
-        # Update status-specific timestamp
-        now = datetime.utcnow()
-        update_data = {
-            "status": status,
-            "updated_at": now,
-        }
-        
-        if status == MessageStatus.SENT:
-            update_data["sent_at"] = now
-        elif status == MessageStatus.DELIVERED:
-            update_data["delivered_at"] = now
-        elif status == MessageStatus.FAILED:
-            update_data["failed_at"] = now
-            update_data["reason"] = reason
-        
-        # Set gateway message ID if provided
-        if gateway_message_id:
-            update_data["gateway_message_id"] = gateway_message_id
-        
-        # Update the message
-        await self.session.execute(
-            update(Message)
-            .where(Message.id == message_id)
-            .values(**update_data)
-        )
-        
-        # Create event for status change
-        event = MessageEvent(
-            id=str(uuid4()),
-            message_id=message_id,
-            event_type=event_type,
-            status=status,
-            data=data or {}
-        )
-        
-        self.session.add(event)
-        await self.session.commit()
-        
-        # Refresh the message
-        await self.session.refresh(message)
-        
-        return message
-
-    async def create_batch(
-        self,
-        *,
-        user_id: str,
         name: str,
-        total: int
-    ) -> MessageBatch:
+        user_id: str,
+        description: Optional[str] = None,
+        scheduled_start_at: Optional[datetime] = None,
+        scheduled_end_at: Optional[datetime] = None,
+        settings: Optional[Dict[str, Any]] = None
+    ) -> Campaign:
         """
-        Create a new message batch.
+        Create a new campaign.
         
         Args:
+            name: Campaign name
             user_id: User ID
-            name: Batch name
-            total: Total number of messages
+            description: Optional campaign description
+            scheduled_start_at: Optional scheduled start time
+            scheduled_end_at: Optional scheduled end time
+            settings: Optional campaign settings
             
         Returns:
-            MessageBatch: Created batch
+            Campaign: Created campaign
         """
-        batch = MessageBatch(
+        campaign = Campaign(
             id=str(uuid4()),
             name=name,
-            total=total,
-            processed=0,
-            successful=0,
-            failed=0,
-            status=MessageStatus.PENDING,
-            user_id=user_id
+            description=description,
+            status="draft",
+            user_id=user_id,
+            scheduled_start_at=scheduled_start_at,
+            scheduled_end_at=scheduled_end_at,
+            settings=settings or {}
         )
         
-        self.session.add(batch)
+        self.session.add(campaign)
         await self.session.commit()
-        await self.session.refresh(batch)
+        await self.session.refresh(campaign)
         
-        return batch
-
-    async def update_batch_progress(
-        self,
-        *,
-        batch_id: str,
-        increment_processed: int = 0,
-        increment_successful: int = 0,
-        increment_failed: int = 0,
-        status: Optional[str] = None
-    ) -> Optional[MessageBatch]:
-        """
-        Update batch progress.
-        
-        Args:
-            batch_id: Batch ID
-            increment_processed: Increment processed count
-            increment_successful: Increment successful count
-            increment_failed: Increment failed count
-            status: Optional new status
-            
-        Returns:
-            MessageBatch: Updated batch or None
-        """
-        batch = await self.get_by_id(batch_id)
-        if not batch:
-            return None
-        
-        # Update counts
-        batch.processed += increment_processed
-        batch.successful += increment_successful
-        batch.failed += increment_failed
-        
-        # Update status if provided
-        if status:
-            batch.status = status
-            
-        # If all messages processed, update status and completion time
-        if batch.processed >= batch.total:
-            batch.status = MessageStatus.PROCESSED if batch.failed == 0 else "partial"
-            batch.completed_at = datetime.utcnow()
-        
-        self.session.add(batch)
-        await self.session.commit()
-        await self.session.refresh(batch)
-        
-        return batch
-
-    async def get_by_custom_id(self, custom_id: str) -> Optional[Message]:
-        """
-        Get message by custom ID.
-        
-        Args:
-            custom_id: Custom ID
-            
-        Returns:
-            Message: Found message or None
-        """
-        return await self.get_by_attribute("custom_id", custom_id)
-
-    async def get_by_gateway_id(self, gateway_id: str) -> Optional[Message]:
-        """
-        Get message by gateway ID.
-        
-        Args:
-            gateway_id: Gateway message ID
-            
-        Returns:
-            Message: Found message or None
-        """
-        return await self.get_by_attribute("gateway_message_id", gateway_id)
-
-    async def list_messages_for_user(
-        self,
-        *,
-        user_id: str,
-        status: Optional[str] = None,
-        phone_number: Optional[str] = None,
-        from_date: Optional[str] = None,
-        to_date: Optional[str] = None,
-        campaign_id: Optional[str] = None,
-        skip: int = 0,
-        limit: int = 20
-    ) -> Tuple[List[Message], int]:
-        """
-        List messages for user with filtering.
-        
-        Args:
-            user_id: User ID
-            status: Optional status filter
-            phone_number: Optional phone number filter
-            from_date: Optional from date filter
-            to_date: Optional to date filter
-            campaign_id: Optional campaign ID filter
-            skip: Number of records to skip
-            limit: Maximum number of records to return
-            
-        Returns:
-            Tuple[List[Message], int]: List of messages and total count
-        """
-        # Base query
-        query = select(Message).where(Message.user_id == user_id)
-        count_query = select(func.count()).select_from(Message).where(Message.user_id == user_id)
-        
-        # Apply filters
-        if status:
-            query = query.where(Message.status == status)
-            count_query = count_query.where(Message.status == status)
-        
-        if phone_number:
-            query = query.where(Message.phone_number == phone_number)
-            count_query = count_query.where(Message.phone_number == phone_number)
-
-        if campaign_id:
-            query = query.where(Message.campaign_id == campaign_id)
-            count_query = count_query.where(Message.campaign_id == campaign_id)
-        
-        if from_date:
-            try:
-                from_date_obj = datetime.fromisoformat(from_date.replace('Z', '+00:00'))
-                query = query.where(Message.created_at >= from_date_obj)
-                count_query = count_query.where(Message.created_at >= from_date_obj)
-            except ValueError:
-                pass
-        
-        if to_date:
-            try:
-                to_date_obj = datetime.fromisoformat(to_date.replace('Z', '+00:00'))
-                query = query.where(Message.created_at <= to_date_obj)
-                count_query = count_query.where(Message.created_at <= to_date_obj)
-            except ValueError:
-                pass
-        
-        # Order by created_at desc
-        query = query.order_by(desc(Message.created_at))
-        
-        # Pagination
-        query = query.offset(skip).limit(limit)
-        
-        # Execute queries
-        result = await self.session.execute(query)
-        count_result = await self.session.execute(count_query)
-        
-        messages = result.scalars().all()
-        total = count_result.scalar_one()
-        
-        return messages, total
-
-    async def get_messages_for_batch(
-        self,
-        *,
-        batch_id: str,
-        skip: int = 0,
-        limit: int = 20
-    ) -> Tuple[List[Message], int]:
-        """
-        Get messages for a batch.
-        
-        Args:
-            batch_id: Batch ID
-            skip: Number of records to skip
-            limit: Maximum number of records to return
-            
-        Returns:
-            Tuple[List[Message], int]: List of messages and total count
-        """
-        # Base query
-        query = select(Message).where(Message.batch_id == batch_id)
-        count_query = select(func.count()).select_from(Message).where(Message.batch_id == batch_id)
-        
-        # Order by created_at desc
-        query = query.order_by(desc(Message.created_at))
-        
-        # Pagination
-        query = query.offset(skip).limit(limit)
-        
-        # Execute queries
-        result = await self.session.execute(query)
-        count_result = await self.session.execute(count_query)
-        
-        messages = result.scalars().all()
-        total = count_result.scalar_one()
-        
-        return messages, total
+        return campaign
     
-    async def get_messages_for_campaign(
+    async def update_campaign_status(
         self,
         *,
         campaign_id: str,
-        status: Optional[str] = None,
-        skip: int = 0,
-        limit: int = 20
-    ) -> Tuple[List[Message], int]:
+        status: str,
+        started_at: Optional[datetime] = None,
+        completed_at: Optional[datetime] = None
+    ) -> Optional[Campaign]:
         """
-        Get messages for a campaign.
+        Update campaign status.
         
         Args:
             campaign_id: Campaign ID
+            status: New status
+            started_at: Optional start timestamp
+            completed_at: Optional completion timestamp
+            
+        Returns:
+            Campaign: Updated campaign or None
+        """
+        campaign = await self.get_by_id(campaign_id)
+        if not campaign:
+            return None
+        
+        campaign.status = status
+        
+        if started_at:
+            campaign.started_at = started_at
+        
+        if completed_at:
+            campaign.completed_at = completed_at
+        
+        # If status is active and no start time, set it now
+        if status == "active" and not campaign.started_at:
+            campaign.started_at = datetime.utcnow()
+        
+        # If status is completed and no completion time, set it now
+        if status in ["completed", "cancelled", "failed"] and not campaign.completed_at:
+            campaign.completed_at = datetime.utcnow()
+        
+        self.session.add(campaign)
+        await self.session.commit()
+        await self.session.refresh(campaign)
+        
+        return campaign
+    
+    async def update_campaign_stats(
+        self,
+        *,
+        campaign_id: str,
+        increment_sent: int = 0,
+        increment_delivered: int = 0,
+        increment_failed: int = 0
+    ) -> Optional[Campaign]:
+        """
+        Update campaign statistics.
+        
+        Args:
+            campaign_id: Campaign ID
+            increment_sent: Increment sent count
+            increment_delivered: Increment delivered count
+            increment_failed: Increment failed count
+            
+        Returns:
+            Campaign: Updated campaign or None
+        """
+        campaign = await self.get_by_id(campaign_id)
+        if not campaign:
+            return None
+        
+        # Update counts
+        campaign.sent_count += increment_sent
+        campaign.delivered_count += increment_delivered
+        campaign.failed_count += increment_failed
+        
+        # Check if campaign is complete
+        total_processed = campaign.sent_count + campaign.failed_count
+        if total_processed >= campaign.total_messages and campaign.total_messages > 0:
+            campaign.status = "completed"
+            campaign.completed_at = datetime.utcnow()
+        
+        self.session.add(campaign)
+        await self.session.commit()
+        await self.session.refresh(campaign)
+        
+        return campaign
+    
+    async def get_campaigns_for_user(
+        self,
+        *,
+        user_id: str,
+        status: Optional[str] = None,
+        skip: int = 0,
+        limit: int = 20
+    ) -> Tuple[List[Campaign], int]:
+        """
+        Get campaigns for a user with optional filtering.
+        
+        Args:
+            user_id: User ID
             status: Optional status filter
             skip: Number of records to skip
             limit: Maximum number of records to return
             
         Returns:
-            Tuple[List[Message], int]: List of messages and total count
+            Tuple[List[Campaign], int]: List of campaigns and total count
         """
         # Base query
-        query = select(Message).where(Message.campaign_id == campaign_id)
-        count_query = select(func.count()).select_from(Message).where(Message.campaign_id == campaign_id)
+        query = select(Campaign).where(Campaign.user_id == user_id)
+        count_query = select(func.count()).select_from(Campaign).where(Campaign.user_id == user_id)
         
         # Apply status filter
         if status:
-            query = query.where(Message.status == status)
-            count_query = count_query.where(Message.status == status)
+            query = query.where(Campaign.status == status)
+            count_query = count_query.where(Campaign.status == status)
         
         # Order by created_at desc
-        query = query.order_by(desc(Message.created_at))
+        query = query.order_by(desc(Campaign.created_at))
         
         # Apply pagination
         query = query.offset(skip).limit(limit)
@@ -3808,42 +2416,69 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
         result = await self.session.execute(query)
         count_result = await self.session.execute(count_query)
         
-        messages = result.scalars().all()
+        campaigns = result.scalars().all()
         total = count_result.scalar_one()
         
-        return messages, total
-
-    async def get_retryable_messages(
+        return campaigns, total
+    
+    async def add_messages_to_campaign(
         self,
         *,
-        max_retries: int = 3,
-        limit: int = 50
-    ) -> List[Message]:
+        campaign_id: str,
+        phone_numbers: List[str],
+        message_text: str,
+        user_id: str
+    ) -> int:
         """
-        Get messages that can be retried.
+        Add messages to a campaign.
         
         Args:
-            max_retries: Maximum number of retry attempts
-            limit: Maximum number of messages to return
+            campaign_id: Campaign ID
+            phone_numbers: List of recipient phone numbers
+            message_text: Message content
+            user_id: User ID
             
         Returns:
-            List[Message]: List of retryable messages
+            int: Number of messages added
         """
-        # Query for failed messages that can be retried
-        query = select(Message).where(
-            and_(
-                Message.status == MessageStatus.FAILED,
-                or_(
-                    # Either no retry count in metadata
-                    ~Message.meta_data.has_key("retry_count"),
-                    # Or retry count less than max
-                    Message.meta_data["retry_count"].as_integer() < max_retries
-                )
-            )
-        ).order_by(Message.failed_at).limit(limit)
+        from app.db.repositories.messages import MessageRepository
+        from app.utils.phone import validate_phone
         
-        result = await self.session.execute(query)
-        return result.scalars().all()
+        # Get campaign
+        campaign = await self.get_by_id(campaign_id)
+        if not campaign:
+            return 0
+        
+        # Validate campaign belongs to user
+        if campaign.user_id != user_id:
+            return 0
+        
+        # TODO: Implement bulk insertion for better performance
+        message_repo = MessageRepository(self.session)
+        added_count = 0
+        
+        for phone in phone_numbers:
+            # Basic validation
+            is_valid, formatted_number, _ = validate_phone(phone)
+            if is_valid:
+                # Add message to campaign
+                await message_repo.create_message(
+                    phone_number=formatted_number,
+                    message_text=message_text,
+                    user_id=user_id,
+                    scheduled_at=campaign.scheduled_start_at,
+                    metadata={"campaign_id": campaign_id},
+                    campaign_id=campaign_id  # Direct link to campaign
+                )
+                added_count += 1
+        
+        # Update campaign message count
+        if added_count > 0:
+            campaign.total_messages += added_count
+            self.session.add(campaign)
+            await self.session.commit()
+        
+        return added_count
 </file>
 
 <file path="app/db/repositories/users.py">
@@ -4656,12 +3291,10 @@ class Base:
         })
 </file>
 
-<file path="app/models/message.py">
-"""
-Database models for SMS messages.
-"""
+<file path="app/models/campaign.py">
+# app/models/campaign.py
 from datetime import datetime
-from typing import List, Optional, Dict, Any
+from typing import List, Optional
 
 from sqlalchemy import Column, String, DateTime, Boolean, JSON, Integer, ForeignKey, Text
 from sqlalchemy.orm import relationship
@@ -4669,82 +3302,52 @@ from sqlalchemy.orm import relationship
 from app.models.base import Base
 
 
-class Message(Base):
-    """SMS message model."""
+class Campaign(Base):
+    """Campaign model for bulk SMS messaging."""
     
-    # Core message data
-    custom_id = Column(String, unique=True, index=True, nullable=True)
-    phone_number = Column(String, nullable=False, index=True)
-    message = Column(Text, nullable=False)
-    status = Column(String, nullable=False, default="pending", index=True)
-
-    # Campaign relationship
-    campaign_id = Column(String, ForeignKey("campaign.id"), nullable=True, index=True)
-    campaign = relationship("Campaign", back_populates="messages")
+    # Basic campaign information
+    name = Column(String, nullable=False, index=True)
+    description = Column(Text, nullable=True)
     
-    # Timestamps for status tracking
-    scheduled_at = Column(DateTime, nullable=True, index=True)
-    sent_at = Column(DateTime, nullable=True)
-    delivered_at = Column(DateTime, nullable=True)
-    failed_at = Column(DateTime, nullable=True)
+    # Campaign status
+    status = Column(String, nullable=False, default="draft", index=True)  # draft, active, paused, completed, cancelled, failed
     
-    # Additional data
-    reason = Column(String, nullable=True)
-    gateway_message_id = Column(String, nullable=True, index=True)
-    user_id = Column(String, ForeignKey("user.id"), nullable=False, index=True)
-    meta_data = Column(JSON, nullable=True)  # Changed from 'metadata' to 'meta_data'
+    # Campaign statistics
+    total_messages = Column(Integer, default=0, nullable=False)
+    sent_count = Column(Integer, default=0, nullable=False)
+    delivered_count = Column(Integer, default=0, nullable=False)
+    failed_count = Column(Integer, default=0, nullable=False)
     
-    # SMS parts tracking
-    parts_count = Column(Integer, default=1, nullable=False)
-    
-    # Relationships
-    user = relationship("User", back_populates="messages")
-    events = relationship("MessageEvent", back_populates="message", cascade="all, delete-orphan")
-    batch_id = Column(String, ForeignKey("messagebatch.id"), nullable=True, index=True)
-    batch = relationship("MessageBatch", back_populates="messages")
-
-
-class MessageEvent(Base):
-    """Model for tracking message events and status changes."""
-    
-    message_id = Column(String, ForeignKey("message.id"), nullable=False, index=True)
-    event_type = Column(String, nullable=False, index=True)
-    status = Column(String, nullable=False)
-    data = Column(JSON, nullable=True)
-    
-    # Relationships
-    message = relationship("Message", back_populates="events")
-
-
-class MessageBatch(Base):
-    """Model for tracking message batches."""
-    
-    name = Column(String, nullable=True)
-    total = Column(Integer, default=0, nullable=False)
-    processed = Column(Integer, default=0, nullable=False)
-    successful = Column(Integer, default=0, nullable=False)
-    failed = Column(Integer, default=0, nullable=False)
-    status = Column(String, nullable=False, default="pending", index=True)
-    user_id = Column(String, ForeignKey("user.id"), nullable=False, index=True)
+    # Campaign configuration
+    scheduled_start_at = Column(DateTime, nullable=True, index=True)
+    scheduled_end_at = Column(DateTime, nullable=True)
+    started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
     
-    # Relationships
-    messages = relationship("Message", back_populates="batch")
-    user = relationship("User")
-
-
-class MessageTemplate(Base):
-    """Model for storing reusable message templates."""
+    # Campaign settings
+    settings = Column(JSON, nullable=True, default=dict)  # Store campaign-specific settings
     
-    name = Column(String, nullable=False, index=True)
-    content = Column(Text, nullable=False)
-    description = Column(String, nullable=True)
-    is_active = Column(Boolean, default=True, nullable=False)
+    # Ownership
     user_id = Column(String, ForeignKey("user.id"), nullable=False, index=True)
-    variables = Column(JSON, nullable=True)  # Define expected variables in the template
     
     # Relationships
     user = relationship("User")
+    messages = relationship("Message", back_populates="campaign")
+    
+    # Helper properties
+    @property
+    def progress_percentage(self) -> float:
+        """Calculate the campaign progress percentage."""
+        if self.total_messages == 0:
+            return 0
+        return round((self.sent_count / self.total_messages) * 100, 2)
+    
+    @property
+    def delivery_success_rate(self) -> float:
+        """Calculate the delivery success rate."""
+        if self.sent_count == 0:
+            return 0
+        return round((self.delivered_count / self.sent_count) * 100, 2)
 </file>
 
 <file path="app/models/user.py">
@@ -4856,6 +3459,93 @@ class WebhookEvent(Base):
     error_message = Column(String, nullable=True)
 </file>
 
+<file path="app/schemas/campaign.py">
+# app/schemas/campaign.py
+from typing import List, Optional, Dict, Any
+from datetime import datetime
+from uuid import UUID
+
+from pydantic import BaseModel, Field, validator
+
+
+class CampaignBase(BaseModel):
+    """Base schema for campaign data."""
+    name: str = Field(..., description="Campaign name")
+    description: Optional[str] = Field(None, description="Campaign description")
+    scheduled_start_at: Optional[datetime] = Field(None, description="Scheduled start time")
+    scheduled_end_at: Optional[datetime] = Field(None, description="Scheduled end time")
+    settings: Optional[Dict[str, Any]] = Field(default={}, description="Campaign settings")
+
+
+class CampaignCreate(CampaignBase):
+    """Schema for creating a new campaign."""
+    pass
+
+
+class CampaignCreateFromCSV(BaseModel):
+    """Schema for creating a campaign from CSV file."""
+    name: str = Field(..., description="Campaign name")
+    description: Optional[str] = Field(None, description="Campaign description")
+    message_template: str = Field(..., description="Message template to send")
+    scheduled_start_at: Optional[datetime] = Field(None, description="Scheduled start time")
+    scheduled_end_at: Optional[datetime] = Field(None, description="Scheduled end time")
+    settings: Optional[Dict[str, Any]] = Field(default={}, description="Campaign settings")
+
+
+class CampaignUpdate(BaseModel):
+    """Schema for updating a campaign."""
+    name: Optional[str] = Field(None, description="Campaign name")
+    description: Optional[str] = Field(None, description="Campaign description")
+    scheduled_start_at: Optional[datetime] = Field(None, description="Scheduled start time")
+    scheduled_end_at: Optional[datetime] = Field(None, description="Scheduled end time")
+    settings: Optional[Dict[str, Any]] = Field(None, description="Campaign settings")
+
+
+class CampaignStatus(BaseModel):
+    """Schema for campaign status update."""
+    status: str = Field(..., description="Campaign status")
+    
+    @validator("status")
+    def validate_status(cls, v):
+        """Validate status value."""
+        valid_statuses = ["draft", "active", "paused", "completed", "cancelled", "failed"]
+        if v not in valid_statuses:
+            raise ValueError(f"Status must be one of: {', '.join(valid_statuses)}")
+        return v
+
+
+class CampaignResponse(CampaignBase):
+    """Schema for campaign response."""
+    id: str = Field(..., description="Campaign ID")
+    status: str = Field(..., description="Campaign status")
+    total_messages: int = Field(..., description="Total number of messages")
+    sent_count: int = Field(..., description="Number of sent messages")
+    delivered_count: int = Field(..., description="Number of delivered messages")
+    failed_count: int = Field(..., description="Number of failed messages")
+    created_at: datetime = Field(..., description="Creation timestamp")
+    updated_at: datetime = Field(..., description="Last update timestamp")
+    started_at: Optional[datetime] = Field(None, description="Start timestamp")
+    completed_at: Optional[datetime] = Field(None, description="Completion timestamp")
+    user_id: str = Field(..., description="User ID")
+    
+    # Add computed fields
+    progress_percentage: float = Field(0, description="Progress percentage")
+    delivery_success_rate: float = Field(0, description="Delivery success rate")
+    
+    class Config:
+        """Pydantic config."""
+        from_attributes = True
+
+
+class CampaignListResponse(BaseModel):
+    """Schema for campaign list response with pagination."""
+    items: List[CampaignResponse]
+    total: int
+    page: int
+    size: int
+    pages: int
+</file>
+
 <file path="app/schemas/message.py">
 """
 Pydantic schemas for message-related API operations.
@@ -4922,7 +3612,7 @@ class MessageResponse(BaseModel):
     
     class Config:
         """Pydantic config."""
-        orm_mode = True
+        from_attributes = True
 
 
 class MessageStatusUpdate(BaseModel):
@@ -5039,7 +3729,7 @@ class User(UserBase):
     
     class Config:
         """Pydantic config."""
-        orm_mode = True
+        from_attributes = True
 
 
 class UserInDB(User):
@@ -5075,7 +3765,7 @@ class APIKey(BaseModel):
     
     class Config:
         """Pydantic config."""
-        orm_mode = True
+        from_attributes = True
 
 
 class APIKeyCreate(BaseModel):
@@ -5083,6 +3773,373 @@ class APIKeyCreate(BaseModel):
     name: str = Field(..., description="API key name")
     expires_at: Optional[datetime] = Field(None, description="Expiration timestamp")
     permissions: Optional[List[str]] = Field(default=[], description="List of permissions")
+</file>
+
+<file path="app/scripts/create_admin.py">
+# scripts/create_admin.py
+import asyncio
+import sys
+from pathlib import Path
+
+# Add parent directory to path
+sys.path.append(str(Path(__file__).parent.parent))
+
+from app.db.session import async_session_factory, initialize_database
+from app.db.repositories.users import UserRepository
+from app.core.security import get_password_hash
+
+async def create_admin_user():
+    """Create an admin user if none exists."""
+    # Initialize database
+    await initialize_database()
+    
+    # Use session properly with context manager
+    async with async_session_factory() as session:
+        # Create repository with session
+        user_repo = UserRepository(session)
+        
+        # Check if admin exists
+        admin = await user_repo.get_by_email("admin@inboxerr.com")
+        
+        if admin:
+            print("Admin user already exists")
+            return
+        
+        # Create admin user
+        password = "Admin123!"
+        hashed_password = get_password_hash(password)
+        
+        admin = await user_repo.create(
+            email="admin@inboxerr.com",
+            hashed_password=hashed_password,
+            full_name="Admin User",
+            is_active=True,
+            role="admin"
+        )
+        
+        print(f"Admin user created with ID: {admin.id}")
+        print(f"Email: admin@inboxerr.com")
+        print(f"Password: {password}")
+
+if __name__ == "__main__":
+    asyncio.run(create_admin_user())
+</file>
+
+<file path="app/services/campaigns/processor.py">
+# app/services/campaigns/processor.py
+import asyncio
+import logging
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+import uuid
+
+from app.core.config import settings
+from app.db.repositories.campaigns import CampaignRepository
+from app.db.repositories.messages import MessageRepository
+from app.schemas.message import MessageStatus
+from app.services.event_bus.bus import get_event_bus
+from app.services.event_bus.events import EventType
+from app.services.sms.sender import SMSSender
+
+logger = logging.getLogger("inboxerr.campaigns")
+
+class CampaignProcessor:
+    """
+    Service for processing SMS campaigns.
+    
+    Manages campaign execution, chunked processing, and status tracking.
+    """
+    
+    def __init__(
+        self,
+        campaign_repository: CampaignRepository,
+        message_repository: MessageRepository,
+        sms_sender: SMSSender,
+        event_bus: Any
+    ):
+        """Initialize campaign processor with required dependencies."""
+        self.campaign_repository = campaign_repository
+        self.message_repository = message_repository
+        self.sms_sender = sms_sender
+        self.event_bus = event_bus
+        self._processing_campaigns = set()
+        self._chunk_size = settings.BATCH_SIZE  # Default from settings
+        self._semaphore = asyncio.Semaphore(5)  # Limit concurrent campaigns
+    
+    async def start_campaign(self, campaign_id: str, user_id: str) -> bool:
+        """
+        Start a campaign.
+        
+        Args:
+            campaign_id: Campaign ID
+            user_id: User ID for authorization
+            
+        Returns:
+            bool: True if campaign was started, False otherwise
+        """
+        # Get campaign
+        campaign = await self.campaign_repository.get_by_id(campaign_id)
+        if not campaign:
+            return False
+        
+        # Validate ownership
+        if campaign.user_id != user_id:
+            return False
+        
+        # Check if campaign can be started
+        if campaign.status != "draft" and campaign.status != "paused":
+            return False
+        
+        # Update status to active
+        updated = await self.campaign_repository.update_campaign_status(
+            campaign_id=campaign_id,
+            status="active",
+            started_at=datetime.utcnow()
+        )
+        
+        if not updated:
+            return False
+        
+        # Start processing in background
+        asyncio.create_task(self._process_campaign(campaign_id))
+        
+        # Publish event
+        await self.event_bus.publish(
+            EventType.BATCH_CREATED,
+            {
+                "campaign_id": campaign_id,
+                "user_id": user_id,
+                "total_messages": campaign.total_messages
+            }
+        )
+        
+        return True
+    
+    async def pause_campaign(self, campaign_id: str, user_id: str) -> bool:
+        """
+        Pause a campaign.
+        
+        Args:
+            campaign_id: Campaign ID
+            user_id: User ID for authorization
+            
+        Returns:
+            bool: True if campaign was paused, False otherwise
+        """
+        # Get campaign
+        campaign = await self.campaign_repository.get_by_id(campaign_id)
+        if not campaign:
+            return False
+        
+        # Validate ownership
+        if campaign.user_id != user_id:
+            return False
+        
+        # Check if campaign can be paused
+        if campaign.status != "active":
+            return False
+        
+        # Update status to paused
+        updated = await self.campaign_repository.update_campaign_status(
+            campaign_id=campaign_id,
+            status="paused"
+        )
+        
+        return updated is not None
+    
+    async def cancel_campaign(self, campaign_id: str, user_id: str) -> bool:
+        """
+        Cancel a campaign.
+        
+        Args:
+            campaign_id: Campaign ID
+            user_id: User ID for authorization
+            
+        Returns:
+            bool: True if campaign was cancelled, False otherwise
+        """
+        # Get campaign
+        campaign = await self.campaign_repository.get_by_id(campaign_id)
+        if not campaign:
+            return False
+        
+        # Validate ownership
+        if campaign.user_id != user_id:
+            return False
+        
+        # Check if campaign can be cancelled
+        if campaign.status in ["completed", "cancelled", "failed"]:
+            return False
+        
+        # Update status to cancelled
+        updated = await self.campaign_repository.update_campaign_status(
+            campaign_id=campaign_id,
+            status="cancelled",
+            completed_at=datetime.utcnow()
+        )
+        
+        return updated is not None
+    
+    async def _process_campaign(self, campaign_id: str) -> None:
+        """
+        Process a campaign in the background.
+        
+        Args:
+            campaign_id: Campaign ID
+        """
+        if campaign_id in self._processing_campaigns:
+            logger.warning(f"Campaign {campaign_id} is already being processed")
+            return
+        
+        # Mark as processing
+        self._processing_campaigns.add(campaign_id)
+        
+        try:
+            # Get campaign
+            campaign = await self.campaign_repository.get_by_id(campaign_id)
+            if not campaign or campaign.status != "active":
+                return
+            
+            # Process in chunks until complete
+            async with self._semaphore:
+                await self._process_campaign_chunks(campaign)
+                
+        except Exception as e:
+            logger.error(f"Error processing campaign {campaign_id}: {e}", exc_info=True)
+            # Update campaign status to failed
+            await self.campaign_repository.update_campaign_status(
+                campaign_id=campaign_id,
+                status="failed",
+                completed_at=datetime.utcnow()
+            )
+        finally:
+            # Remove from processing set
+            self._processing_campaigns.remove(campaign_id)
+    
+    async def _process_campaign_chunks(self, campaign) -> None:
+        """
+        Process campaign messages in chunks.
+        
+        Args:
+            campaign: Campaign object
+        """
+        # Query pending messages in chunks
+        offset = 0
+        
+        while True:
+            # Check if campaign is still active
+            campaign = await self.campaign_repository.get_by_id(campaign.id)
+            if not campaign or campaign.status != "active":
+                logger.info(f"Campaign {campaign.id} is no longer active, stopping processing")
+                return
+            
+            # Get next chunk of messages
+            messages, _ = await self.message_repository.get_messages_for_campaign(
+                campaign_id=campaign.id,
+                status=MessageStatus.PENDING,
+                skip=offset,
+                limit=self._chunk_size
+            )
+            
+            # If no more messages, campaign is complete
+            if not messages:
+                logger.info(f"No more pending messages for campaign {campaign.id}")
+                await self.campaign_repository.update_campaign_status(
+                    campaign_id=campaign.id,
+                    status="completed",
+                    completed_at=datetime.utcnow()
+                )
+                return
+            
+            # Process this chunk
+            await self._process_message_chunk(campaign.id, messages)
+            
+            # Update offset for next chunk
+            offset += len(messages)
+            
+            # Small delay between chunks to avoid overloading
+            await asyncio.sleep(0.5)
+    
+    async def _process_message_chunk(self, campaign_id: str, messages: List[Any]) -> None:
+        """
+        Process a chunk of messages.
+        
+        Args:
+            campaign_id: Campaign ID
+            messages: List of message objects
+        """
+        # Process each message in the chunk
+        success_count = 0
+        fail_count = 0
+        
+        for message in messages:
+            try:
+                # Use SMS sender to send the message
+                # Note: This is not optimal for bulk processing and would be improved in future versions
+                result = await self.sms_sender._send_to_gateway(
+                    phone_number=message.phone_number,
+                    message_text=message.message,
+                    custom_id=message.custom_id or str(uuid.uuid4())
+                )
+                
+                # Update message status
+                await self.message_repository.update_message_status(
+                    message_id=message.id,
+                    status=result.get("status", MessageStatus.PENDING),
+                    event_type="campaign_process",
+                    gateway_message_id=result.get("gateway_message_id"),
+                    data=result
+                )
+                
+                success_count += 1
+                
+                # Add delay between messages to avoid overloading gateway
+                await asyncio.sleep(settings.DELAY_BETWEEN_SMS)
+                
+            except Exception as e:
+                logger.error(f"Error processing message {message.id}: {e}")
+                
+                # Update message status to failed
+                await self.message_repository.update_message_status(
+                    message_id=message.id,
+                    status=MessageStatus.FAILED,
+                    event_type="campaign_process_error",
+                    reason=str(e),
+                    data={"error": str(e)}
+                )
+                
+                fail_count += 1
+        
+        # Update campaign stats
+        await self.campaign_repository.update_campaign_stats(
+            campaign_id=campaign_id,
+            increment_sent=success_count,
+            increment_failed=fail_count
+        )
+        
+        logger.info(f"Processed chunk for campaign {campaign_id}: {success_count} sent, {fail_count} failed")
+
+
+# Dependency injection function
+async def get_campaign_processor():
+    """Get campaign processor service instance."""
+    from app.db.session import get_repository
+    from app.db.repositories.campaigns import CampaignRepository
+    from app.db.repositories.messages import MessageRepository
+    from app.services.event_bus.bus import get_event_bus
+    from app.services.sms.sender import get_sms_sender
+    
+    campaign_repository = await get_repository(CampaignRepository)
+    message_repository = await get_repository(MessageRepository)
+    sms_sender = await get_sms_sender()
+    event_bus = get_event_bus()
+    
+    return CampaignProcessor(
+        campaign_repository=campaign_repository,
+        message_repository=message_repository,
+        sms_sender=sms_sender,
+        event_bus=event_bus
+    )
 </file>
 
 <file path="app/services/event_bus/bus.py">
@@ -5283,6 +4340,1734 @@ _event_bus = EventBus()
 def get_event_bus() -> EventBus:
     """Get the singleton event bus instance."""
     return _event_bus
+</file>
+
+<file path="app/services/rate_limiter.py">
+"""
+Rate limiting service for API request throttling.
+"""
+import asyncio
+import time
+from typing import Dict, Any, Optional, Tuple
+import logging
+from datetime import datetime
+
+from app.core.config import settings
+
+logger = logging.getLogger("inboxerr.rate_limiter")
+
+class RateLimiter:
+    """
+    Service for enforcing rate limits on API requests.
+    
+    Uses a simple in-memory storage for tracking request counts.
+    For production, consider using Redis or another distributed storage.
+    """
+    
+    def __init__(self):
+        """Initialize the rate limiter with default limits."""
+        self._requests = {}
+        self._lock = asyncio.Lock()
+        
+        # Default rate limits by operation type
+        self._rate_limits = {
+            "send_message": {"requests": 60, "period": 60},  # 60 requests per minute
+            "send_batch": {"requests": 10, "period": 60},    # 10 batch requests per minute
+            "import_messages": {"requests": 5, "period": 300},  # 5 imports per 5 minutes
+            "default": {"requests": 100, "period": 60},      # Default: 100 requests per minute
+        }
+    
+    async def check_rate_limit(
+        self, 
+        user_id: str, 
+        operation: str = "default"
+    ) -> bool:
+        """
+        Check if a request is within rate limits.
+        
+        Args:
+            user_id: ID of the user making the request
+            operation: Type of operation being performed
+            
+        Returns:
+            bool: True if request is allowed, raises exception otherwise
+            
+        Raises:
+            HTTPException: If rate limit is exceeded
+        """
+        from fastapi import HTTPException, status
+        
+        # Get rate limit for operation
+        limit = self._rate_limits.get(operation, self._rate_limits["default"])
+        
+        # Create key for this user and operation
+        key = f"{user_id}:{operation}"
+        
+        current_time = time.time()
+        
+        async with self._lock:
+            # Initialize if not exists
+            if key not in self._requests:
+                self._requests[key] = {"count": 0, "reset_at": current_time + limit["period"]}
+            
+            # Check if we need to reset the counter
+            if current_time > self._requests[key]["reset_at"]:
+                self._requests[key] = {"count": 0, "reset_at": current_time + limit["period"]}
+            
+            # Check if we're over the limit
+            if self._requests[key]["count"] >= limit["requests"]:
+                reset_in = int(self._requests[key]["reset_at"] - current_time)
+                logger.warning(f"Rate limit exceeded for {key}. Reset in {reset_in} seconds.")
+                
+                # Calculate when the rate limit will reset
+                reset_at = datetime.fromtimestamp(self._requests[key]["reset_at"])
+                
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail=f"Rate limit exceeded. Try again in {reset_in} seconds.",
+                    headers={"Retry-After": str(reset_in)}
+                )
+            
+            # Increment counter
+            self._requests[key]["count"] += 1
+            
+            logger.debug(f"Rate limit for {key}: {self._requests[key]['count']}/{limit['requests']}")
+            
+            return True
+    
+    def set_limit(self, operation: str, requests: int, period: int) -> None:
+        """
+        Set a custom rate limit for an operation.
+        
+        Args:
+            operation: Operation type to set limit for
+            requests: Maximum number of requests allowed
+            period: Time period in seconds
+        """
+        self._rate_limits[operation] = {"requests": requests, "period": period}
+    
+    async def get_limit_status(self, user_id: str, operation: str = "default") -> Dict[str, Any]:
+        """
+        Get current rate limit status for a user and operation.
+        
+        Args:
+            user_id: User ID
+            operation: Operation type
+            
+        Returns:
+            Dict: Rate limit status information
+        """
+        # Get rate limit for operation
+        limit = self._rate_limits.get(operation, self._rate_limits["default"])
+        
+        # Create key for this user and operation
+        key = f"{user_id}:{operation}"
+        
+        current_time = time.time()
+        
+        async with self._lock:
+            # Handle case where user hasn't made any requests yet
+            if key not in self._requests:
+                return {
+                    "limit": limit["requests"],
+                    "remaining": limit["requests"],
+                    "reset": int(current_time + limit["period"]),
+                    "used": 0
+                }
+            
+            # Reset counter if needed
+            if current_time > self._requests[key]["reset_at"]:
+                self._requests[key] = {"count": 0, "reset_at": current_time + limit["period"]}
+            
+            # Return current status
+            return {
+                "limit": limit["requests"],
+                "remaining": max(0, limit["requests"] - self._requests[key]["count"]),
+                "reset": int(self._requests[key]["reset_at"]),
+                "used": self._requests[key]["count"]
+            }
+
+
+# Singleton instance for dependency injection
+_rate_limiter = RateLimiter()
+
+def get_rate_limiter() -> RateLimiter:
+    """Get the singleton rate limiter instance."""
+    return _rate_limiter
+</file>
+
+<file path="app/services/sms/retry_engine.py">
+# app/services/sms/retry_engine.py
+import asyncio
+import logging
+import uuid
+from datetime import datetime, timedelta
+from typing import List, Dict, Any, Optional
+
+from app.core.config import settings
+from app.db.repositories.messages import MessageRepository
+from app.schemas.message import MessageStatus
+from app.services.event_bus.events import EventType
+from app.services.event_bus.bus import get_event_bus
+from app.core.exceptions import SMSGatewayError, RetryableError
+
+logger = logging.getLogger("inboxerr.retry")
+
+class RetryEngine:
+    """
+    Service for retrying failed messages.
+    
+    Periodically checks for failed messages and attempts to resend them.
+    """
+    
+    def __init__(self, message_repository: MessageRepository, event_bus: Any, sms_sender: Any):
+        """
+        Initialize retry engine with required dependencies.
+        
+        Args:
+            message_repository: Repository for message access
+            event_bus: Event bus for publishing events
+            sms_sender: SMS sender service for resending messages
+        """
+        self.message_repository = message_repository
+        self.event_bus = event_bus
+        self.sms_sender = sms_sender
+        self._running = False
+        self._semaphore = asyncio.Semaphore(5)  # Limit concurrent retries
+        
+    async def start(self) -> None:
+        """Start the retry engine."""
+        if self._running:
+            return
+            
+        self._running = True
+        logger.info("Starting retry engine")
+        
+        while self._running:
+            try:
+                await self._process_retries()
+            except Exception as e:
+                logger.error(f"Error in retry engine: {e}", exc_info=True)
+                
+            # Wait before next cycle
+            await asyncio.sleep(settings.RETRY_INTERVAL_SECONDS)
+            
+    async def stop(self) -> None:
+        """Stop the retry engine."""
+        self._running = False
+        logger.info("Retry engine stopped")
+    
+    async def _process_retries(self) -> None:
+        """Process messages pending retry."""
+        # Get messages that need retry
+        retry_candidates = await self._get_retry_candidates()
+        
+        if not retry_candidates:
+            logger.debug("No messages to retry")
+            return
+            
+        logger.info(f"Found {len(retry_candidates)} messages to retry")
+        
+        # Process retries with concurrency limit
+        tasks = []
+        for message in retry_candidates:
+            tasks.append(self._retry_message(message))
+            
+        if tasks:
+            # Process retries concurrently but with limit
+            for i in range(0, len(tasks), 5):  # Process in chunks of 5
+                chunk = tasks[i:i+5]
+                await asyncio.gather(*chunk)
+                await asyncio.sleep(1)  # Short delay between chunks
+    
+    async def _get_retry_candidates(self) -> List[Dict[str, Any]]:
+        """
+        Get messages that are candidates for retry.
+        
+        Returns:
+            List[Dict]: List of messages that should be retried
+        """
+        # Parameters for retry candidate selection
+        now = datetime.utcnow()
+        max_retries = settings.RETRY_MAX_ATTEMPTS
+        
+        # Query for messages that:
+        # 1. Are in a failed state
+        # 2. Have not exceeded max retry attempts
+        # 3. Have a retryable error or no error specified
+        # 4. Last retry attempt was long enough ago (based on exponential backoff)
+        
+        # This is a simplified implementation - in production you might want
+        # more sophisticated filtering and prioritization
+        failed_messages = await self.message_repository.get_retryable_messages(
+            max_retries=max_retries,
+            limit=50  # Limit number of messages to process in one cycle
+        )
+        
+        # Filter messages based on retry delay (exponential backoff)
+        retry_candidates = []
+        
+        for message in failed_messages:
+            # Get retry attempt count (from message metadata or events)
+            retry_count = self._get_retry_count(message)
+            
+            # Calculate backoff delay - 30s, 2m, 8m, 30m, 2h, etc.
+            backoff_seconds = 30 * (2 ** retry_count)
+            
+            # Get timestamp of last attempt
+            last_attempt = message.failed_at or message.updated_at
+            
+            # Check if enough time has passed for retry
+            if now - last_attempt > timedelta(seconds=backoff_seconds):
+                retry_candidates.append(message)
+        
+        return retry_candidates
+    
+    def _get_retry_count(self, message: Any) -> int:
+        """
+        Get the retry count for a message.
+        
+        Args:
+            message: Message object
+            
+        Returns:
+            int: Number of retry attempts
+        """
+        # Check if retry count is in metadata
+        meta_data = getattr(message, 'meta_data', {}) or {}
+        if isinstance(meta_data, dict) and 'retry_count' in meta_data:
+            return meta_data.get('retry_count', 0)
+            
+        # Fallback - count events of type "retry"
+        retry_events = [e for e in getattr(message, 'events', []) 
+                       if getattr(e, 'event_type', '') == 'retry']
+        return len(retry_events)
+    
+    async def _retry_message(self, message: Any) -> None:
+        """
+        Retry sending a message.
+        
+        Args:
+            message: Message to retry
+        """
+        message_id = message.id
+        phone_number = message.phone_number
+        message_text = message.message
+        custom_id = message.custom_id
+        
+        # Get current retry count
+        retry_count = self._get_retry_count(message)
+        
+        try:
+            logger.info(f"Retrying message {message_id} (attempt {retry_count + 1})")
+            
+            # Use semaphore to limit concurrent retries
+            async with self._semaphore:
+                # Reset status to pending for retry
+                await self.message_repository.update_message_status(
+                    message_id=message_id,
+                    status=MessageStatus.PENDING,
+                    event_type="retry",
+                    data={
+                        "retry_count": retry_count + 1,
+                        "previous_error": message.reason
+                    }
+                )
+                
+                # Update metadata to track retry count
+                meta_data = getattr(message, 'meta_data', {}) or {}
+                if isinstance(meta_data, dict):
+                    meta_data['retry_count'] = retry_count + 1
+                    await self.message_repository.update(
+                        id=message_id,
+                        obj_in={"meta_data": meta_data}
+                    )
+                
+                # Attempt to send again
+                result = await self.sms_sender._send_to_gateway(
+                    phone_number=phone_number,
+                    message_text=message_text,
+                    custom_id=custom_id or str(uuid.uuid4())
+                )
+                
+                # Update message status
+                await self.message_repository.update_message_status(
+                    message_id=message_id,
+                    status=result.get("status", MessageStatus.PENDING),
+                    event_type="retry_success",
+                    gateway_message_id=result.get("gateway_message_id"),
+                    data=result
+                )
+                
+                # Publish event
+                await self.event_bus.publish(
+                    EventType.MESSAGE_RETRIED,
+                    {
+                        "message_id": message_id,
+                        "phone_number": phone_number,
+                        "retry_count": retry_count + 1,
+                        "status": result.get("status", MessageStatus.PENDING)
+                    }
+                )
+                
+                logger.info(f"Successfully retried message {message_id}")
+                
+        except Exception as e:
+            logger.error(f"Error retrying message {message_id}: {e}")
+            
+            # Update status to failed with incremented retry count
+            error_message = str(e)
+            is_retryable = isinstance(e, RetryableError)
+            
+            await self.message_repository.update_message_status(
+                message_id=message_id,
+                status=MessageStatus.FAILED,
+                event_type="retry_failed",
+                reason=error_message,
+                data={
+                    "retry_count": retry_count + 1,
+                    "retryable": is_retryable
+                }
+            )
+            
+            # Publish event
+            await self.event_bus.publish(
+                EventType.MESSAGE_RETRY_FAILED,
+                {
+                    "message_id": message_id,
+                    "phone_number": phone_number,
+                    "retry_count": retry_count + 1,
+                    "error": error_message,
+                    "retryable": is_retryable
+                }
+            )
+
+
+# Singleton instance
+_retry_engine = None
+
+async def get_retry_engine():
+    """Get the singleton retry engine instance."""
+    global _retry_engine
+    
+    if _retry_engine is None:
+        from app.db.session import get_repository
+        from app.db.repositories.messages import MessageRepository
+        from app.services.event_bus.bus import get_event_bus
+        from app.services.sms.sender import get_sms_sender
+        
+        message_repository = await get_repository(MessageRepository)
+        event_bus = get_event_bus()
+        sms_sender = await get_sms_sender()
+        
+        _retry_engine = RetryEngine(
+            message_repository=message_repository,
+            event_bus=event_bus,
+            sms_sender=sms_sender
+        )
+        
+    return _retry_engine
+</file>
+
+<file path="app/services/webhooks/models.py">
+# app/services/webhooks/models.py
+"""
+Pydantic models for webhook payloads from SMS Gateway.
+"""
+from datetime import datetime
+from typing import Dict, Any, Optional, Literal
+from pydantic import BaseModel, Field
+
+class SmsReceivedPayload(BaseModel):
+    """Payload for sms:received event."""
+    message_id: str = Field(..., alias="messageId")
+    message: str
+    phone_number: str = Field(..., alias="phoneNumber")
+    sim_number: Optional[int] = Field(None, alias="simNumber")
+    received_at: datetime = Field(..., alias="receivedAt")
+    
+class SmsSentPayload(BaseModel):
+    """Payload for sms:sent event."""
+    message_id: str = Field(..., alias="messageId")
+    phone_number: str = Field(..., alias="phoneNumber")
+    sim_number: Optional[int] = Field(None, alias="simNumber")
+    sent_at: datetime = Field(..., alias="sentAt")
+    
+class SmsDeliveredPayload(BaseModel):
+    """Payload for sms:delivered event."""
+    message_id: str = Field(..., alias="messageId")
+    phone_number: str = Field(..., alias="phoneNumber")
+    sim_number: Optional[int] = Field(None, alias="simNumber")
+    delivered_at: datetime = Field(..., alias="deliveredAt")
+    
+class SmsFailedPayload(BaseModel):
+    """Payload for sms:failed event."""
+    message_id: str = Field(..., alias="messageId")
+    phone_number: str = Field(..., alias="phoneNumber")
+    sim_number: Optional[int] = Field(None, alias="simNumber")
+    failed_at: datetime = Field(..., alias="failedAt")
+    reason: str
+    
+class SystemPingPayload(BaseModel):
+    """Payload for system:ping event."""
+    health: Dict[str, Any]
+    
+EventType = Literal["sms:received", "sms:sent", "sms:delivered", "sms:failed", "system:ping"]
+
+class WebhookPayload(BaseModel):
+    """Base webhook payload from SMS Gateway."""
+    device_id: str = Field(..., alias="deviceId")
+    event: EventType
+    id: str
+    webhook_id: str = Field(..., alias="webhookId")
+    payload: Dict[str, Any]  # Will be converted to specific payload types based on event
+</file>
+
+<file path="app/utils/pagination.py">
+"""
+Utilities for API pagination.
+"""
+from typing import List, Dict, Any, TypeVar, Generic, Optional
+from fastapi import Query, Depends
+from pydantic import BaseModel
+
+
+class PaginationParams:
+    """
+    Pagination parameters for API endpoints.
+    
+    This class is used as a FastAPI dependency to extract pagination parameters
+    from query parameters.
+    """
+    
+    def __init__(
+        self,
+        page: int = Query(1, ge=1, description="Page number"),
+        limit: int = Query(20, ge=1, le=100, description="Items per page"),
+        sort: Optional[str] = Query(None, description="Sort field"),
+        order: Optional[str] = Query("asc", description="Sort order (asc or desc)")
+    ):
+        """
+        Initialize pagination parameters.
+        
+        Args:
+            page: Page number (1-based)
+            limit: Items per page
+            sort: Field to sort by
+            order: Sort order (asc or desc)
+        """
+        self.page = page
+        self.limit = limit
+        self.sort = sort
+        self.order = order
+        
+        # Calculate skip value for database queries
+        self.skip = (page - 1) * limit
+
+
+class PageInfo(BaseModel):
+    """
+    Page information for paginated responses.
+    """
+    current_page: int
+    total_pages: int
+    page_size: int
+    total_items: int
+    has_previous: bool
+    has_next: bool
+
+
+T = TypeVar('T')
+
+class PaginatedResponse(BaseModel, Generic[T]):
+    """
+    Generic paginated response model.
+    
+    This class is used to standardize the format of paginated responses
+    across all API endpoints.
+    """
+    items: List[T]
+    page_info: PageInfo
+    
+    class Config:
+        """Pydantic config."""
+        arbitrary_types_allowed = True
+
+
+def paginate_response(
+    items: List[Any],
+    total: int,
+    pagination: PaginationParams
+) -> Dict[str, Any]:
+    """
+    Create a standardized paginated response.
+    
+    Args:
+        items: List of items for the current page
+        total: Total number of items across all pages
+        pagination: Pagination parameters
+        
+    Returns:
+        Dict: Standardized response with items and pagination info
+    """
+    # Calculate pagination values
+    total_pages = (total + pagination.limit - 1) // pagination.limit
+    
+    # Create page info
+    page_info = PageInfo(
+        current_page=pagination.page,
+        total_pages=total_pages,
+        page_size=pagination.limit,
+        total_items=total,
+        has_previous=pagination.page > 1,
+        has_next=pagination.page < total_pages
+    )
+    
+    # Create response
+    return {
+        "items": items,
+        "page_info": page_info
+    }
+
+
+def get_pagination_links(
+    path: str,
+    pagination: PaginationParams,
+    total: int,
+    query_params: Optional[Dict[str, Any]] = None
+) -> Dict[str, Optional[str]]:
+    """
+    Generate pagination links for HATEOAS.
+    
+    Args:
+        path: Base path for links
+        pagination: Pagination parameters
+        total: Total number of items
+        query_params: Additional query parameters
+        
+    Returns:
+        Dict: Links for first, prev, next, and last pages
+    """
+    # Calculate pagination values
+    total_pages = (total + pagination.limit - 1) // pagination.limit
+    
+    # Initialize query params
+    params = query_params.copy() if query_params else {}
+    
+    # Helper to create URL with query params
+    def create_url(page: int) -> str:
+        page_params = {**params, "page": page, "limit": pagination.limit}
+        
+        if pagination.sort:
+            page_params["sort"] = pagination.sort
+            page_params["order"] = pagination.order
+            
+        query_string = "&".join(f"{key}={value}" for key, value in page_params.items())
+        return f"{path}?{query_string}"
+    
+    # Create links
+    links = {
+        "first": create_url(1),
+        "last": create_url(total_pages) if total_pages > 0 else None,
+        "prev": create_url(pagination.page - 1) if pagination.page > 1 else None,
+        "next": create_url(pagination.page + 1) if pagination.page < total_pages else None
+    }
+    
+    return links
+</file>
+
+<file path="app/utils/phone.py">
+"""
+Phone number validation and formatting utilities.
+"""
+import re
+from typing import Tuple, Dict, Optional
+
+try:
+    import phonenumbers
+    PHONENUMBERS_AVAILABLE = True
+except ImportError:
+    PHONENUMBERS_AVAILABLE = False
+
+
+class PhoneValidationError(Exception):
+    """Exception raised for phone validation errors."""
+    
+    def __init__(self, message: str, details: Optional[Dict] = None):
+        self.message = message
+        self.details = details or {}
+        super().__init__(message)
+
+
+def validate_phone_basic(number: str) -> Tuple[bool, str, Optional[str]]:
+    """
+    Basic phone number validation without external libraries.
+    
+    Args:
+        number: Phone number to validate
+        
+    Returns:
+        Tuple[bool, str, str]: (is_valid, formatted_number, error_message)
+    """
+    # Remove common formatting characters
+    cleaned = re.sub(r'[\s\-\(\)\.]+', '', number)
+    
+    # Check if it's just digits and maybe a leading +
+    if not re.match(r'^\+?\d+$', cleaned):
+        return False, number, "Phone number contains invalid characters"
+    
+    # Ensure it starts with + for E.164 format
+    if not cleaned.startswith('+'):
+        cleaned = '+' + cleaned
+    
+    # Basic length check
+    if len(cleaned) < 8:
+        return False, cleaned, "Phone number too short"
+    if len(cleaned) > 16:
+        return False, cleaned, "Phone number too long"
+    
+    return True, cleaned, None
+
+
+def validate_phone_advanced(number: str) -> Tuple[bool, str, Optional[str]]:
+    """
+    Advanced phone number validation using the phonenumbers library.
+    
+    Args:
+        number: Phone number to validate
+        
+    Returns:
+        Tuple[bool, str, str]: (is_valid, formatted_number, error_message)
+    """
+    try:
+        # Parse the phone number
+        parsed = phonenumbers.parse(number, None)
+        
+        # Check if it's a valid number
+        if not phonenumbers.is_valid_number(parsed):
+            return False, number, "Invalid phone number"
+        
+        # Format in E.164 format
+        formatted = phonenumbers.format_number(
+            parsed, phonenumbers.PhoneNumberFormat.E164
+        )
+        
+        # Get the country and carrier
+        country = phonenumbers.region_code_for_number(parsed)
+        
+        return True, formatted, None
+    except phonenumbers.NumberParseException as e:
+        return False, number, f"Parse error: {str(e)}"
+
+
+def validate_phone(number: str) -> Tuple[bool, str, Optional[str]]:
+    """
+    Validate and format a phone number.
+    
+    Uses the phonenumbers library if available, otherwise falls back to basic validation.
+    
+    Args:
+        number: Phone number to validate
+        
+    Returns:
+        Tuple[bool, str, str]: (is_valid, formatted_number, error_message)
+    """
+    if PHONENUMBERS_AVAILABLE:
+        return validate_phone_advanced(number)
+    else:
+        return validate_phone_basic(number)
+
+
+def is_valid_phone(number: str) -> bool:
+    """
+    Check if a phone number is valid.
+    
+    Args:
+        number: Phone number to validate
+        
+    Returns:
+        bool: True if valid, False otherwise
+    """
+    is_valid, _, _ = validate_phone(number)
+    return is_valid
+
+
+def format_phone(number: str) -> str:
+    """
+    Format a phone number in E.164 format.
+    
+    Args:
+        number: Phone number to format
+        
+    Returns:
+        str: Formatted phone number or original if invalid
+        
+    Raises:
+        PhoneValidationError: If the phone number is invalid
+    """
+    is_valid, formatted, error = validate_phone(number)
+    if not is_valid:
+        raise PhoneValidationError(error or "Invalid phone number", {"number": number})
+    return formatted
+</file>
+
+<file path="docker-compose.yml">
+version: '3.8'
+
+services:
+  # API service
+  api:
+    build: .
+    container_name: inboxerr-api
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - .:/app
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/inboxerr
+      - SMS_GATEWAY_URL=${SMS_GATEWAY_URL:-https://endpointnumber1.work.gd/api/3rdparty/v1}
+      - SMS_GATEWAY_LOGIN=${SMS_GATEWAY_LOGIN:-}
+      - SMS_GATEWAY_PASSWORD=${SMS_GATEWAY_PASSWORD:-}
+      - SECRET_KEY=${SECRET_KEY:-CHANGEME_IN_PRODUCTION}
+      - WEBHOOK_HOST=0.0.0.0
+      - WEBHOOK_PORT=5000
+      - LOG_LEVEL=DEBUG
+    depends_on:
+      - db
+    networks:
+      - inboxerr-network
+    restart: unless-stopped
+
+  # Database service
+  db:
+    image: postgres:14-alpine
+    container_name: inboxerr-db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data/
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=inboxerr
+    ports:
+      - "5432:5432"
+    networks:
+      - inboxerr-network
+    restart: unless-stopped
+
+  # Optional: Redis for caching and task queue
+  redis:
+    image: redis:alpine
+    container_name: inboxerr-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - inboxerr-network
+    restart: unless-stopped
+
+  # Optional: PgAdmin for database management
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: inboxerr-pgadmin
+    environment:
+      - PGADMIN_DEFAULT_EMAIL=admin@inboxerr.com
+      - PGADMIN_DEFAULT_PASSWORD=admin
+    ports:
+      - "5050:80"
+    depends_on:
+      - db
+    networks:
+      - inboxerr-network
+    restart: unless-stopped
+
+networks:
+  inboxerr-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+</file>
+
+<file path="Dockerfile">
+# Use Python 3.10 slim as base image
+FROM python:3.10-slim
+
+# Set working directory
+WORKDIR /app
+
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
+
+# Install system dependencies
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        libpq-dev \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY . .
+
+# Create non-root user
+RUN adduser --disabled-password --gecos "" appuser
+RUN chown -R appuser:appuser /app
+USER appuser
+
+# Expose port
+EXPOSE 8000
+
+# Start application
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+</file>
+
+<file path="scripts/seed_db.py">
+"""
+Placeholder script for seeding the database in development.
+Currently not in use — extend as needed.
+Seed the database with essential data (e.g., admin user).
+Currently skips message seeding — placeholder for future use.
+
+"""
+
+import subprocess
+import os
+import sys
+
+def run_admin_script():
+    """Ensure an admin user exists by running create_admin.py."""
+    try:
+        subprocess.run(
+            [sys.executable, "app/scripts/create_admin.py"],
+            check=True,
+            cwd=os.getcwd(),  # Ensures correct working directory
+            env={**os.environ, "PYTHONPATH": os.getcwd()}
+        )
+        print("👮 Admin user created.")
+    except subprocess.CalledProcessError:
+        print("⚠️ Failed to create admin user. Check create_admin.py.")
+
+
+def seed():
+    print("🌱 [SKIPPED] No seed data logic implemented yet.")
+
+if __name__ == "__main__":
+    seed()
+    run_admin_script()
+</file>
+
+<file path=".gitignore">
+# Python specific
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.env
+*.venv
+env/
+venv/
+ENV/
+.venv/
+env.bak/
+venv.bak/
+*.egg
+*.egg-info/
+dist/
+build/
+*.log
+
+# FastAPI specific
+instance/
+*.db
+*.sqlite3
+
+# IDE specific
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Test and coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+</file>
+
+<file path="app/api/router.py">
+"""
+Main API router that includes all endpoint routers.
+"""
+from fastapi import APIRouter
+
+from app.api.v1.endpoints import auth, messages, webhooks, metrics, campaigns
+
+
+# Create main API router
+api_router = APIRouter()
+
+# Include all endpoint routers with appropriate tags
+api_router.include_router(
+    auth.router, 
+    prefix="/auth", 
+    tags=["Authentication"]
+)
+api_router.include_router(
+    messages.router, 
+    prefix="/messages", 
+    tags=["Messages"]
+)
+api_router.include_router(
+    campaigns.router, 
+    prefix="/campaigns", 
+    tags=["Campaigns"]
+)
+api_router.include_router(
+    webhooks.router, 
+    prefix="/webhooks", 
+    tags=["Webhooks"]
+)
+api_router.include_router(
+    metrics.router, 
+    prefix="/metrics", 
+    tags=["Metrics"]
+)
+</file>
+
+<file path="app/api/v1/endpoints/metrics.py">
+"""
+API endpoints for metrics and reporting.
+"""
+from fastapi import APIRouter, Depends, HTTPException
+
+from app.api.v1.dependencies import get_current_user
+from app.schemas.user import User
+
+router = APIRouter()
+
+@router.get("/")
+async def get_metrics(
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Get system metrics and statistics.
+    """
+    # This is a stub - implementation will be added later
+    return {
+        "message_count": {
+            "total": 0,
+            "sent": 0,
+            "delivered": 0,
+            "failed": 0
+        },
+        "user_count": 1,
+        "webhook_count": 0
+    }
+
+@router.get("/usage")
+async def get_usage_metrics(
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Get usage metrics for the current user.
+    """
+    # This is a stub - implementation will be added later
+    return {
+        "message_count": 0,
+        "quota": {
+            "used": 0,
+            "total": 1000
+        }
+    }
+</file>
+
+<file path="app/api/v1/endpoints/webhooks.py">
+# app/api/v1/endpoints/webhooks.py
+"""
+API endpoints for webhook management.
+"""
+import logging
+from typing import Dict, Any
+from fastapi import APIRouter, Depends, HTTPException, Request, Body, Header, status
+
+from app.api.v1.dependencies import get_current_user
+from app.schemas.user import User
+from app.services.webhooks.manager import process_gateway_webhook
+
+router = APIRouter()
+logger = logging.getLogger("inboxerr.webhooks")
+
+@router.get("/")
+async def list_webhooks(
+    current_user: User = Depends(get_current_user)
+):
+    """
+    List all webhooks for the current user.
+    """
+    # This is a stub - implementation will be added later
+    return {"message": "Webhook listing not implemented yet"}
+
+@router.post("/gateway", status_code=status.HTTP_200_OK)
+async def webhook_receiver(
+    request: Request,
+    x_signature: str = Header(None),
+    x_timestamp: str = Header(None)
+):
+    """
+    Receive webhooks from the SMS Gateway.
+    
+    This endpoint is called by the SMS Gateway when events occur.
+    No authentication is required as we validate using signatures.
+    """
+    # Get raw body for signature validation
+    body = await request.body()
+    
+    # Prepare headers for signature verification
+    headers = {
+        "X-Signature": x_signature,
+        "X-Timestamp": x_timestamp
+    }
+    
+    # Process the webhook
+    success, result = await process_gateway_webhook(body, headers)
+    
+    if not success:
+        logger.error(f"Error processing webhook: {result.get('error')}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=result.get('error', 'Error processing webhook')
+        )
+    
+    return result
+</file>
+
+<file path="app/core/config.py">
+"""
+Application settings and configuration management.
+"""
+from typing import List, Optional, Union
+from pydantic import AnyHttpUrl, validator, field_validator
+from pydantic_settings import BaseSettings
+
+
+class Settings(BaseSettings):
+    """Application settings."""
+    # Base
+    PROJECT_NAME: str = "Inboxerr Backend"
+    PROJECT_DESCRIPTION: str = "API backend for SMS management and delivery"
+    VERSION: str = "0.1.0"
+    API_PREFIX: str = "/api/v1"
+    DEBUG: bool = False
+    
+    # CORS
+    BACKEND_CORS_ORIGINS: List[Union[str, AnyHttpUrl]] = []
+
+    @field_validator("BACKEND_CORS_ORIGINS", mode='before')
+    def assemble_cors_origins(cls, v: Union[str, List[str]]) -> Union[List[str], str]:
+        """Parse CORS origins from string or list."""
+        if isinstance(v, str) and not v.startswith("["):
+            return [i.strip() for i in v.split(",")]
+        elif isinstance(v, (list, str)):
+            return v
+        raise ValueError(v)
+    
+    # Authentication
+    SECRET_KEY: str = "CHANGEME_IN_PRODUCTION"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 1 day
+    API_KEY_HEADER: str = "X-API-Key"
+    
+    # Database
+    DATABASE_URL: str = "sqlite+aiosqlite:///./inboxerr.db"
+    
+    # SMS Gateway
+    SMS_GATEWAY_URL: str = "https://endpointnumber1.work.gd/api/3rdparty/v1"
+    SMS_GATEWAY_LOGIN: str = ""
+    SMS_GATEWAY_PASSWORD: str = ""
+    
+    # Webhook
+    API_BASE_URL: str = "http://localhost:8000"  # Base URL for webhooks
+    WEBHOOK_SIGNATURE_KEY: Optional[str] = None
+    WEBHOOK_TIMESTAMP_TOLERANCE: int = 300  # 5 minutes
+    
+    # SMS Processing
+    BATCH_SIZE: int = 100
+    DELAY_BETWEEN_SMS: float = 0.3  # seconds
+    RETRY_ENABLED: bool = True
+    RETRY_MAX_ATTEMPTS: int = 3
+    RETRY_INTERVAL_SECONDS: int = 60
+    
+    # Logging
+    LOG_LEVEL: str = "INFO"
+    
+    class Config:
+        """Pydantic config."""
+        case_sensitive = True
+        env_file = ".env"
+
+
+# Create singleton settings instance
+settings = Settings()
+</file>
+
+<file path="app/db/repositories/messages.py">
+"""
+Message repository for database operations related to SMS messages.
+"""
+from datetime import datetime
+from typing import List, Optional, Dict, Any, Tuple
+from uuid import uuid4
+
+from sqlalchemy import select, update, delete, and_, or_, desc, func
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.dialects.postgresql import JSONB
+
+from app.db.repositories.base import BaseRepository
+from app.models.message import Message, MessageEvent, MessageBatch, MessageTemplate
+from app.schemas.message import MessageCreate, MessageStatus
+
+
+class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
+    """Message repository for database operations."""
+    
+    def __init__(self, session: AsyncSession):
+        """Initialize with session and Message model."""
+        super().__init__(session=session, model=Message)
+    
+    async def create_message(
+        self,
+        *,
+        phone_number: str,
+        message_text: str,
+        user_id: str,
+        custom_id: Optional[str] = None,
+        scheduled_at: Optional[datetime] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        batch_id: Optional[str] = None
+    ) -> Message:
+        """
+        Create a new message.
+        
+        Args:
+            phone_number: Recipient phone number
+            message_text: Message content
+            user_id: User who is sending the message
+            custom_id: Optional custom ID for tracking
+            scheduled_at: Optional scheduled time
+            metadata: Optional additional data
+            batch_id: Optional batch ID
+            
+        Returns:
+            Message: Created message
+        """
+        # Set initial status based on scheduling
+        initial_status = MessageStatus.SCHEDULED if scheduled_at else MessageStatus.PENDING
+        
+        # Calculate SMS parts (simple calculation, can be improved)
+        parts_count = (len(message_text) + 159) // 160  # 160 chars per SMS part, rounded up
+        
+        # Create message
+        message = Message(
+            id=str(uuid4()),
+            custom_id=custom_id or str(uuid4()),
+            phone_number=phone_number,
+            message=message_text,
+            status=initial_status,
+            scheduled_at=scheduled_at,
+            user_id=user_id,
+            meta_data=metadata or {},  # Use meta_data instead of metadata
+            parts_count=parts_count,
+            batch_id=batch_id
+        )
+        
+        self.session.add(message)
+        
+        # Create initial event
+        event = MessageEvent(
+            id=str(uuid4()),
+            message_id=message.id,
+            event_type="created",
+            status=initial_status,
+            data={
+                "phone_number": phone_number,
+                "scheduled_at": scheduled_at.isoformat() if scheduled_at else None
+            }
+        )
+        
+        self.session.add(event)
+        await self.session.commit()
+        await self.session.refresh(message)
+        
+        return message
+    
+    async def update_message_status(
+        self,
+        *,
+        message_id: str,
+        status: str,
+        event_type: str,
+        reason: Optional[str] = None,
+        gateway_message_id: Optional[str] = None,
+        data: Optional[Dict[str, Any]] = None
+    ) -> Optional[Message]:
+        """
+        Update message status.
+        
+        Args:
+            message_id: Message ID
+            status: New status
+            event_type: Event type triggering this update
+            reason: Optional reason for status change
+            gateway_message_id: Optional gateway message ID
+            data: Optional additional data
+            
+        Returns:
+            Message: Updated message or None
+        """
+        # Get the message
+        message = await self.get_by_id(message_id)
+        if not message:
+            return None
+        
+        # Update status-specific timestamp
+        now = datetime.utcnow()
+        update_data = {
+            "status": status,
+            "updated_at": now,
+        }
+        
+        if status == MessageStatus.SENT:
+            update_data["sent_at"] = now
+        elif status == MessageStatus.DELIVERED:
+            update_data["delivered_at"] = now
+        elif status == MessageStatus.FAILED:
+            update_data["failed_at"] = now
+            update_data["reason"] = reason
+        
+        # Set gateway message ID if provided
+        if gateway_message_id:
+            update_data["gateway_message_id"] = gateway_message_id
+        
+        # Update the message
+        await self.session.execute(
+            update(Message)
+            .where(Message.id == message_id)
+            .values(**update_data)
+        )
+        
+        # Create event for status change
+        event = MessageEvent(
+            id=str(uuid4()),
+            message_id=message_id,
+            event_type=event_type,
+            status=status,
+            data=data or {}
+        )
+        
+        self.session.add(event)
+        await self.session.commit()
+        
+        # Refresh the message
+        await self.session.refresh(message)
+        
+        return message
+
+    async def create_batch(
+        self,
+        *,
+        user_id: str,
+        name: str,
+        total: int
+    ) -> MessageBatch:
+        """
+        Create a new message batch.
+        
+        Args:
+            user_id: User ID
+            name: Batch name
+            total: Total number of messages
+            
+        Returns:
+            MessageBatch: Created batch
+        """
+        batch = MessageBatch(
+            id=str(uuid4()),
+            name=name,
+            total=total,
+            processed=0,
+            successful=0,
+            failed=0,
+            status=MessageStatus.PENDING,
+            user_id=user_id
+        )
+        
+        self.session.add(batch)
+        await self.session.commit()
+        await self.session.refresh(batch)
+        
+        return batch
+
+    async def update_batch_progress(
+        self,
+        *,
+        batch_id: str,
+        increment_processed: int = 0,
+        increment_successful: int = 0,
+        increment_failed: int = 0,
+        status: Optional[str] = None
+    ) -> Optional[MessageBatch]:
+        """
+        Update batch progress.
+        
+        Args:
+            batch_id: Batch ID
+            increment_processed: Increment processed count
+            increment_successful: Increment successful count
+            increment_failed: Increment failed count
+            status: Optional new status
+            
+        Returns:
+            MessageBatch: Updated batch or None
+        """
+        batch = await self.get_by_id(batch_id)
+        if not batch:
+            return None
+        
+        # Update counts
+        batch.processed += increment_processed
+        batch.successful += increment_successful
+        batch.failed += increment_failed
+        
+        # Update status if provided
+        if status:
+            batch.status = status
+            
+        # If all messages processed, update status and completion time
+        if batch.processed >= batch.total:
+            batch.status = MessageStatus.PROCESSED if batch.failed == 0 else "partial"
+            batch.completed_at = datetime.utcnow()
+        
+        self.session.add(batch)
+        await self.session.commit()
+        await self.session.refresh(batch)
+        
+        return batch
+
+    async def get_by_custom_id(self, custom_id: str) -> Optional[Message]:
+        """
+        Get message by custom ID.
+        
+        Args:
+            custom_id: Custom ID
+            
+        Returns:
+            Message: Found message or None
+        """
+        return await self.get_by_attribute("custom_id", custom_id)
+
+    async def get_by_gateway_id(self, gateway_id: str) -> Optional[Message]:
+        """
+        Get message by gateway ID.
+        
+        Args:
+            gateway_id: Gateway message ID
+            
+        Returns:
+            Message: Found message or None
+        """
+        return await self.get_by_attribute("gateway_message_id", gateway_id)
+
+    async def list_messages_for_user(
+        self,
+        *,
+        user_id: str,
+        status: Optional[str] = None,
+        phone_number: Optional[str] = None,
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+        campaign_id: Optional[str] = None,
+        skip: int = 0,
+        limit: int = 20
+    ) -> Tuple[List[Message], int]:
+        """
+        List messages for user with filtering.
+        
+        Args:
+            user_id: User ID
+            status: Optional status filter
+            phone_number: Optional phone number filter
+            from_date: Optional from date filter
+            to_date: Optional to date filter
+            campaign_id: Optional campaign ID filter
+            skip: Number of records to skip
+            limit: Maximum number of records to return
+            
+        Returns:
+            Tuple[List[Message], int]: List of messages and total count
+        """
+        # Base query
+        query = select(Message).where(Message.user_id == user_id)
+        count_query = select(func.count()).select_from(Message).where(Message.user_id == user_id)
+        
+        # Apply filters
+        if status:
+            query = query.where(Message.status == status)
+            count_query = count_query.where(Message.status == status)
+        
+        if phone_number:
+            query = query.where(Message.phone_number == phone_number)
+            count_query = count_query.where(Message.phone_number == phone_number)
+
+        if campaign_id:
+            query = query.where(Message.campaign_id == campaign_id)
+            count_query = count_query.where(Message.campaign_id == campaign_id)
+        
+        if from_date:
+            try:
+                from_date_obj = datetime.fromisoformat(from_date.replace('Z', '+00:00'))
+                query = query.where(Message.created_at >= from_date_obj)
+                count_query = count_query.where(Message.created_at >= from_date_obj)
+            except ValueError:
+                pass
+        
+        if to_date:
+            try:
+                to_date_obj = datetime.fromisoformat(to_date.replace('Z', '+00:00'))
+                query = query.where(Message.created_at <= to_date_obj)
+                count_query = count_query.where(Message.created_at <= to_date_obj)
+            except ValueError:
+                pass
+        
+        # Order by created_at desc
+        query = query.order_by(desc(Message.created_at))
+        
+        # Pagination
+        query = query.offset(skip).limit(limit)
+        
+        # Execute queries
+        result = await self.session.execute(query)
+        count_result = await self.session.execute(count_query)
+        
+        messages = result.scalars().all()
+        total = count_result.scalar_one()
+        
+        return messages, total
+
+    async def get_messages_for_batch(
+        self,
+        *,
+        batch_id: str,
+        skip: int = 0,
+        limit: int = 20
+    ) -> Tuple[List[Message], int]:
+        """
+        Get messages for a batch.
+        
+        Args:
+            batch_id: Batch ID
+            skip: Number of records to skip
+            limit: Maximum number of records to return
+            
+        Returns:
+            Tuple[List[Message], int]: List of messages and total count
+        """
+        # Base query
+        query = select(Message).where(Message.batch_id == batch_id)
+        count_query = select(func.count()).select_from(Message).where(Message.batch_id == batch_id)
+        
+        # Order by created_at desc
+        query = query.order_by(desc(Message.created_at))
+        
+        # Pagination
+        query = query.offset(skip).limit(limit)
+        
+        # Execute queries
+        result = await self.session.execute(query)
+        count_result = await self.session.execute(count_query)
+        
+        messages = result.scalars().all()
+        total = count_result.scalar_one()
+        
+        return messages, total
+    
+    async def get_messages_for_campaign(
+        self,
+        *,
+        campaign_id: str,
+        status: Optional[str] = None,
+        skip: int = 0,
+        limit: int = 20
+    ) -> Tuple[List[Message], int]:
+        """
+        Get messages for a campaign.
+        
+        Args:
+            campaign_id: Campaign ID
+            status: Optional status filter
+            skip: Number of records to skip
+            limit: Maximum number of records to return
+            
+        Returns:
+            Tuple[List[Message], int]: List of messages and total count
+        """
+        # Base query
+        query = select(Message).where(Message.campaign_id == campaign_id)
+        count_query = select(func.count()).select_from(Message).where(Message.campaign_id == campaign_id)
+        
+        # Apply status filter
+        if status:
+            query = query.where(Message.status == status)
+            count_query = count_query.where(Message.status == status)
+        
+        # Order by created_at desc
+        query = query.order_by(desc(Message.created_at))
+        
+        # Apply pagination
+        query = query.offset(skip).limit(limit)
+        
+        # Execute queries
+        result = await self.session.execute(query)
+        count_result = await self.session.execute(count_query)
+        
+        messages = result.scalars().all()
+        total = count_result.scalar_one()
+        
+        return messages, total
+
+    async def get_retryable_messages(
+        self,
+        *,
+        max_retries: int = 3,
+        limit: int = 50
+    ) -> List[Message]:
+        """
+        Get messages that can be retried.
+        
+        Args:
+            max_retries: Maximum number of retry attempts
+            limit: Maximum number of messages to return
+            
+        Returns:
+            List[Message]: List of retryable messages
+        """
+        # Query for failed messages that can be retried
+        query = select(Message).where(
+            and_(
+                Message.status == MessageStatus.FAILED,
+                or_(
+                    Message.meta_data.is_(None),  # No metadata at all
+                    ~Message.meta_data.contains({"retry_count": 0}),  # retry_count key is absent
+                    Message.meta_data["retry_count"].as_integer() < max_retries  # retry_count too low
+                )
+            )
+        ).order_by(Message.failed_at).limit(limit)
+        
+        result = await self.session.execute(query)
+        return result.scalars().all()
+</file>
+
+<file path="app/models/message.py">
+"""
+Database models for SMS messages.
+"""
+from datetime import datetime
+from typing import List, Optional, Dict, Any
+
+from sqlalchemy import Column, String, DateTime, Boolean, JSON, Integer, ForeignKey, Text
+from sqlalchemy.orm import relationship
+
+from app.models.base import Base
+
+
+class Message(Base):
+    """SMS message model."""
+    
+    # Core message data
+    custom_id = Column(String, unique=True, index=True, nullable=True)
+    phone_number = Column(String, nullable=False, index=True)
+    message = Column(Text, nullable=False)
+    status = Column(String, nullable=False, default="pending", index=True)
+
+    # Campaign relationship
+    campaign_id = Column(String, ForeignKey("campaign.id"), nullable=True, index=True)
+    campaign = relationship("Campaign", back_populates="messages")
+    
+    # Timestamps for status tracking
+    scheduled_at = Column(DateTime, nullable=True, index=True)
+    sent_at = Column(DateTime, nullable=True)
+    delivered_at = Column(DateTime, nullable=True)
+    failed_at = Column(DateTime, nullable=True)
+    
+    # Additional data
+    reason = Column(String, nullable=True)
+    gateway_message_id = Column(String, nullable=True, index=True)
+    user_id = Column(String, ForeignKey("user.id"), nullable=False, index=True)
+    meta_data = Column(JSON, nullable=True)  # Changed from 'metadata' to 'meta_data'
+    
+    # SMS parts tracking
+    parts_count = Column(Integer, default=1, nullable=False)
+    
+    # Relationships
+    user = relationship("User", back_populates="messages")
+    events = relationship("MessageEvent", back_populates="message", cascade="all, delete-orphan")
+    batch_id = Column(String, ForeignKey("messagebatch.id"), nullable=True, index=True)
+    batch = relationship("MessageBatch", back_populates="messages")
+
+
+class MessageEvent(Base):
+    """Model for tracking message events and status changes."""
+    
+    message_id = Column(String, ForeignKey("message.id"), nullable=False, index=True)
+    event_type = Column(String, nullable=False, index=True)
+    status = Column(String, nullable=False)
+    data = Column(JSON, nullable=True)
+    
+    # Relationships
+    message = relationship("Message", back_populates="events")
+
+
+class MessageBatch(Base):
+    """Model for tracking message batches."""
+    
+    name = Column(String, nullable=True)
+    total = Column(Integer, default=0, nullable=False)
+    processed = Column(Integer, default=0, nullable=False)
+    successful = Column(Integer, default=0, nullable=False)
+    failed = Column(Integer, default=0, nullable=False)
+    status = Column(String, nullable=False, default="pending", index=True)
+    user_id = Column(String, ForeignKey("user.id"), nullable=False, index=True)
+    completed_at = Column(DateTime, nullable=True)
+    
+    # Relationships
+    messages = relationship("Message", back_populates="batch")
+    user = relationship("User")
+
+
+class MessageTemplate(Base):
+    """Model for storing reusable message templates."""
+    
+    name = Column(String, nullable=False, index=True)
+    content = Column(Text, nullable=False)
+    description = Column(String, nullable=True)
+    is_active = Column(Boolean, default=True, nullable=False)
+    user_id = Column(String, ForeignKey("user.id"), nullable=False, index=True)
+    variables = Column(JSON, nullable=True)  # Define expected variables in the template
+    
+    # Relationships
+    user = relationship("User")
 </file>
 
 <file path="app/services/event_bus/events.py">
@@ -6980,410 +7765,6 @@ async def process_system_ping(base_payload: WebhookPayload, payload: SystemPingP
     }
 </file>
 
-<file path="app/utils/pagination.py">
-"""
-Utilities for API pagination.
-"""
-from typing import List, Dict, Any, TypeVar, Generic, Optional
-from fastapi import Query, Depends
-from pydantic import BaseModel
-
-
-class PaginationParams:
-    """
-    Pagination parameters for API endpoints.
-    
-    This class is used as a FastAPI dependency to extract pagination parameters
-    from query parameters.
-    """
-    
-    def __init__(
-        self,
-        page: int = Query(1, ge=1, description="Page number"),
-        limit: int = Query(20, ge=1, le=100, description="Items per page"),
-        sort: Optional[str] = Query(None, description="Sort field"),
-        order: Optional[str] = Query("asc", description="Sort order (asc or desc)")
-    ):
-        """
-        Initialize pagination parameters.
-        
-        Args:
-            page: Page number (1-based)
-            limit: Items per page
-            sort: Field to sort by
-            order: Sort order (asc or desc)
-        """
-        self.page = page
-        self.limit = limit
-        self.sort = sort
-        self.order = order
-        
-        # Calculate skip value for database queries
-        self.skip = (page - 1) * limit
-
-
-class PageInfo(BaseModel):
-    """
-    Page information for paginated responses.
-    """
-    current_page: int
-    total_pages: int
-    page_size: int
-    total_items: int
-    has_previous: bool
-    has_next: bool
-
-
-T = TypeVar('T')
-
-class PaginatedResponse(BaseModel, Generic[T]):
-    """
-    Generic paginated response model.
-    
-    This class is used to standardize the format of paginated responses
-    across all API endpoints.
-    """
-    items: List[T]
-    page_info: PageInfo
-    
-    class Config:
-        """Pydantic config."""
-        arbitrary_types_allowed = True
-
-
-def paginate_response(
-    items: List[Any],
-    total: int,
-    pagination: PaginationParams
-) -> Dict[str, Any]:
-    """
-    Create a standardized paginated response.
-    
-    Args:
-        items: List of items for the current page
-        total: Total number of items across all pages
-        pagination: Pagination parameters
-        
-    Returns:
-        Dict: Standardized response with items and pagination info
-    """
-    # Calculate pagination values
-    total_pages = (total + pagination.limit - 1) // pagination.limit
-    
-    # Create page info
-    page_info = PageInfo(
-        current_page=pagination.page,
-        total_pages=total_pages,
-        page_size=pagination.limit,
-        total_items=total,
-        has_previous=pagination.page > 1,
-        has_next=pagination.page < total_pages
-    )
-    
-    # Create response
-    return {
-        "items": items,
-        "page_info": page_info
-    }
-
-
-def get_pagination_links(
-    path: str,
-    pagination: PaginationParams,
-    total: int,
-    query_params: Optional[Dict[str, Any]] = None
-) -> Dict[str, Optional[str]]:
-    """
-    Generate pagination links for HATEOAS.
-    
-    Args:
-        path: Base path for links
-        pagination: Pagination parameters
-        total: Total number of items
-        query_params: Additional query parameters
-        
-    Returns:
-        Dict: Links for first, prev, next, and last pages
-    """
-    # Calculate pagination values
-    total_pages = (total + pagination.limit - 1) // pagination.limit
-    
-    # Initialize query params
-    params = query_params.copy() if query_params else {}
-    
-    # Helper to create URL with query params
-    def create_url(page: int) -> str:
-        page_params = {**params, "page": page, "limit": pagination.limit}
-        
-        if pagination.sort:
-            page_params["sort"] = pagination.sort
-            page_params["order"] = pagination.order
-            
-        query_string = "&".join(f"{key}={value}" for key, value in page_params.items())
-        return f"{path}?{query_string}"
-    
-    # Create links
-    links = {
-        "first": create_url(1),
-        "last": create_url(total_pages) if total_pages > 0 else None,
-        "prev": create_url(pagination.page - 1) if pagination.page > 1 else None,
-        "next": create_url(pagination.page + 1) if pagination.page < total_pages else None
-    }
-    
-    return links
-</file>
-
-<file path="app/utils/phone.py">
-"""
-Phone number validation and formatting utilities.
-"""
-import re
-from typing import Tuple, Dict, Optional
-
-try:
-    import phonenumbers
-    PHONENUMBERS_AVAILABLE = True
-except ImportError:
-    PHONENUMBERS_AVAILABLE = False
-
-
-class PhoneValidationError(Exception):
-    """Exception raised for phone validation errors."""
-    
-    def __init__(self, message: str, details: Optional[Dict] = None):
-        self.message = message
-        self.details = details or {}
-        super().__init__(message)
-
-
-def validate_phone_basic(number: str) -> Tuple[bool, str, Optional[str]]:
-    """
-    Basic phone number validation without external libraries.
-    
-    Args:
-        number: Phone number to validate
-        
-    Returns:
-        Tuple[bool, str, str]: (is_valid, formatted_number, error_message)
-    """
-    # Remove common formatting characters
-    cleaned = re.sub(r'[\s\-\(\)\.]+', '', number)
-    
-    # Check if it's just digits and maybe a leading +
-    if not re.match(r'^\+?\d+$', cleaned):
-        return False, number, "Phone number contains invalid characters"
-    
-    # Ensure it starts with + for E.164 format
-    if not cleaned.startswith('+'):
-        cleaned = '+' + cleaned
-    
-    # Basic length check
-    if len(cleaned) < 8:
-        return False, cleaned, "Phone number too short"
-    if len(cleaned) > 16:
-        return False, cleaned, "Phone number too long"
-    
-    return True, cleaned, None
-
-
-def validate_phone_advanced(number: str) -> Tuple[bool, str, Optional[str]]:
-    """
-    Advanced phone number validation using the phonenumbers library.
-    
-    Args:
-        number: Phone number to validate
-        
-    Returns:
-        Tuple[bool, str, str]: (is_valid, formatted_number, error_message)
-    """
-    try:
-        # Parse the phone number
-        parsed = phonenumbers.parse(number, None)
-        
-        # Check if it's a valid number
-        if not phonenumbers.is_valid_number(parsed):
-            return False, number, "Invalid phone number"
-        
-        # Format in E.164 format
-        formatted = phonenumbers.format_number(
-            parsed, phonenumbers.PhoneNumberFormat.E164
-        )
-        
-        # Get the country and carrier
-        country = phonenumbers.region_code_for_number(parsed)
-        
-        return True, formatted, None
-    except phonenumbers.NumberParseException as e:
-        return False, number, f"Parse error: {str(e)}"
-
-
-def validate_phone(number: str) -> Tuple[bool, str, Optional[str]]:
-    """
-    Validate and format a phone number.
-    
-    Uses the phonenumbers library if available, otherwise falls back to basic validation.
-    
-    Args:
-        number: Phone number to validate
-        
-    Returns:
-        Tuple[bool, str, str]: (is_valid, formatted_number, error_message)
-    """
-    if PHONENUMBERS_AVAILABLE:
-        return validate_phone_advanced(number)
-    else:
-        return validate_phone_basic(number)
-
-
-def is_valid_phone(number: str) -> bool:
-    """
-    Check if a phone number is valid.
-    
-    Args:
-        number: Phone number to validate
-        
-    Returns:
-        bool: True if valid, False otherwise
-    """
-    is_valid, _, _ = validate_phone(number)
-    return is_valid
-
-
-def format_phone(number: str) -> str:
-    """
-    Format a phone number in E.164 format.
-    
-    Args:
-        number: Phone number to format
-        
-    Returns:
-        str: Formatted phone number or original if invalid
-        
-    Raises:
-        PhoneValidationError: If the phone number is invalid
-    """
-    is_valid, formatted, error = validate_phone(number)
-    if not is_valid:
-        raise PhoneValidationError(error or "Invalid phone number", {"number": number})
-    return formatted
-</file>
-
-<file path="docker-compose.yml">
-version: '3.8'
-
-services:
-  # API service
-  api:
-    build: .
-    container_name: inboxerr-api
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-    volumes:
-      - .:/app
-    ports:
-      - "8000:8000"
-    environment:
-      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/inboxerr
-      - SMS_GATEWAY_URL=${SMS_GATEWAY_URL:-https://endpointnumber1.work.gd/api/3rdparty/v1}
-      - SMS_GATEWAY_LOGIN=${SMS_GATEWAY_LOGIN:-}
-      - SMS_GATEWAY_PASSWORD=${SMS_GATEWAY_PASSWORD:-}
-      - SECRET_KEY=${SECRET_KEY:-CHANGEME_IN_PRODUCTION}
-      - WEBHOOK_HOST=0.0.0.0
-      - WEBHOOK_PORT=5000
-      - LOG_LEVEL=DEBUG
-    depends_on:
-      - db
-    networks:
-      - inboxerr-network
-    restart: unless-stopped
-
-  # Database service
-  db:
-    image: postgres:14-alpine
-    container_name: inboxerr-db
-    volumes:
-      - postgres_data:/var/lib/postgresql/data/
-    environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
-      - POSTGRES_DB=inboxerr
-    ports:
-      - "5432:5432"
-    networks:
-      - inboxerr-network
-    restart: unless-stopped
-
-  # Optional: Redis for caching and task queue
-  redis:
-    image: redis:alpine
-    container_name: inboxerr-redis
-    ports:
-      - "6379:6379"
-    networks:
-      - inboxerr-network
-    restart: unless-stopped
-
-  # Optional: PgAdmin for database management
-  pgadmin:
-    image: dpage/pgadmin4
-    container_name: inboxerr-pgadmin
-    environment:
-      - PGADMIN_DEFAULT_EMAIL=admin@inboxerr.com
-      - PGADMIN_DEFAULT_PASSWORD=admin
-    ports:
-      - "5050:80"
-    depends_on:
-      - db
-    networks:
-      - inboxerr-network
-    restart: unless-stopped
-
-networks:
-  inboxerr-network:
-    driver: bridge
-
-volumes:
-  postgres_data:
-</file>
-
-<file path="Dockerfile">
-# Use Python 3.10 slim as base image
-FROM python:3.10-slim
-
-# Set working directory
-WORKDIR /app
-
-# Set environment variables
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app
-
-# Install system dependencies
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        build-essential \
-        libpq-dev \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy application code
-COPY . .
-
-# Create non-root user
-RUN adduser --disabled-password --gecos "" appuser
-RUN chown -R appuser:appuser /app
-USER appuser
-
-# Expose port
-EXPOSE 8000
-
-# Start application
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
-</file>
-
 <file path="project_structure.md">
 # Inboxerr Backend Project Structure
 
@@ -7829,52 +8210,6 @@ httpx>=0.25.0
 # Utilities
 python-dateutil>=2.8.2
 pytz>=2023.3
-</file>
-
-<file path=".gitignore">
-# Python specific
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-*.env
-*.venv
-env/
-venv/
-ENV/
-.venv/
-env.bak/
-venv.bak/
-*.egg
-*.egg-info/
-dist/
-build/
-*.log
-
-# FastAPI specific
-instance/
-*.db
-*.sqlite3
-
-# IDE specific
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# OS generated files
-.DS_Store
-Thumbs.db
-
-# Test and coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-*.cover
-*.py,cover
-.hypothesis/
-.pytest_cache/
 </file>
 
 </files>

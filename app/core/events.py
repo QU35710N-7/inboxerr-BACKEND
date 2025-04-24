@@ -45,7 +45,7 @@ async def startup_event_handler() -> None:
     if settings.RETRY_ENABLED:
         try:
             from app.services.sms.retry_engine import get_retry_engine
-            retry_engine = get_retry_engine()
+            retry_engine = await get_retry_engine()
             retry_task = asyncio.create_task(retry_engine.start())
             background_tasks.append(retry_task)
             logger.info("Retry engine started successfully")
