@@ -87,6 +87,7 @@ app/services/webhooks/manager.py
 app/services/webhooks/models.py
 app/utils/pagination.py
 app/utils/phone.py
+database-schema.md
 docker-compose.yml
 Dockerfile
 project_structure.md
@@ -219,176 +220,6 @@ formatter = generic
 [formatter_generic]
 format = %(levelname)-5.5s [%(name)s] %(message)s
 datefmt = %H:%M:%S
-</file>
-
-<file path="scripts/reset_db.py">
-"""
-Reset the development database by deleting the current DB file,
-running all Alembic migrations, and seeding initial data for testing.
-"""
-import sys
-import os
-import subprocess
-from pathlib import Path
-
-# Path to the SQLite DB file
-DB_PATH = "app.db"
-
-# Resolve project root dynamically
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-
-def reset_database() -> None:
-    """
-    Delete the dev database, run Alembic migrations, and seed initial data.
-    This should only be used in development environments.
-    """
-    db_file = PROJECT_ROOT / DB_PATH
-    if db_file.exists():
-        db_file.unlink()
-        print(f"✅ Removed existing DB at {DB_PATH}")
-    else:
-        print("ℹ️ No existing DB found")
-
-    print("🚀 Running Alembic migrations...")
-    subprocess.run(["alembic", "upgrade", "head"], check=True, cwd=PROJECT_ROOT)
-
-    print("🌱 Seeding initial data...")
-    subprocess.run(
-        [sys.executable, "scripts/seed_db.py"], 
-        check=True, 
-        cwd=PROJECT_ROOT,
-        env={**os.environ, "PYTHONPATH": str(PROJECT_ROOT)}
-    )
-
-    print("✅ Database reset and seeded successfully!")
-
-if __name__ == "__main__":
-    reset_database()
-</file>
-
-<file path="alembic/env.py">
-from logging.config import fileConfig
-
-from sqlalchemy import engine_from_config
-from sqlalchemy import pool
-
-from alembic import context
-from app.core.config import settings
-from app.db.base import Base
-
-
-# this is the Alembic Config object, which provides
-# access to the values within the .ini file in use.
-config = context.config
-
-# Interpret the config file for Python logging.
-# This line sets up loggers basically.
-if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
-
-# add your model's MetaData object here
-# for 'autogenerate' support
-# from myapp import mymodel
-# target_metadata = mymodel.Base.metadata
-target_metadata = Base.metadata
-
-# other values from the config, defined by the needs of env.py,
-# can be acquired:
-# my_important_option = config.get_main_option("my_important_option")
-# ... etc.
-
-
-def run_migrations_offline() -> None:
-    """Run migrations in 'offline' mode.
-
-    This configures the context with just a URL
-    and not an Engine, though an Engine is acceptable
-    here as well.  By skipping the Engine creation
-    we don't even need a DBAPI to be available.
-
-    Calls to context.execute() here emit the given string to the
-    script output.
-
-    """
-    config.set_main_option("sqlalchemy.url", settings.DATABASE_URL.replace("sqlite+aiosqlite", "sqlite"))
-    url = config.get_main_option("sqlalchemy.url")
-    
-    context.configure(
-        url=url,
-        target_metadata=target_metadata,
-        literal_binds=True,
-        dialect_opts={"paramstyle": "named"},
-    )
-
-    with context.begin_transaction():
-        context.run_migrations()
-
-
-def run_migrations_online() -> None:
-    """Run migrations in 'online' mode.
-
-    In this scenario we need to create an Engine
-    and associate a connection with the context.
-
-    """
-
-    # 🔧 Inject corrected DB URL for Alembic
-    config.set_main_option("sqlalchemy.url", settings.DATABASE_URL.replace("sqlite+aiosqlite", "sqlite"))
-
-    connectable = engine_from_config(
-        config.get_section(config.config_ini_section, {}),
-        prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
-    )
-
-    with connectable.connect() as connection:
-        context.configure(
-            connection=connection, target_metadata=target_metadata
-        )
-
-        with context.begin_transaction():
-            context.run_migrations()
-
-
-if context.is_offline_mode():
-    run_migrations_offline()
-else:
-    run_migrations_online()
-</file>
-
-<file path="alembic/README">
-Generic single-database configuration.
-</file>
-
-<file path="alembic/script.py.mako">
-"""${message}
-
-Revision ID: ${up_revision}
-Revises: ${down_revision | comma,n}
-Create Date: ${create_date}
-
-"""
-from typing import Sequence, Union
-
-from alembic import op
-import sqlalchemy as sa
-${imports if imports else ""}
-
-# revision identifiers, used by Alembic.
-revision: str = ${repr(up_revision)}
-down_revision: Union[str, None] = ${repr(down_revision)}
-branch_labels: Union[str, Sequence[str], None] = ${repr(branch_labels)}
-depends_on: Union[str, Sequence[str], None] = ${repr(depends_on)}
-
-
-def upgrade() -> None:
-    """Upgrade schema."""
-    ${upgrades if upgrades else "pass"}
-
-
-def downgrade() -> None:
-    """Downgrade schema."""
-    ${downgrades if downgrades else "pass"}
 </file>
 
 <file path="app/api/v1/dependencies.py">
@@ -1565,129 +1396,6 @@ async def get_task_status(
         raise HTTPException(status_code=500, detail=f"Error retrieving task status: {str(e)}")
 </file>
 
-<file path="app/core/events.py">
-"""
-Event handlers for application lifecycle events.
-"""
-import asyncio
-import logging
-from typing import Dict, List, Any
-
-from app.core.config import settings
-from app.services.event_bus.bus import get_event_bus
-from app.services.event_bus.events import EventType
-
-logger = logging.getLogger("inboxerr")
-
-# Collection of background tasks to manage
-background_tasks: List[asyncio.Task] = []
-
-
-async def startup_event_handler() -> None:
-    """
-    Handle application startup.
-    
-    Initialize services, database connections, and start background processes.
-    """
-    logger.info("Starting Inboxerr Backend application")
-    
-    # Initialize database (async)
-    try:
-        # We'll implement this in the database module
-        from app.db.session import initialize_database
-        await initialize_database()
-        logger.info("Database initialized successfully")
-    except Exception as e:
-        logger.error(f"Error initializing database: {e}")
-        # Don't raise error to allow startup to continue
-    
-    # Initialize event bus
-    try:
-        event_bus = get_event_bus()
-        await event_bus.initialize()
-        logger.info("Event bus initialized successfully")
-    except Exception as e:
-        logger.error(f"Error initializing event bus: {e}")
-    
-    # Start retry engine if enabled
-    if settings.RETRY_ENABLED:
-        try:
-            from app.services.sms.retry_engine import get_retry_engine
-            retry_engine = await get_retry_engine()
-            retry_task = asyncio.create_task(retry_engine.start())
-            background_tasks.append(retry_task)
-            logger.info("Retry engine started successfully")
-        except Exception as e:
-            logger.error(f"Error starting retry engine: {e}")
-    
-    # Start webhook listener if enabled
-    try:
-        from app.services.webhooks.manager import initialize_webhook_manager
-        await initialize_webhook_manager()
-        logger.info("Webhook manager initialized successfully")
-    except Exception as e:
-        logger.error(f"Error initializing webhooks: {e}")
-    
-    # Initialize metrics collector
-    try:
-        from app.services.metrics.collector import initialize_metrics
-        await initialize_metrics()
-        logger.info("Metrics collector initialized successfully")
-    except Exception as e:
-        logger.error(f"Error initializing metrics: {e}")
-    
-    # Log successful startup
-    logger.info(f"✅ {settings.PROJECT_NAME} v{settings.VERSION} startup complete")
-
-
-async def shutdown_event_handler() -> None:
-    """
-    Handle application shutdown.
-    
-    Clean up resources and close connections properly.
-    """
-    logger.info("Shutting down Inboxerr Backend application")
-    
-    # Publish shutdown event
-    try:
-        event_bus = get_event_bus()
-        await event_bus.publish(EventType.SYSTEM_SHUTDOWN, {
-            "reason": "Application shutdown",
-            "graceful": True
-        })
-        logger.info("Published shutdown event")
-    except Exception as e:
-        logger.error(f"Error publishing shutdown event: {e}")
-    
-    # Cancel all background tasks
-    for task in background_tasks:
-        if not task.done():
-            task.cancel()
-            try:
-                # Wait briefly for task to cancel
-                await asyncio.wait_for(task, timeout=5.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                logger.warning(f"Task {task.get_name()} was cancelled")
-    
-    # Close database connections
-    try:
-        from app.db.session import close_database_connections
-        await close_database_connections()
-        logger.info("Database connections closed")
-    except Exception as e:
-        logger.error(f"Error closing database connections: {e}")
-    
-    # Shutdown webhook manager
-    try:
-        from app.services.webhooks.manager import shutdown_webhook_manager
-        await shutdown_webhook_manager()
-        logger.info("Webhook manager shutdown complete")
-    except Exception as e:
-        logger.error(f"Error shutting down webhook manager: {e}")
-    
-    logger.info("✅ Application shutdown complete")
-</file>
-
 <file path="app/core/exceptions.py">
 """
 Custom exception classes for Inboxerr Backend.
@@ -2000,22 +1708,6 @@ def verify_webhook_signature(
     
     # Compare signatures (constant-time comparison)
     return hmac.compare_digest(expected, signature)
-</file>
-
-<file path="app/db/base.py">
-"""
-Import all models here to ensure they are registered with SQLAlchemy.
-"""
-# Import Base
-from app.models.base import Base
-
-# Import all models
-from app.models.user import User, APIKey
-from app.models.campaign import Campaign
-from app.models.message import Message, MessageEvent, MessageBatch, MessageTemplate
-from app.models.webhook import Webhook, WebhookDelivery, WebhookEvent
-
-# This allows alembic to auto-discover all models when creating migrations
 </file>
 
 <file path="app/db/repositories/base.py">
@@ -3459,322 +3151,6 @@ class WebhookEvent(Base):
     error_message = Column(String, nullable=True)
 </file>
 
-<file path="app/schemas/campaign.py">
-# app/schemas/campaign.py
-from typing import List, Optional, Dict, Any
-from datetime import datetime
-from uuid import UUID
-
-from pydantic import BaseModel, Field, validator
-
-
-class CampaignBase(BaseModel):
-    """Base schema for campaign data."""
-    name: str = Field(..., description="Campaign name")
-    description: Optional[str] = Field(None, description="Campaign description")
-    scheduled_start_at: Optional[datetime] = Field(None, description="Scheduled start time")
-    scheduled_end_at: Optional[datetime] = Field(None, description="Scheduled end time")
-    settings: Optional[Dict[str, Any]] = Field(default={}, description="Campaign settings")
-
-
-class CampaignCreate(CampaignBase):
-    """Schema for creating a new campaign."""
-    pass
-
-
-class CampaignCreateFromCSV(BaseModel):
-    """Schema for creating a campaign from CSV file."""
-    name: str = Field(..., description="Campaign name")
-    description: Optional[str] = Field(None, description="Campaign description")
-    message_template: str = Field(..., description="Message template to send")
-    scheduled_start_at: Optional[datetime] = Field(None, description="Scheduled start time")
-    scheduled_end_at: Optional[datetime] = Field(None, description="Scheduled end time")
-    settings: Optional[Dict[str, Any]] = Field(default={}, description="Campaign settings")
-
-
-class CampaignUpdate(BaseModel):
-    """Schema for updating a campaign."""
-    name: Optional[str] = Field(None, description="Campaign name")
-    description: Optional[str] = Field(None, description="Campaign description")
-    scheduled_start_at: Optional[datetime] = Field(None, description="Scheduled start time")
-    scheduled_end_at: Optional[datetime] = Field(None, description="Scheduled end time")
-    settings: Optional[Dict[str, Any]] = Field(None, description="Campaign settings")
-
-
-class CampaignStatus(BaseModel):
-    """Schema for campaign status update."""
-    status: str = Field(..., description="Campaign status")
-    
-    @validator("status")
-    def validate_status(cls, v):
-        """Validate status value."""
-        valid_statuses = ["draft", "active", "paused", "completed", "cancelled", "failed"]
-        if v not in valid_statuses:
-            raise ValueError(f"Status must be one of: {', '.join(valid_statuses)}")
-        return v
-
-
-class CampaignResponse(CampaignBase):
-    """Schema for campaign response."""
-    id: str = Field(..., description="Campaign ID")
-    status: str = Field(..., description="Campaign status")
-    total_messages: int = Field(..., description="Total number of messages")
-    sent_count: int = Field(..., description="Number of sent messages")
-    delivered_count: int = Field(..., description="Number of delivered messages")
-    failed_count: int = Field(..., description="Number of failed messages")
-    created_at: datetime = Field(..., description="Creation timestamp")
-    updated_at: datetime = Field(..., description="Last update timestamp")
-    started_at: Optional[datetime] = Field(None, description="Start timestamp")
-    completed_at: Optional[datetime] = Field(None, description="Completion timestamp")
-    user_id: str = Field(..., description="User ID")
-    
-    # Add computed fields
-    progress_percentage: float = Field(0, description="Progress percentage")
-    delivery_success_rate: float = Field(0, description="Delivery success rate")
-    
-    class Config:
-        """Pydantic config."""
-        from_attributes = True
-
-
-class CampaignListResponse(BaseModel):
-    """Schema for campaign list response with pagination."""
-    items: List[CampaignResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
-</file>
-
-<file path="app/schemas/message.py">
-"""
-Pydantic schemas for message-related API operations.
-"""
-from typing import List, Optional, Dict, Any
-from datetime import datetime
-from enum import Enum
-from pydantic import BaseModel, Field, validator
-
-
-class MessageStatus(str, Enum):
-    """Possible message statuses."""
-    PENDING = "pending"
-    PROCESSED = "processed"
-    SENT = "sent"
-    DELIVERED = "delivered"
-    FAILED = "failed"
-    SCHEDULED = "scheduled"
-    CANCELLED = "cancelled"
-
-
-class MessageCreate(BaseModel):
-    """Schema for creating a new message."""
-    phone_number: str = Field(..., description="Recipient phone number in E.164 format")
-    message: str = Field(..., description="Message content")
-    scheduled_at: Optional[datetime] = Field(None, description="Schedule message for future delivery")
-    custom_id: Optional[str] = Field(None, description="Custom ID for tracking")
-    
-    @validator("phone_number")
-    def validate_phone_number(cls, v):
-        """Validate phone number format."""
-        # Basic validation - will be handled more thoroughly in the service
-        if not v or not (v.startswith("+") and len(v) >= 8):
-            raise ValueError("Phone number must be in E.164 format (e.g. +1234567890)")
-        return v
-    
-    @validator("message")
-    def validate_message(cls, v):
-        """Validate message content."""
-        if not v or len(v.strip()) == 0:
-            raise ValueError("Message cannot be empty")
-        if len(v) > 1600:  # Allow for multi-part SMS
-            raise ValueError("Message exceeds maximum length of 1600 characters")
-        return v
-
-
-class MessageResponse(BaseModel):
-    """Schema for message response."""
-    id: str = Field(..., description="Message ID")
-    custom_id: Optional[str] = Field(None, description="Custom ID if provided")
-    phone_number: str = Field(..., description="Recipient phone number")
-    message: str = Field(..., description="Message content")
-    status: MessageStatus = Field(..., description="Current message status")
-    created_at: datetime = Field(..., description="Creation timestamp")
-    updated_at: datetime = Field(..., description="Last update timestamp")
-    scheduled_at: Optional[datetime] = Field(None, description="Scheduled delivery time")
-    sent_at: Optional[datetime] = Field(None, description="Time when message was sent")
-    delivered_at: Optional[datetime] = Field(None, description="Time when message was delivered")
-    failed_at: Optional[datetime] = Field(None, description="Time when message failed")
-    reason: Optional[str] = Field(None, description="Failure reason if applicable")
-    gateway_message_id: Optional[str] = Field(None, description="ID from SMS gateway")
-    user_id: str = Field(..., description="User who sent the message")
-    metadata: Optional[Dict[str, Any]] = Field(default={}, description="Additional metadata")
-    
-    class Config:
-        """Pydantic config."""
-        from_attributes = True
-
-
-class MessageStatusUpdate(BaseModel):
-    """Schema for updating message status."""
-    status: MessageStatus = Field(..., description="New message status")
-    reason: Optional[str] = Field(None, description="Reason for status change (required for FAILED)")
-    
-    @validator("reason")
-    def validate_reason(cls, v, values):
-        """Validate reason field."""
-        if values.get("status") == MessageStatus.FAILED and not v:
-            raise ValueError("Reason is required when status is FAILED")
-        return v
-
-
-class BatchOptions(BaseModel):
-    """Options for batch processing."""
-    delay_between_messages: Optional[float] = Field(0.3, description="Delay between messages in seconds")
-    fail_on_first_error: Optional[bool] = Field(False, description="Stop processing on first error")
-    retry_failed: Optional[bool] = Field(True, description="Automatically retry failed messages")
-
-
-class BatchMessageRequest(BaseModel):
-    """Schema for batch message request."""
-    messages: List[MessageCreate] = Field(..., description="List of messages to send")
-    options: Optional[BatchOptions] = Field(default=None, description="Batch processing options")
-    
-    @validator("messages")
-    def validate_messages(cls, v):
-        """Validate message list."""
-        if not v:
-            raise ValueError("Message list cannot be empty")
-        if len(v) > 1000:
-            raise ValueError("Maximum batch size is 1000 messages")
-        return v
-
-
-class BatchMessageResponse(BaseModel):
-    """Schema for batch message response."""
-    batch_id: str = Field(..., description="Batch ID for tracking")
-    total: int = Field(..., description="Total number of messages in batch")
-    processed: int = Field(..., description="Number of messages processed")
-    successful: int = Field(..., description="Number of successful messages")
-    failed: int = Field(..., description="Number of failed messages")
-    status: str = Field(..., description="Overall batch status")
-    created_at: datetime = Field(..., description="Batch creation timestamp")
-    messages: Optional[List[MessageResponse]] = Field(None, description="List of message responses")
-</file>
-
-<file path="app/schemas/user.py">
-"""
-Pydantic schemas for user-related API operations.
-"""
-from typing import List, Optional
-from datetime import datetime
-from enum import Enum
-from pydantic import BaseModel, Field, EmailStr, validator
-
-
-class UserRole(str, Enum):
-    """User role enum."""
-    ADMIN = "admin"
-    USER = "user"
-    API = "api"
-
-
-class UserBase(BaseModel):
-    """Base user schema."""
-    email: Optional[EmailStr] = Field(None, description="User email address")
-    full_name: Optional[str] = Field(None, description="User's full name")
-    is_active: Optional[bool] = Field(True, description="Whether the user is active")
-    role: Optional[UserRole] = Field(UserRole.USER, description="User role")
-
-
-class UserCreate(UserBase):
-    """Schema for creating a new user."""
-    email: EmailStr = Field(..., description="User email address")
-    password: str = Field(..., description="User password")
-    
-    @validator("password")
-    def validate_password(cls, v):
-        """Validate password strength."""
-        if len(v) < 8:
-            raise ValueError("Password must be at least 8 characters long")
-        if not any(char.isdigit() for char in v):
-            raise ValueError("Password must contain at least one digit")
-        if not any(char.isupper() for char in v):
-            raise ValueError("Password must contain at least one uppercase letter")
-        return v
-
-
-class UserUpdate(UserBase):
-    """Schema for updating a user."""
-    password: Optional[str] = Field(None, description="User password")
-    
-    @validator("password")
-    def validate_password(cls, v):
-        """Validate password if provided."""
-        if v is not None:
-            if len(v) < 8:
-                raise ValueError("Password must be at least 8 characters long")
-            if not any(char.isdigit() for char in v):
-                raise ValueError("Password must contain at least one digit")
-            if not any(char.isupper() for char in v):
-                raise ValueError("Password must contain at least one uppercase letter")
-        return v
-
-
-class User(UserBase):
-    """Schema for user response."""
-    id: str = Field(..., description="User ID")
-    created_at: datetime = Field(..., description="Creation timestamp")
-    updated_at: datetime = Field(..., description="Last update timestamp")
-    
-    class Config:
-        """Pydantic config."""
-        from_attributes = True
-
-
-class UserInDB(User):
-    """Schema for user in database (with hashed password)."""
-    hashed_password: str = Field(..., description="Hashed password")
-
-
-class Token(BaseModel):
-    """Schema for authentication token."""
-    access_token: str
-    token_type: str = "bearer"
-    expires_at: datetime
-
-
-class TokenData(BaseModel):
-    """Schema for token payload."""
-    sub: str  # User ID
-    exp: Optional[datetime] = None
-    role: Optional[str] = None
-
-
-class APIKey(BaseModel):
-    """Schema for API key."""
-    id: str = Field(..., description="API key ID")
-    key: str = Field(..., description="API key")
-    name: str = Field(..., description="API key name")
-    user_id: str = Field(..., description="User who owns the API key")
-    created_at: datetime = Field(..., description="Creation timestamp")
-    expires_at: Optional[datetime] = Field(None, description="Expiration timestamp")
-    is_active: bool = Field(True, description="Whether the API key is active")
-    last_used_at: Optional[datetime] = Field(None, description="Last usage timestamp")
-    permissions: List[str] = Field(default=[], description="List of permissions")
-    
-    class Config:
-        """Pydantic config."""
-        from_attributes = True
-
-
-class APIKeyCreate(BaseModel):
-    """Schema for creating a new API key."""
-    name: str = Field(..., description="API key name")
-    expires_at: Optional[datetime] = Field(None, description="Expiration timestamp")
-    permissions: Optional[List[str]] = Field(default=[], description="List of permissions")
-</file>
-
 <file path="app/scripts/create_admin.py">
 # scripts/create_admin.py
 import asyncio
@@ -4496,279 +3872,6 @@ def get_rate_limiter() -> RateLimiter:
     return _rate_limiter
 </file>
 
-<file path="app/services/sms/retry_engine.py">
-# app/services/sms/retry_engine.py
-import asyncio
-import logging
-import uuid
-from datetime import datetime, timedelta
-from typing import List, Dict, Any, Optional
-
-from app.core.config import settings
-from app.db.repositories.messages import MessageRepository
-from app.schemas.message import MessageStatus
-from app.services.event_bus.events import EventType
-from app.services.event_bus.bus import get_event_bus
-from app.core.exceptions import SMSGatewayError, RetryableError
-
-logger = logging.getLogger("inboxerr.retry")
-
-class RetryEngine:
-    """
-    Service for retrying failed messages.
-    
-    Periodically checks for failed messages and attempts to resend them.
-    """
-    
-    def __init__(self, message_repository: MessageRepository, event_bus: Any, sms_sender: Any):
-        """
-        Initialize retry engine with required dependencies.
-        
-        Args:
-            message_repository: Repository for message access
-            event_bus: Event bus for publishing events
-            sms_sender: SMS sender service for resending messages
-        """
-        self.message_repository = message_repository
-        self.event_bus = event_bus
-        self.sms_sender = sms_sender
-        self._running = False
-        self._semaphore = asyncio.Semaphore(5)  # Limit concurrent retries
-        
-    async def start(self) -> None:
-        """Start the retry engine."""
-        if self._running:
-            return
-            
-        self._running = True
-        logger.info("Starting retry engine")
-        
-        while self._running:
-            try:
-                await self._process_retries()
-            except Exception as e:
-                logger.error(f"Error in retry engine: {e}", exc_info=True)
-                
-            # Wait before next cycle
-            await asyncio.sleep(settings.RETRY_INTERVAL_SECONDS)
-            
-    async def stop(self) -> None:
-        """Stop the retry engine."""
-        self._running = False
-        logger.info("Retry engine stopped")
-    
-    async def _process_retries(self) -> None:
-        """Process messages pending retry."""
-        # Get messages that need retry
-        retry_candidates = await self._get_retry_candidates()
-        
-        if not retry_candidates:
-            logger.debug("No messages to retry")
-            return
-            
-        logger.info(f"Found {len(retry_candidates)} messages to retry")
-        
-        # Process retries with concurrency limit
-        tasks = []
-        for message in retry_candidates:
-            tasks.append(self._retry_message(message))
-            
-        if tasks:
-            # Process retries concurrently but with limit
-            for i in range(0, len(tasks), 5):  # Process in chunks of 5
-                chunk = tasks[i:i+5]
-                await asyncio.gather(*chunk)
-                await asyncio.sleep(1)  # Short delay between chunks
-    
-    async def _get_retry_candidates(self) -> List[Dict[str, Any]]:
-        """
-        Get messages that are candidates for retry.
-        
-        Returns:
-            List[Dict]: List of messages that should be retried
-        """
-        # Parameters for retry candidate selection
-        now = datetime.utcnow()
-        max_retries = settings.RETRY_MAX_ATTEMPTS
-        
-        # Query for messages that:
-        # 1. Are in a failed state
-        # 2. Have not exceeded max retry attempts
-        # 3. Have a retryable error or no error specified
-        # 4. Last retry attempt was long enough ago (based on exponential backoff)
-        
-        # This is a simplified implementation - in production you might want
-        # more sophisticated filtering and prioritization
-        failed_messages = await self.message_repository.get_retryable_messages(
-            max_retries=max_retries,
-            limit=50  # Limit number of messages to process in one cycle
-        )
-        
-        # Filter messages based on retry delay (exponential backoff)
-        retry_candidates = []
-        
-        for message in failed_messages:
-            # Get retry attempt count (from message metadata or events)
-            retry_count = self._get_retry_count(message)
-            
-            # Calculate backoff delay - 30s, 2m, 8m, 30m, 2h, etc.
-            backoff_seconds = 30 * (2 ** retry_count)
-            
-            # Get timestamp of last attempt
-            last_attempt = message.failed_at or message.updated_at
-            
-            # Check if enough time has passed for retry
-            if now - last_attempt > timedelta(seconds=backoff_seconds):
-                retry_candidates.append(message)
-        
-        return retry_candidates
-    
-    def _get_retry_count(self, message: Any) -> int:
-        """
-        Get the retry count for a message.
-        
-        Args:
-            message: Message object
-            
-        Returns:
-            int: Number of retry attempts
-        """
-        # Check if retry count is in metadata
-        meta_data = getattr(message, 'meta_data', {}) or {}
-        if isinstance(meta_data, dict) and 'retry_count' in meta_data:
-            return meta_data.get('retry_count', 0)
-            
-        # Fallback - count events of type "retry"
-        retry_events = [e for e in getattr(message, 'events', []) 
-                       if getattr(e, 'event_type', '') == 'retry']
-        return len(retry_events)
-    
-    async def _retry_message(self, message: Any) -> None:
-        """
-        Retry sending a message.
-        
-        Args:
-            message: Message to retry
-        """
-        message_id = message.id
-        phone_number = message.phone_number
-        message_text = message.message
-        custom_id = message.custom_id
-        
-        # Get current retry count
-        retry_count = self._get_retry_count(message)
-        
-        try:
-            logger.info(f"Retrying message {message_id} (attempt {retry_count + 1})")
-            
-            # Use semaphore to limit concurrent retries
-            async with self._semaphore:
-                # Reset status to pending for retry
-                await self.message_repository.update_message_status(
-                    message_id=message_id,
-                    status=MessageStatus.PENDING,
-                    event_type="retry",
-                    data={
-                        "retry_count": retry_count + 1,
-                        "previous_error": message.reason
-                    }
-                )
-                
-                # Update metadata to track retry count
-                meta_data = getattr(message, 'meta_data', {}) or {}
-                if isinstance(meta_data, dict):
-                    meta_data['retry_count'] = retry_count + 1
-                    await self.message_repository.update(
-                        id=message_id,
-                        obj_in={"meta_data": meta_data}
-                    )
-                
-                # Attempt to send again
-                result = await self.sms_sender._send_to_gateway(
-                    phone_number=phone_number,
-                    message_text=message_text,
-                    custom_id=custom_id or str(uuid.uuid4())
-                )
-                
-                # Update message status
-                await self.message_repository.update_message_status(
-                    message_id=message_id,
-                    status=result.get("status", MessageStatus.PENDING),
-                    event_type="retry_success",
-                    gateway_message_id=result.get("gateway_message_id"),
-                    data=result
-                )
-                
-                # Publish event
-                await self.event_bus.publish(
-                    EventType.MESSAGE_RETRIED,
-                    {
-                        "message_id": message_id,
-                        "phone_number": phone_number,
-                        "retry_count": retry_count + 1,
-                        "status": result.get("status", MessageStatus.PENDING)
-                    }
-                )
-                
-                logger.info(f"Successfully retried message {message_id}")
-                
-        except Exception as e:
-            logger.error(f"Error retrying message {message_id}: {e}")
-            
-            # Update status to failed with incremented retry count
-            error_message = str(e)
-            is_retryable = isinstance(e, RetryableError)
-            
-            await self.message_repository.update_message_status(
-                message_id=message_id,
-                status=MessageStatus.FAILED,
-                event_type="retry_failed",
-                reason=error_message,
-                data={
-                    "retry_count": retry_count + 1,
-                    "retryable": is_retryable
-                }
-            )
-            
-            # Publish event
-            await self.event_bus.publish(
-                EventType.MESSAGE_RETRY_FAILED,
-                {
-                    "message_id": message_id,
-                    "phone_number": phone_number,
-                    "retry_count": retry_count + 1,
-                    "error": error_message,
-                    "retryable": is_retryable
-                }
-            )
-
-
-# Singleton instance
-_retry_engine = None
-
-async def get_retry_engine():
-    """Get the singleton retry engine instance."""
-    global _retry_engine
-    
-    if _retry_engine is None:
-        from app.db.session import get_repository
-        from app.db.repositories.messages import MessageRepository
-        from app.services.event_bus.bus import get_event_bus
-        from app.services.sms.sender import get_sms_sender
-        
-        message_repository = await get_repository(MessageRepository)
-        event_bus = get_event_bus()
-        sms_sender = await get_sms_sender()
-        
-        _retry_engine = RetryEngine(
-            message_repository=message_repository,
-            event_bus=event_bus,
-            sms_sender=sms_sender
-        )
-        
-    return _retry_engine
-</file>
-
 <file path="app/services/webhooks/models.py">
 # app/services/webhooks/models.py
 """
@@ -5111,81 +4214,72 @@ def format_phone(number: str) -> str:
     return formatted
 </file>
 
-<file path="docker-compose.yml">
-version: '3.8'
+<file path="database-schema.md">
+# Inboxerr Database Schema Overview
 
-services:
-  # API service
-  api:
-    build: .
-    container_name: inboxerr-api
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-    volumes:
-      - .:/app
-    ports:
-      - "8000:8000"
-    environment:
-      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/inboxerr
-      - SMS_GATEWAY_URL=${SMS_GATEWAY_URL:-https://endpointnumber1.work.gd/api/3rdparty/v1}
-      - SMS_GATEWAY_LOGIN=${SMS_GATEWAY_LOGIN:-}
-      - SMS_GATEWAY_PASSWORD=${SMS_GATEWAY_PASSWORD:-}
-      - SECRET_KEY=${SECRET_KEY:-CHANGEME_IN_PRODUCTION}
-      - WEBHOOK_HOST=0.0.0.0
-      - WEBHOOK_PORT=5000
-      - LOG_LEVEL=DEBUG
-    depends_on:
-      - db
-    networks:
-      - inboxerr-network
-    restart: unless-stopped
+This document outlines the structure of the PostgreSQL database used by the Inboxerr backend service. It includes all tables, relationships, and index/foreign key mappings, aligned with the SQLAlchemy models defined in the codebase.
 
-  # Database service
-  db:
-    image: postgres:14-alpine
-    container_name: inboxerr-db
-    volumes:
-      - postgres_data:/var/lib/postgresql/data/
-    environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
-      - POSTGRES_DB=inboxerr
-    ports:
-      - "5432:5432"
-    networks:
-      - inboxerr-network
-    restart: unless-stopped
+---
 
-  # Optional: Redis for caching and task queue
-  redis:
-    image: redis:alpine
-    container_name: inboxerr-redis
-    ports:
-      - "6379:6379"
-    networks:
-      - inboxerr-network
-    restart: unless-stopped
+## 🔢 Tables & Relationships
 
-  # Optional: PgAdmin for database management
-  pgadmin:
-    image: dpage/pgadmin4
-    container_name: inboxerr-pgadmin
-    environment:
-      - PGADMIN_DEFAULT_EMAIL=admin@inboxerr.com
-      - PGADMIN_DEFAULT_PASSWORD=admin
-    ports:
-      - "5050:80"
-    depends_on:
-      - db
-    networks:
-      - inboxerr-network
-    restart: unless-stopped
+| **Table**           | **Primary Keys** | **Foreign Keys**                             | **Relationships**                             |
+|---------------------|------------------|-----------------------------------------------|------------------------------------------------|
+| `user`              | `id`             | –                                             | Referenced by many tables                      |
+| `apikey`            | `id`             | `user_id` → `user(id)`                     | Each API key belongs to a user                 |
+| `campaign`          | `id`             | `user_id` → `user(id)`                     | One user owns many campaigns                   |
+| `message`           | `id`             | `user_id` → `user(id)`<br>`campaign_id` → `campaign(id)`<br>`batch_id` → `messagebatch(id)` | Messages belong to a campaign and batch        |
+| `messagebatch`      | `id`             | `user_id` → `user(id)`                     | Groups messages sent together                  |
+| `messageevent`      | `id`             | `message_id` → `message(id)`              | Tracks status updates for a message            |
+| `messagetemplate`   | `id`             | `user_id` → `user(id)`                     | Message content templates                      |
+| `webhook`           | `id`             | `user_id` → `user(id)`                     | Defines external callbacks                     |
+| `webhookdelivery`   | `id`             | `webhook_id` → `webhook(id)`<br>`message_id` → `message(id)` | Stores actual webhook attempts                 |
+| `webhookevent`      | `id`             | –                                             | Events that can trigger webhooks               |
+| `alembic_version`   | –                | –                                             | Managed by Alembic for schema migrations       |
 
-networks:
-  inboxerr-network:
-    driver: bridge
+---
 
-volumes:
-  postgres_data:
+## 📊 Indexes & Performance
+
+Each table includes relevant indexes, such as:
+- `id` (primary key, indexed by default)
+- Frequently queried fields like `user_id`, `campaign_id`, `status`, and `scheduled_at`
+
+---
+
+## 🔒 Data Types Overview
+
+| **Field**            | **Type**                       |
+|----------------------|---------------------------------|
+| `id`                 | `character varying` (UUIDs)     |
+| `user_id`            | `character varying` (FK)        |
+| `campaign_id`        | `character varying` (FK)        |
+| `message`            | `text`                          |
+| `status`             | `character varying`             |
+| `scheduled_at`       | `timestamp without time zone`   |
+| `settings`, `data`   | `json`                          |
+
+---
+
+## 📄 How to Inspect the Schema
+
+From inside `psql`:
+```bash
+\c inboxerr        -- Connect to DB
+\dt                 -- List tables
+\d tablename       -- Describe table structure
+SELECT * FROM tablename LIMIT 5;  -- Preview data
+```
+
+To see all foreign keys:
+```sql
+SELECT conname AS constraint_name, conrelid::regclass AS table,
+       a.attname AS column, confrelid::regclass AS referenced_table
+FROM pg_constraint
+JOIN pg_class ON conrelid = pg_class.oid
+JOIN pg_attribute a ON a.attrelid = conrelid AND a.attnum = ANY(conkey)
+WHERE contype = 'f';
+```
 </file>
 
 <file path="Dockerfile">
@@ -5227,39 +4321,59 @@ EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
 </file>
 
-<file path="scripts/seed_db.py">
+<file path="scripts/reset_db.py">
 """
-Placeholder script for seeding the database in development.
-Currently not in use — extend as needed.
-Seed the database with essential data (e.g., admin user).
-Currently skips message seeding — placeholder for future use.
-
+Reset the development database, run Alembic migrations, and seed initial data.
+Works with PostgreSQL database.
 """
-
-import subprocess
-import os
 import sys
+import os
+import subprocess
+from pathlib import Path
 
-def run_admin_script():
-    """Ensure an admin user exists by running create_admin.py."""
+
+
+# Resolve project root dynamically
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+def reset_database() -> None:
+    """
+    Reset the development database, run Alembic migrations, and seed initial data.
+    This should only be used in development environments.
+    """
+    # Reset PostgreSQL database (drop and recreate)
+    print("🗄️ Resetting PostgreSQL database...")
     try:
+        # Connect to default postgres database to drop/create our database
         subprocess.run(
-            [sys.executable, "app/scripts/create_admin.py"],
-            check=True,
-            cwd=os.getcwd(),  # Ensures correct working directory
-            env={**os.environ, "PYTHONPATH": os.getcwd()}
+            ["psql", "-U", "postgres", "-c", "DROP DATABASE IF EXISTS inboxerr;"],
+            check=True
         )
-        print("👮 Admin user created.")
-    except subprocess.CalledProcessError:
-        print("⚠️ Failed to create admin user. Check create_admin.py.")
+        subprocess.run(
+            ["psql", "-U", "postgres", "-c", "CREATE DATABASE inboxerr;"],
+            check=True
+        )
+        print("✅ Database reset successfully")
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Error resetting database: {e}")
+        print("💡 Make sure PostgreSQL is running and you have permissions")
+        sys.exit(1)
 
+    print("🚀 Running Alembic migrations...")
+    subprocess.run(["alembic", "upgrade", "head"], check=True, cwd=PROJECT_ROOT)
 
-def seed():
-    print("🌱 [SKIPPED] No seed data logic implemented yet.")
+    print("🌱 Seeding initial data...")
+    subprocess.run(
+        [sys.executable, "scripts/seed_db.py"], 
+        check=True, 
+        cwd=PROJECT_ROOT,
+        env={**os.environ, "PYTHONPATH": str(PROJECT_ROOT)}
+    )
+
+    print("✅ Database reset and seeded successfully!")
 
 if __name__ == "__main__":
-    seed()
-    run_admin_script()
+    reset_database()
 </file>
 
 <file path=".gitignore">
@@ -5306,6 +4420,132 @@ htmlcov/
 *.py,cover
 .hypothesis/
 .pytest_cache/
+</file>
+
+<file path="alembic/env.py">
+from logging.config import fileConfig
+
+from sqlalchemy import engine_from_config
+from sqlalchemy import pool
+
+from alembic import context
+from app.core.config import settings
+from app.db.base import Base
+
+
+# this is the Alembic Config object, which provides
+# access to the values within the .ini file in use.
+config = context.config
+
+# Interpret the config file for Python logging.
+# This line sets up loggers basically.
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+
+# add your model's MetaData object here
+# for 'autogenerate' support
+# from myapp import mymodel
+# target_metadata = mymodel.Base.metadata
+target_metadata = Base.metadata
+
+# other values from the config, defined by the needs of env.py,
+# can be acquired:
+# my_important_option = config.get_main_option("my_important_option")
+# ... etc.
+
+
+
+def run_migrations_offline() -> None:
+    """Run migrations in 'offline' mode.
+
+    This configures the context with just a URL
+    and not an Engine, though an Engine is acceptable
+    here as well.  By skipping the Engine creation
+    we don't even need a DBAPI to be available.
+
+    Calls to context.execute() here emit the given string to the
+    script output.
+
+    """
+    config.set_main_option("sqlalchemy.url", settings.DATABASE_URL.replace("postgresql+asyncpg", "postgresql"))
+    url = config.get_main_option("sqlalchemy.url")
+    
+    context.configure(
+        url=url,
+        target_metadata=target_metadata,
+        literal_binds=True,
+        dialect_opts={"paramstyle": "named"},
+    )
+
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+def run_migrations_online() -> None:
+    """Run migrations in 'online' mode.
+
+    In this scenario we need to create an Engine
+    and associate a connection with the context.
+
+    """
+
+    # 🔧 Inject corrected DB URL for Alembic
+    config.set_main_option("sqlalchemy.url", settings.DATABASE_URL.replace("postgresql+asyncpg", "postgresql"))
+
+    connectable = engine_from_config(
+        config.get_section(config.config_ini_section, {}),
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
+    )
+
+    with connectable.connect() as connection:
+        context.configure(
+            connection=connection, target_metadata=target_metadata
+        )
+
+        with context.begin_transaction():
+            context.run_migrations()
+
+
+if context.is_offline_mode():
+    run_migrations_offline()
+else:
+    run_migrations_online()
+</file>
+
+<file path="alembic/README">
+Generic single-database configuration.
+</file>
+
+<file path="alembic/script.py.mako">
+"""${message}
+
+Revision ID: ${up_revision}
+Revises: ${down_revision | comma,n}
+Create Date: ${create_date}
+
+"""
+from typing import Sequence, Union
+
+from alembic import op
+import sqlalchemy as sa
+${imports if imports else ""}
+
+# revision identifiers, used by Alembic.
+revision: str = ${repr(up_revision)}
+down_revision: Union[str, None] = ${repr(down_revision)}
+branch_labels: Union[str, Sequence[str], None] = ${repr(branch_labels)}
+depends_on: Union[str, Sequence[str], None] = ${repr(depends_on)}
+
+
+def upgrade() -> None:
+    """Upgrade schema."""
+    ${upgrades if upgrades else "pass"}
+
+
+def downgrade() -> None:
+    """Downgrade schema."""
+    ${downgrades if downgrades else "pass"}
 </file>
 
 <file path="app/api/router.py">
@@ -5455,528 +4695,143 @@ async def webhook_receiver(
     return result
 </file>
 
-<file path="app/core/config.py">
+<file path="app/core/events.py">
 """
-Application settings and configuration management.
+Event handlers for application lifecycle events.
 """
-from typing import List, Optional, Union
-from pydantic import AnyHttpUrl, validator, field_validator
-from pydantic_settings import BaseSettings
+import asyncio
+import logging
+from typing import Dict, List, Any
+
+from app.core.config import settings
+from app.services.event_bus.bus import get_event_bus
+from app.services.event_bus.events import EventType
+
+logger = logging.getLogger("inboxerr")
+
+# Collection of background tasks to manage
+background_tasks: List[asyncio.Task] = []
 
 
-class Settings(BaseSettings):
-    """Application settings."""
-    # Base
-    PROJECT_NAME: str = "Inboxerr Backend"
-    PROJECT_DESCRIPTION: str = "API backend for SMS management and delivery"
-    VERSION: str = "0.1.0"
-    API_PREFIX: str = "/api/v1"
-    DEBUG: bool = False
+async def startup_event_handler() -> None:
+    """
+    Handle application startup.
     
-    # CORS
-    BACKEND_CORS_ORIGINS: List[Union[str, AnyHttpUrl]] = []
+    Initialize services, database connections, and start background processes.
+    """
+    logger.info("Starting Inboxerr Backend application")
+    
+    # Initialize database (async)
+    try:
+        # We'll implement this in the database module
+        from app.db.session import initialize_database
+        await initialize_database()
+        logger.info("Database initialized successfully")
+    except Exception as e:
+        logger.error(f"Error initializing database: {e}")
+        # Don't raise error to allow startup to continue
+    
+    # Initialize event bus
+    try:
+        event_bus = get_event_bus()
+        await event_bus.initialize()
+        logger.info("Event bus initialized successfully")
+    except Exception as e:
+        logger.error(f"Error initializing event bus: {e}")
+    
+    # Start retry engine if enabled
+    if settings.RETRY_ENABLED:
+        try:
+            from app.services.sms.retry_engine import get_retry_engine
+            retry_engine = await get_retry_engine()
+            retry_task = asyncio.create_task(retry_engine.start())
+            background_tasks.append(retry_task)
+            logger.info("Retry engine started successfully")
+        except Exception as e:
+            logger.error(f"Error starting retry engine: {e}")
+    
+    # Start webhook listener if enabled
+    try:
+        from app.services.webhooks.manager import initialize_webhook_manager
+        await initialize_webhook_manager()
+        logger.info("Webhook manager initialized successfully")
+    except Exception as e:
+        logger.error(f"Error initializing webhooks: {e}")
+    
+    # Initialize metrics collector
+    try:
+        from app.services.metrics.collector import initialize_metrics
+        await initialize_metrics()
+        logger.info("Metrics collector initialized successfully")
+    except Exception as e:
+        logger.error(f"Error initializing metrics: {e}")
+    
+    # Log successful startup
+    logger.info(f"✅ {settings.PROJECT_NAME} v{settings.VERSION} startup complete")
 
-    @field_validator("BACKEND_CORS_ORIGINS", mode='before')
-    def assemble_cors_origins(cls, v: Union[str, List[str]]) -> Union[List[str], str]:
-        """Parse CORS origins from string or list."""
-        if isinstance(v, str) and not v.startswith("["):
-            return [i.strip() for i in v.split(",")]
-        elif isinstance(v, (list, str)):
-            return v
-        raise ValueError(v)
-    
-    # Authentication
-    SECRET_KEY: str = "CHANGEME_IN_PRODUCTION"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 1 day
-    API_KEY_HEADER: str = "X-API-Key"
-    
-    # Database
-    DATABASE_URL: str = "sqlite+aiosqlite:///./inboxerr.db"
-    
-    # SMS Gateway
-    SMS_GATEWAY_URL: str = "https://endpointnumber1.work.gd/api/3rdparty/v1"
-    SMS_GATEWAY_LOGIN: str = ""
-    SMS_GATEWAY_PASSWORD: str = ""
-    
-    # Webhook
-    API_BASE_URL: str = "http://localhost:8000"  # Base URL for webhooks
-    WEBHOOK_SIGNATURE_KEY: Optional[str] = None
-    WEBHOOK_TIMESTAMP_TOLERANCE: int = 300  # 5 minutes
-    
-    # SMS Processing
-    BATCH_SIZE: int = 100
-    DELAY_BETWEEN_SMS: float = 0.3  # seconds
-    RETRY_ENABLED: bool = True
-    RETRY_MAX_ATTEMPTS: int = 3
-    RETRY_INTERVAL_SECONDS: int = 60
-    
-    # Logging
-    LOG_LEVEL: str = "INFO"
-    
-    class Config:
-        """Pydantic config."""
-        case_sensitive = True
-        env_file = ".env"
 
-
-# Create singleton settings instance
-settings = Settings()
+async def shutdown_event_handler() -> None:
+    """
+    Handle application shutdown.
+    
+    Clean up resources and close connections properly.
+    """
+    logger.info("Shutting down Inboxerr Backend application")
+    
+    # Publish shutdown event
+    try:
+        event_bus = get_event_bus()
+        await event_bus.publish(EventType.SYSTEM_SHUTDOWN, {
+            "reason": "Application shutdown",
+            "graceful": True
+        })
+        logger.info("Published shutdown event")
+    except Exception as e:
+        logger.error(f"Error publishing shutdown event: {e}")
+    
+    # Cancel all background tasks
+    for task in background_tasks:
+        if not task.done():
+            task.cancel()
+            try:
+                # Wait briefly for task to cancel
+                await asyncio.wait_for(task, timeout=5.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                logger.warning(f"Task {task.get_name()} was cancelled")
+    
+    # Close database connections
+    try:
+        from app.db.session import close_database_connections
+        await close_database_connections()
+        logger.info("Database connections closed")
+    except Exception as e:
+        logger.error(f"Error closing database connections: {e}")
+    
+    # Shutdown webhook manager
+    try:
+        from app.services.webhooks.manager import shutdown_webhook_manager
+        await shutdown_webhook_manager()
+        logger.info("Webhook manager shutdown complete")
+    except Exception as e:
+        logger.error(f"Error shutting down webhook manager: {e}")
+    
+    logger.info("✅ Application shutdown complete")
 </file>
 
-<file path="app/db/repositories/messages.py">
+<file path="app/db/base.py">
 """
-Message repository for database operations related to SMS messages.
+Import all models here to ensure they are registered with SQLAlchemy.
 """
-from datetime import datetime
-from typing import List, Optional, Dict, Any, Tuple
-from uuid import uuid4
+# Import Base
+from app.models.base import Base
 
-from sqlalchemy import select, update, delete, and_, or_, desc, func
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.dialects.postgresql import JSONB
-
-from app.db.repositories.base import BaseRepository
+# Import all models
+from app.models.user import User, APIKey
+from app.models.campaign import Campaign
 from app.models.message import Message, MessageEvent, MessageBatch, MessageTemplate
-from app.schemas.message import MessageCreate, MessageStatus
+from app.models.webhook import Webhook, WebhookDelivery, WebhookEvent
 
-
-class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
-    """Message repository for database operations."""
-    
-    def __init__(self, session: AsyncSession):
-        """Initialize with session and Message model."""
-        super().__init__(session=session, model=Message)
-    
-    async def create_message(
-        self,
-        *,
-        phone_number: str,
-        message_text: str,
-        user_id: str,
-        custom_id: Optional[str] = None,
-        scheduled_at: Optional[datetime] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        batch_id: Optional[str] = None
-    ) -> Message:
-        """
-        Create a new message.
-        
-        Args:
-            phone_number: Recipient phone number
-            message_text: Message content
-            user_id: User who is sending the message
-            custom_id: Optional custom ID for tracking
-            scheduled_at: Optional scheduled time
-            metadata: Optional additional data
-            batch_id: Optional batch ID
-            
-        Returns:
-            Message: Created message
-        """
-        # Set initial status based on scheduling
-        initial_status = MessageStatus.SCHEDULED if scheduled_at else MessageStatus.PENDING
-        
-        # Calculate SMS parts (simple calculation, can be improved)
-        parts_count = (len(message_text) + 159) // 160  # 160 chars per SMS part, rounded up
-        
-        # Create message
-        message = Message(
-            id=str(uuid4()),
-            custom_id=custom_id or str(uuid4()),
-            phone_number=phone_number,
-            message=message_text,
-            status=initial_status,
-            scheduled_at=scheduled_at,
-            user_id=user_id,
-            meta_data=metadata or {},  # Use meta_data instead of metadata
-            parts_count=parts_count,
-            batch_id=batch_id
-        )
-        
-        self.session.add(message)
-        
-        # Create initial event
-        event = MessageEvent(
-            id=str(uuid4()),
-            message_id=message.id,
-            event_type="created",
-            status=initial_status,
-            data={
-                "phone_number": phone_number,
-                "scheduled_at": scheduled_at.isoformat() if scheduled_at else None
-            }
-        )
-        
-        self.session.add(event)
-        await self.session.commit()
-        await self.session.refresh(message)
-        
-        return message
-    
-    async def update_message_status(
-        self,
-        *,
-        message_id: str,
-        status: str,
-        event_type: str,
-        reason: Optional[str] = None,
-        gateway_message_id: Optional[str] = None,
-        data: Optional[Dict[str, Any]] = None
-    ) -> Optional[Message]:
-        """
-        Update message status.
-        
-        Args:
-            message_id: Message ID
-            status: New status
-            event_type: Event type triggering this update
-            reason: Optional reason for status change
-            gateway_message_id: Optional gateway message ID
-            data: Optional additional data
-            
-        Returns:
-            Message: Updated message or None
-        """
-        # Get the message
-        message = await self.get_by_id(message_id)
-        if not message:
-            return None
-        
-        # Update status-specific timestamp
-        now = datetime.utcnow()
-        update_data = {
-            "status": status,
-            "updated_at": now,
-        }
-        
-        if status == MessageStatus.SENT:
-            update_data["sent_at"] = now
-        elif status == MessageStatus.DELIVERED:
-            update_data["delivered_at"] = now
-        elif status == MessageStatus.FAILED:
-            update_data["failed_at"] = now
-            update_data["reason"] = reason
-        
-        # Set gateway message ID if provided
-        if gateway_message_id:
-            update_data["gateway_message_id"] = gateway_message_id
-        
-        # Update the message
-        await self.session.execute(
-            update(Message)
-            .where(Message.id == message_id)
-            .values(**update_data)
-        )
-        
-        # Create event for status change
-        event = MessageEvent(
-            id=str(uuid4()),
-            message_id=message_id,
-            event_type=event_type,
-            status=status,
-            data=data or {}
-        )
-        
-        self.session.add(event)
-        await self.session.commit()
-        
-        # Refresh the message
-        await self.session.refresh(message)
-        
-        return message
-
-    async def create_batch(
-        self,
-        *,
-        user_id: str,
-        name: str,
-        total: int
-    ) -> MessageBatch:
-        """
-        Create a new message batch.
-        
-        Args:
-            user_id: User ID
-            name: Batch name
-            total: Total number of messages
-            
-        Returns:
-            MessageBatch: Created batch
-        """
-        batch = MessageBatch(
-            id=str(uuid4()),
-            name=name,
-            total=total,
-            processed=0,
-            successful=0,
-            failed=0,
-            status=MessageStatus.PENDING,
-            user_id=user_id
-        )
-        
-        self.session.add(batch)
-        await self.session.commit()
-        await self.session.refresh(batch)
-        
-        return batch
-
-    async def update_batch_progress(
-        self,
-        *,
-        batch_id: str,
-        increment_processed: int = 0,
-        increment_successful: int = 0,
-        increment_failed: int = 0,
-        status: Optional[str] = None
-    ) -> Optional[MessageBatch]:
-        """
-        Update batch progress.
-        
-        Args:
-            batch_id: Batch ID
-            increment_processed: Increment processed count
-            increment_successful: Increment successful count
-            increment_failed: Increment failed count
-            status: Optional new status
-            
-        Returns:
-            MessageBatch: Updated batch or None
-        """
-        batch = await self.get_by_id(batch_id)
-        if not batch:
-            return None
-        
-        # Update counts
-        batch.processed += increment_processed
-        batch.successful += increment_successful
-        batch.failed += increment_failed
-        
-        # Update status if provided
-        if status:
-            batch.status = status
-            
-        # If all messages processed, update status and completion time
-        if batch.processed >= batch.total:
-            batch.status = MessageStatus.PROCESSED if batch.failed == 0 else "partial"
-            batch.completed_at = datetime.utcnow()
-        
-        self.session.add(batch)
-        await self.session.commit()
-        await self.session.refresh(batch)
-        
-        return batch
-
-    async def get_by_custom_id(self, custom_id: str) -> Optional[Message]:
-        """
-        Get message by custom ID.
-        
-        Args:
-            custom_id: Custom ID
-            
-        Returns:
-            Message: Found message or None
-        """
-        return await self.get_by_attribute("custom_id", custom_id)
-
-    async def get_by_gateway_id(self, gateway_id: str) -> Optional[Message]:
-        """
-        Get message by gateway ID.
-        
-        Args:
-            gateway_id: Gateway message ID
-            
-        Returns:
-            Message: Found message or None
-        """
-        return await self.get_by_attribute("gateway_message_id", gateway_id)
-
-    async def list_messages_for_user(
-        self,
-        *,
-        user_id: str,
-        status: Optional[str] = None,
-        phone_number: Optional[str] = None,
-        from_date: Optional[str] = None,
-        to_date: Optional[str] = None,
-        campaign_id: Optional[str] = None,
-        skip: int = 0,
-        limit: int = 20
-    ) -> Tuple[List[Message], int]:
-        """
-        List messages for user with filtering.
-        
-        Args:
-            user_id: User ID
-            status: Optional status filter
-            phone_number: Optional phone number filter
-            from_date: Optional from date filter
-            to_date: Optional to date filter
-            campaign_id: Optional campaign ID filter
-            skip: Number of records to skip
-            limit: Maximum number of records to return
-            
-        Returns:
-            Tuple[List[Message], int]: List of messages and total count
-        """
-        # Base query
-        query = select(Message).where(Message.user_id == user_id)
-        count_query = select(func.count()).select_from(Message).where(Message.user_id == user_id)
-        
-        # Apply filters
-        if status:
-            query = query.where(Message.status == status)
-            count_query = count_query.where(Message.status == status)
-        
-        if phone_number:
-            query = query.where(Message.phone_number == phone_number)
-            count_query = count_query.where(Message.phone_number == phone_number)
-
-        if campaign_id:
-            query = query.where(Message.campaign_id == campaign_id)
-            count_query = count_query.where(Message.campaign_id == campaign_id)
-        
-        if from_date:
-            try:
-                from_date_obj = datetime.fromisoformat(from_date.replace('Z', '+00:00'))
-                query = query.where(Message.created_at >= from_date_obj)
-                count_query = count_query.where(Message.created_at >= from_date_obj)
-            except ValueError:
-                pass
-        
-        if to_date:
-            try:
-                to_date_obj = datetime.fromisoformat(to_date.replace('Z', '+00:00'))
-                query = query.where(Message.created_at <= to_date_obj)
-                count_query = count_query.where(Message.created_at <= to_date_obj)
-            except ValueError:
-                pass
-        
-        # Order by created_at desc
-        query = query.order_by(desc(Message.created_at))
-        
-        # Pagination
-        query = query.offset(skip).limit(limit)
-        
-        # Execute queries
-        result = await self.session.execute(query)
-        count_result = await self.session.execute(count_query)
-        
-        messages = result.scalars().all()
-        total = count_result.scalar_one()
-        
-        return messages, total
-
-    async def get_messages_for_batch(
-        self,
-        *,
-        batch_id: str,
-        skip: int = 0,
-        limit: int = 20
-    ) -> Tuple[List[Message], int]:
-        """
-        Get messages for a batch.
-        
-        Args:
-            batch_id: Batch ID
-            skip: Number of records to skip
-            limit: Maximum number of records to return
-            
-        Returns:
-            Tuple[List[Message], int]: List of messages and total count
-        """
-        # Base query
-        query = select(Message).where(Message.batch_id == batch_id)
-        count_query = select(func.count()).select_from(Message).where(Message.batch_id == batch_id)
-        
-        # Order by created_at desc
-        query = query.order_by(desc(Message.created_at))
-        
-        # Pagination
-        query = query.offset(skip).limit(limit)
-        
-        # Execute queries
-        result = await self.session.execute(query)
-        count_result = await self.session.execute(count_query)
-        
-        messages = result.scalars().all()
-        total = count_result.scalar_one()
-        
-        return messages, total
-    
-    async def get_messages_for_campaign(
-        self,
-        *,
-        campaign_id: str,
-        status: Optional[str] = None,
-        skip: int = 0,
-        limit: int = 20
-    ) -> Tuple[List[Message], int]:
-        """
-        Get messages for a campaign.
-        
-        Args:
-            campaign_id: Campaign ID
-            status: Optional status filter
-            skip: Number of records to skip
-            limit: Maximum number of records to return
-            
-        Returns:
-            Tuple[List[Message], int]: List of messages and total count
-        """
-        # Base query
-        query = select(Message).where(Message.campaign_id == campaign_id)
-        count_query = select(func.count()).select_from(Message).where(Message.campaign_id == campaign_id)
-        
-        # Apply status filter
-        if status:
-            query = query.where(Message.status == status)
-            count_query = count_query.where(Message.status == status)
-        
-        # Order by created_at desc
-        query = query.order_by(desc(Message.created_at))
-        
-        # Apply pagination
-        query = query.offset(skip).limit(limit)
-        
-        # Execute queries
-        result = await self.session.execute(query)
-        count_result = await self.session.execute(count_query)
-        
-        messages = result.scalars().all()
-        total = count_result.scalar_one()
-        
-        return messages, total
-
-    async def get_retryable_messages(
-        self,
-        *,
-        max_retries: int = 3,
-        limit: int = 50
-    ) -> List[Message]:
-        """
-        Get messages that can be retried.
-        
-        Args:
-            max_retries: Maximum number of retry attempts
-            limit: Maximum number of messages to return
-            
-        Returns:
-            List[Message]: List of retryable messages
-        """
-        # Query for failed messages that can be retried
-        query = select(Message).where(
-            and_(
-                Message.status == MessageStatus.FAILED,
-                or_(
-                    Message.meta_data.is_(None),  # No metadata at all
-                    ~Message.meta_data.contains({"retry_count": 0}),  # retry_count key is absent
-                    Message.meta_data["retry_count"].as_integer() < max_retries  # retry_count too low
-                )
-            )
-        ).order_by(Message.failed_at).limit(limit)
-        
-        result = await self.session.execute(query)
-        return result.scalars().all()
+# This allows alembic to auto-discover all models when creating migrations
 </file>
 
 <file path="app/models/message.py">
@@ -6068,6 +4923,322 @@ class MessageTemplate(Base):
     
     # Relationships
     user = relationship("User")
+</file>
+
+<file path="app/schemas/campaign.py">
+# app/schemas/campaign.py
+from typing import List, Optional, Dict, Any
+from datetime import datetime
+from uuid import UUID
+
+from pydantic import BaseModel, Field, validator
+
+
+class CampaignBase(BaseModel):
+    """Base schema for campaign data."""
+    name: str = Field(..., description="Campaign name")
+    description: Optional[str] = Field(None, description="Campaign description")
+    scheduled_start_at: Optional[datetime] = Field(None, description="Scheduled start time")
+    scheduled_end_at: Optional[datetime] = Field(None, description="Scheduled end time")
+    settings: Optional[Dict[str, Any]] = Field(default={}, description="Campaign settings")
+
+
+class CampaignCreate(CampaignBase):
+    """Schema for creating a new campaign."""
+    pass
+
+
+class CampaignCreateFromCSV(BaseModel):
+    """Schema for creating a campaign from CSV file."""
+    name: str = Field(..., description="Campaign name")
+    description: Optional[str] = Field(None, description="Campaign description")
+    message_template: str = Field(..., description="Message template to send")
+    scheduled_start_at: Optional[datetime] = Field(None, description="Scheduled start time")
+    scheduled_end_at: Optional[datetime] = Field(None, description="Scheduled end time")
+    settings: Optional[Dict[str, Any]] = Field(default={}, description="Campaign settings")
+
+
+class CampaignUpdate(BaseModel):
+    """Schema for updating a campaign."""
+    name: Optional[str] = Field(None, description="Campaign name")
+    description: Optional[str] = Field(None, description="Campaign description")
+    scheduled_start_at: Optional[datetime] = Field(None, description="Scheduled start time")
+    scheduled_end_at: Optional[datetime] = Field(None, description="Scheduled end time")
+    settings: Optional[Dict[str, Any]] = Field(None, description="Campaign settings")
+
+
+class CampaignStatus(BaseModel):
+    """Schema for campaign status update."""
+    status: str = Field(..., description="Campaign status")
+    
+    @validator("status")
+    def validate_status(cls, v):
+        """Validate status value."""
+        valid_statuses = ["draft", "active", "paused", "completed", "cancelled", "failed"]
+        if v not in valid_statuses:
+            raise ValueError(f"Status must be one of: {', '.join(valid_statuses)}")
+        return v
+
+
+class CampaignResponse(CampaignBase):
+    """Schema for campaign response."""
+    id: str = Field(..., description="Campaign ID")
+    status: str = Field(..., description="Campaign status")
+    total_messages: int = Field(..., description="Total number of messages")
+    sent_count: int = Field(..., description="Number of sent messages")
+    delivered_count: int = Field(..., description="Number of delivered messages")
+    failed_count: int = Field(..., description="Number of failed messages")
+    created_at: datetime = Field(..., description="Creation timestamp")
+    updated_at: datetime = Field(..., description="Last update timestamp")
+    started_at: Optional[datetime] = Field(None, description="Start timestamp")
+    completed_at: Optional[datetime] = Field(None, description="Completion timestamp")
+    user_id: str = Field(..., description="User ID")
+    
+    # Add computed fields
+    progress_percentage: float = Field(0, description="Progress percentage")
+    delivery_success_rate: float = Field(0, description="Delivery success rate")
+    
+    class Config:
+        """Pydantic config."""
+        from_attributes = True
+
+
+class CampaignListResponse(BaseModel):
+    """Schema for campaign list response with pagination."""
+    items: List[CampaignResponse]
+    total: int
+    page: int
+    size: int
+    pages: int
+</file>
+
+<file path="app/schemas/message.py">
+"""
+Pydantic schemas for message-related API operations.
+"""
+from typing import List, Optional, Dict, Any
+from datetime import datetime
+from enum import Enum
+from pydantic import BaseModel, Field, validator
+
+
+class MessageStatus(str, Enum):
+    """Possible message statuses."""
+    PENDING = "pending"
+    PROCESSED = "processed"
+    SENT = "sent"
+    DELIVERED = "delivered"
+    FAILED = "failed"
+    SCHEDULED = "scheduled"
+    CANCELLED = "cancelled"
+
+
+class MessageCreate(BaseModel):
+    """Schema for creating a new message."""
+    phone_number: str = Field(..., description="Recipient phone number in E.164 format")
+    message: str = Field(..., description="Message content")
+    scheduled_at: Optional[datetime] = Field(None, description="Schedule message for future delivery")
+    custom_id: Optional[str] = Field(None, description="Custom ID for tracking")
+    
+    @validator("phone_number")
+    def validate_phone_number(cls, v):
+        """Validate phone number format."""
+        # Basic validation - will be handled more thoroughly in the service
+        if not v or not (v.startswith("+") and len(v) >= 8):
+            raise ValueError("Phone number must be in E.164 format (e.g. +1234567890)")
+        return v
+    
+    @validator("message")
+    def validate_message(cls, v):
+        """Validate message content."""
+        if not v or len(v.strip()) == 0:
+            raise ValueError("Message cannot be empty")
+        if len(v) > 1600:  # Allow for multi-part SMS
+            raise ValueError("Message exceeds maximum length of 1600 characters")
+        return v
+
+
+class MessageResponse(BaseModel):
+    """Schema for message response."""
+    id: str = Field(..., description="Message ID")
+    custom_id: Optional[str] = Field(None, description="Custom ID if provided")
+    phone_number: str = Field(..., description="Recipient phone number")
+    message: str = Field(..., description="Message content")
+    status: MessageStatus = Field(..., description="Current message status")
+    created_at: datetime = Field(..., description="Creation timestamp")
+    updated_at: datetime = Field(..., description="Last update timestamp")
+    scheduled_at: Optional[datetime] = Field(None, description="Scheduled delivery time")
+    sent_at: Optional[datetime] = Field(None, description="Time when message was sent")
+    delivered_at: Optional[datetime] = Field(None, description="Time when message was delivered")
+    failed_at: Optional[datetime] = Field(None, description="Time when message failed")
+    reason: Optional[str] = Field(None, description="Failure reason if applicable")
+    gateway_message_id: Optional[str] = Field(None, description="ID from SMS gateway")
+    user_id: str = Field(..., description="User who sent the message")
+    metadata: Optional[Dict[str, Any]] = Field(default={}, description="Additional metadata")
+    
+    class Config:
+        """Pydantic config."""
+        from_attributes = True
+
+
+class MessageStatusUpdate(BaseModel):
+    """Schema for updating message status."""
+    status: MessageStatus = Field(..., description="New message status")
+    reason: Optional[str] = Field(None, description="Reason for status change (required for FAILED)")
+    
+    @validator("reason")
+    def validate_reason(cls, v, values):
+        """Validate reason field."""
+        if values.get("status") == MessageStatus.FAILED and not v:
+            raise ValueError("Reason is required when status is FAILED")
+        return v
+
+
+class BatchOptions(BaseModel):
+    """Options for batch processing."""
+    delay_between_messages: Optional[float] = Field(0.3, description="Delay between messages in seconds")
+    fail_on_first_error: Optional[bool] = Field(False, description="Stop processing on first error")
+    retry_failed: Optional[bool] = Field(True, description="Automatically retry failed messages")
+
+
+class BatchMessageRequest(BaseModel):
+    """Schema for batch message request."""
+    messages: List[MessageCreate] = Field(..., description="List of messages to send")
+    options: Optional[BatchOptions] = Field(default=None, description="Batch processing options")
+    
+    @validator("messages")
+    def validate_messages(cls, v):
+        """Validate message list."""
+        if not v:
+            raise ValueError("Message list cannot be empty")
+        if len(v) > 1000:
+            raise ValueError("Maximum batch size is 1000 messages")
+        return v
+
+
+class BatchMessageResponse(BaseModel):
+    """Schema for batch message response."""
+    batch_id: str = Field(..., description="Batch ID for tracking")
+    total: int = Field(..., description="Total number of messages in batch")
+    processed: int = Field(..., description="Number of messages processed")
+    successful: int = Field(..., description="Number of successful messages")
+    failed: int = Field(..., description="Number of failed messages")
+    status: str = Field(..., description="Overall batch status")
+    created_at: datetime = Field(..., description="Batch creation timestamp")
+    messages: Optional[List[MessageResponse]] = Field(None, description="List of message responses")
+</file>
+
+<file path="app/schemas/user.py">
+"""
+Pydantic schemas for user-related API operations.
+"""
+from typing import List, Optional
+from datetime import datetime
+from enum import Enum
+from pydantic import BaseModel, Field, EmailStr, validator
+
+
+class UserRole(str, Enum):
+    """User role enum."""
+    ADMIN = "admin"
+    USER = "user"
+    API = "api"
+
+
+class UserBase(BaseModel):
+    """Base user schema."""
+    email: Optional[EmailStr] = Field(None, description="User email address")
+    full_name: Optional[str] = Field(None, description="User's full name")
+    is_active: Optional[bool] = Field(True, description="Whether the user is active")
+    role: Optional[UserRole] = Field(UserRole.USER, description="User role")
+
+
+class UserCreate(UserBase):
+    """Schema for creating a new user."""
+    email: EmailStr = Field(..., description="User email address")
+    password: str = Field(..., description="User password")
+    
+    @validator("password")
+    def validate_password(cls, v):
+        """Validate password strength."""
+        if len(v) < 8:
+            raise ValueError("Password must be at least 8 characters long")
+        if not any(char.isdigit() for char in v):
+            raise ValueError("Password must contain at least one digit")
+        if not any(char.isupper() for char in v):
+            raise ValueError("Password must contain at least one uppercase letter")
+        return v
+
+
+class UserUpdate(UserBase):
+    """Schema for updating a user."""
+    password: Optional[str] = Field(None, description="User password")
+    
+    @validator("password")
+    def validate_password(cls, v):
+        """Validate password if provided."""
+        if v is not None:
+            if len(v) < 8:
+                raise ValueError("Password must be at least 8 characters long")
+            if not any(char.isdigit() for char in v):
+                raise ValueError("Password must contain at least one digit")
+            if not any(char.isupper() for char in v):
+                raise ValueError("Password must contain at least one uppercase letter")
+        return v
+
+
+class User(UserBase):
+    """Schema for user response."""
+    id: str = Field(..., description="User ID")
+    created_at: datetime = Field(..., description="Creation timestamp")
+    updated_at: datetime = Field(..., description="Last update timestamp")
+    
+    class Config:
+        """Pydantic config."""
+        from_attributes = True
+
+
+class UserInDB(User):
+    """Schema for user in database (with hashed password)."""
+    hashed_password: str = Field(..., description="Hashed password")
+
+
+class Token(BaseModel):
+    """Schema for authentication token."""
+    access_token: str
+    token_type: str = "bearer"
+    expires_at: datetime
+
+
+class TokenData(BaseModel):
+    """Schema for token payload."""
+    sub: str  # User ID
+    exp: Optional[datetime] = None
+    role: Optional[str] = None
+
+
+class APIKey(BaseModel):
+    """Schema for API key."""
+    id: str = Field(..., description="API key ID")
+    key: str = Field(..., description="API key")
+    name: str = Field(..., description="API key name")
+    user_id: str = Field(..., description="User who owns the API key")
+    created_at: datetime = Field(..., description="Creation timestamp")
+    expires_at: Optional[datetime] = Field(None, description="Expiration timestamp")
+    is_active: bool = Field(True, description="Whether the API key is active")
+    last_used_at: Optional[datetime] = Field(None, description="Last usage timestamp")
+    permissions: List[str] = Field(default=[], description="List of permissions")
+    
+    class Config:
+        """Pydantic config."""
+        from_attributes = True
+
+
+class APIKeyCreate(BaseModel):
+    """Schema for creating a new API key."""
+    name: str = Field(..., description="API key name")
+    expires_at: Optional[datetime] = Field(None, description="Expiration timestamp")
+    permissions: Optional[List[str]] = Field(default=[], description="List of permissions")
 </file>
 
 <file path="app/services/event_bus/events.py">
@@ -6363,6 +5534,286 @@ async def _handle_message_delivered(data: Dict[str, Any]) -> None:
 async def _handle_message_failed(data: Dict[str, Any]) -> None:
     """Handle message failed event."""
     _metrics["messages"]["failed"] += 1
+</file>
+
+<file path="app/services/sms/retry_engine.py">
+# app/services/sms/retry_engine.py
+import asyncio
+import logging
+import uuid
+from datetime import datetime, timedelta
+from typing import List, Dict, Any, Optional
+
+from app.core.config import settings
+from app.db.repositories.messages import MessageRepository
+from app.schemas.message import MessageStatus
+from app.services.event_bus.events import EventType
+from app.services.event_bus.bus import get_event_bus
+from app.core.exceptions import SMSGatewayError, RetryableError
+
+logger = logging.getLogger("inboxerr.retry")
+
+class RetryEngine:
+    """
+    Service for retrying failed messages.
+    
+    Periodically checks for failed messages and attempts to resend them.
+    """
+    
+    def __init__(self, message_repository: MessageRepository, event_bus: Any, sms_sender: Any):
+        """
+        Initialize retry engine with required dependencies.
+        
+        Args:
+            message_repository: Repository for message access
+            event_bus: Event bus for publishing events
+            sms_sender: SMS sender service for resending messages
+        """
+        self.message_repository = message_repository
+        self.event_bus = event_bus
+        self.sms_sender = sms_sender
+        self._running = False
+        self._semaphore = asyncio.Semaphore(5)  # Limit concurrent retries
+        
+    async def start(self) -> None:
+        """Start the retry engine."""
+        if self._running:
+            return
+            
+        self._running = True
+        logger.info("Starting retry engine")
+        
+        while self._running:
+            try:
+                await self._process_retries()
+            except Exception as e:
+                logger.error(f"Error in retry engine: {e}", exc_info=True)
+                
+            # Wait before next cycle
+            await asyncio.sleep(settings.RETRY_INTERVAL_SECONDS)
+            
+    async def stop(self) -> None:
+        """Stop the retry engine."""
+        self._running = False
+        logger.info("Retry engine stopped")
+    
+    async def _process_retries(self) -> None:
+        """Process messages pending retry."""
+        # Get messages that need retry
+        retry_candidates = await self._get_retry_candidates()
+        
+        if not retry_candidates:
+            logger.debug("No messages to retry")
+            return
+            
+        logger.info(f"Found {len(retry_candidates)} messages to retry")
+        
+        # Process retries with concurrency limit
+        tasks = []
+        for message in retry_candidates:
+            tasks.append(self._retry_message(message))
+            
+        if tasks:
+            # Process retries concurrently but with limit
+            for i in range(0, len(tasks), 5):  # Process in chunks of 5
+                chunk = tasks[i:i+5]
+                await asyncio.gather(*chunk)
+                await asyncio.sleep(1)  # Short delay between chunks
+    
+    async def _get_retry_candidates(self) -> List[Dict[str, Any]]:
+        """
+        Get messages that are candidates for retry.
+        
+        Returns:
+            List[Dict]: List of messages that should be retried
+        """
+        # Parameters for retry candidate selection
+        now = datetime.utcnow()
+        max_retries = settings.RETRY_MAX_ATTEMPTS
+        
+        try:
+            # Query for messages that:
+            # 1. Are in a failed state
+            # 2. Have not exceeded max retry attempts
+            # 3. Have a retryable error or no error specified
+            # 4. Last retry attempt was long enough ago (based on exponential backoff)
+            
+            # This is a simplified implementation - in production you might want
+            # more sophisticated filtering and prioritization
+            failed_messages = await self.message_repository.get_retryable_messages(
+                max_retries=max_retries,
+                limit=50  # Limit number of messages to process in one cycle
+            )
+            
+            # Filter messages based on retry delay (exponential backoff)
+            retry_candidates = []
+            
+            for message in failed_messages:
+                # Get retry attempt count (from message metadata or events)
+                retry_count = self._get_retry_count(message)
+                
+                # Calculate backoff delay - 30s, 2m, 8m, 30m, 2h, etc.
+                backoff_seconds = 30 * (2 ** retry_count)
+                
+                # Get timestamp of last attempt
+                last_attempt = message.failed_at or message.updated_at
+                
+                # Check if enough time has passed for retry
+                if now - last_attempt > timedelta(seconds=backoff_seconds):
+                    retry_candidates.append(message)
+            
+            return retry_candidates
+        
+        except Exception as e:
+            logger.error(f"Error getting retry candidates: {e}", exc_info=True)
+            # Return empty list on error to prevent crashing the retry engine
+            return []
+    
+    
+    def _get_retry_count(self, message: Any) -> int:
+        """
+        Get the retry count for a message.
+        
+        Args:
+            message: Message object
+            
+        Returns:
+            int: Number of retry attempts
+        """
+        # Check if retry count is in metadata
+        meta_data = getattr(message, 'meta_data', {}) or {}
+        if isinstance(meta_data, dict) and 'retry_count' in meta_data:
+            return meta_data.get('retry_count', 0)
+            
+        # Fallback - count events of type "retry"
+        retry_events = [e for e in getattr(message, 'events', []) 
+                       if getattr(e, 'event_type', '') == 'retry']
+        return len(retry_events)
+    
+    async def _retry_message(self, message: Any) -> None:
+        """
+        Retry sending a message.
+        
+        Args:
+            message: Message to retry
+        """
+        message_id = message.id
+        phone_number = message.phone_number
+        message_text = message.message
+        custom_id = message.custom_id
+        
+        # Get current retry count
+        retry_count = self._get_retry_count(message)
+        
+        try:
+            logger.info(f"Retrying message {message_id} (attempt {retry_count + 1})")
+            
+            # Use semaphore to limit concurrent retries
+            async with self._semaphore:
+                # Reset status to pending for retry
+                await self.message_repository.update_message_status(
+                    message_id=message_id,
+                    status=MessageStatus.PENDING,
+                    event_type="retry",
+                    data={
+                        "retry_count": retry_count + 1,
+                        "previous_error": message.reason
+                    }
+                )
+                
+                # Update metadata to track retry count
+                meta_data = getattr(message, 'meta_data', {}) or {}
+                if isinstance(meta_data, dict):
+                    meta_data['retry_count'] = retry_count + 1
+                    await self.message_repository.update(
+                        id=message_id,
+                        obj_in={"meta_data": meta_data}
+                    )
+                
+                # Attempt to send again
+                result = await self.sms_sender._send_to_gateway(
+                    phone_number=phone_number,
+                    message_text=message_text,
+                    custom_id=custom_id or str(uuid.uuid4())
+                )
+                
+                # Update message status
+                await self.message_repository.update_message_status(
+                    message_id=message_id,
+                    status=result.get("status", MessageStatus.PENDING),
+                    event_type="retry_success",
+                    gateway_message_id=result.get("gateway_message_id"),
+                    data=result
+                )
+                
+                # Publish event
+                await self.event_bus.publish(
+                    EventType.MESSAGE_RETRIED,
+                    {
+                        "message_id": message_id,
+                        "phone_number": phone_number,
+                        "retry_count": retry_count + 1,
+                        "status": result.get("status", MessageStatus.PENDING)
+                    }
+                )
+                
+                logger.info(f"Successfully retried message {message_id}")
+                
+        except Exception as e:
+            logger.error(f"Error retrying message {message_id}: {e}")
+            
+            # Update status to failed with incremented retry count
+            error_message = str(e)
+            is_retryable = isinstance(e, RetryableError)
+            
+            await self.message_repository.update_message_status(
+                message_id=message_id,
+                status=MessageStatus.FAILED,
+                event_type="retry_failed",
+                reason=error_message,
+                data={
+                    "retry_count": retry_count + 1,
+                    "retryable": is_retryable
+                }
+            )
+            
+            # Publish event
+            await self.event_bus.publish(
+                EventType.MESSAGE_RETRY_FAILED,
+                {
+                    "message_id": message_id,
+                    "phone_number": phone_number,
+                    "retry_count": retry_count + 1,
+                    "error": error_message,
+                    "retryable": is_retryable
+                }
+            )
+
+
+# Singleton instance
+_retry_engine = None
+
+async def get_retry_engine():
+    """Get the singleton retry engine instance."""
+    global _retry_engine
+    
+    if _retry_engine is None:
+        from app.db.session import get_repository
+        from app.db.repositories.messages import MessageRepository
+        from app.services.event_bus.bus import get_event_bus
+        from app.services.sms.sender import get_sms_sender
+        
+        message_repository = await get_repository(MessageRepository)
+        event_bus = get_event_bus()
+        sms_sender = await get_sms_sender()
+        
+        _retry_engine = RetryEngine(
+            message_repository=message_repository,
+            event_bus=event_bus,
+            sms_sender=sms_sender
+        )
+        
+    return _retry_engine
 </file>
 
 <file path="app/services/sms/sender.py">
@@ -7765,6 +7216,117 @@ async def process_system_ping(base_payload: WebhookPayload, payload: SystemPingP
     }
 </file>
 
+<file path="docker-compose.yml">
+version: '3.8'
+
+services:
+  # API service
+  api:
+    build: .
+    container_name: inboxerr-api
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - .:/app
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/inboxerr
+      - SMS_GATEWAY_URL=${SMS_GATEWAY_URL:-https://endpointnumber1.work.gd/api/3rdparty/v1}
+      - SMS_GATEWAY_LOGIN=${SMS_GATEWAY_LOGIN:-}
+      - SMS_GATEWAY_PASSWORD=${SMS_GATEWAY_PASSWORD:-}
+      - SECRET_KEY=${SECRET_KEY:-CHANGEME_IN_PRODUCTION}
+      - WEBHOOK_HOST=0.0.0.0
+      - WEBHOOK_PORT=5000
+      - LOG_LEVEL=DEBUG
+    depends_on:
+      db:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+    networks:
+      - inboxerr-network
+    restart: unless-stopped
+
+  # Database service
+  db:
+    image: postgres:14-alpine
+    container_name: inboxerr-db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data/
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=inboxerr
+    ports:
+      - "5432:5432"
+    networks:
+      - inboxerr-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Database initialization service
+  db-init:
+    build: .
+    container_name: inboxerr-db-init
+    command: >
+      sh -c "
+        echo 'Waiting for database to be ready...' &&
+        sleep 5 &&
+        echo 'Running database migrations...' &&
+        alembic upgrade head &&
+        echo 'Creating admin user...' &&
+        python app/scripts/create_admin.py &&
+        echo 'Database initialization completed.'
+      "
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/inboxerr
+      - SECRET_KEY=${SECRET_KEY:-CHANGEME_IN_PRODUCTION}
+    volumes:
+      - .:/app
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - inboxerr-network
+    restart: "no"  # Run once and exit
+
+  # Optional: Redis for caching and task queue
+  redis:
+    image: redis:alpine
+    container_name: inboxerr-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - inboxerr-network
+    restart: unless-stopped
+
+  # Optional: PgAdmin for database management
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: inboxerr-pgadmin
+    environment:
+      - PGADMIN_DEFAULT_EMAIL=admin@inboxerr.com
+      - PGADMIN_DEFAULT_PASSWORD=admin
+    ports:
+      - "5050:80"
+    depends_on:
+      - db
+    networks:
+      - inboxerr-network
+    restart: unless-stopped
+
+networks:
+  inboxerr-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+</file>
+
 <file path="project_structure.md">
 # Inboxerr Backend Project Structure
 
@@ -8210,6 +7772,565 @@ httpx>=0.25.0
 # Utilities
 python-dateutil>=2.8.2
 pytz>=2023.3
+</file>
+
+<file path="scripts/seed_db.py">
+"""
+Placeholder script for seeding the database in development.
+Currently not in use — extend as needed.
+Seed the database with essential data (e.g., admin user).
+Currently skips message seeding — placeholder for future use.
+
+"""
+
+import subprocess
+import os
+import sys
+
+def run_admin_script():
+    """Ensure an admin user exists by running create_admin.py."""
+    try:
+        subprocess.run(
+            [sys.executable, "app/scripts/create_admin.py"],
+            check=True,
+            cwd=os.getcwd(),  # Ensures correct working directory
+            env={**os.environ, "PYTHONPATH": os.getcwd()}
+        )
+        print("👮 Admin user created.")
+    except subprocess.CalledProcessError:
+        print("⚠️ Failed to create admin user. Check create_admin.py.")
+
+
+def seed():
+    print("🌱 [SKIPPED] No seed data logic implemented yet.")
+
+if __name__ == "__main__":
+    seed()
+    run_admin_script()
+</file>
+
+<file path="app/core/config.py">
+"""
+Application settings and configuration management.
+"""
+from typing import List, Optional, Union
+from pydantic import AnyHttpUrl, validator, field_validator
+from pydantic_settings import BaseSettings
+
+
+class Settings(BaseSettings):
+    """Application settings."""
+    # Base
+    PROJECT_NAME: str = "Inboxerr Backend"
+    PROJECT_DESCRIPTION: str = "API backend for SMS management and delivery"
+    VERSION: str = "0.1.0"
+    API_PREFIX: str = "/api/v1"
+    DEBUG: bool = False
+    
+    # CORS
+    BACKEND_CORS_ORIGINS: List[Union[str, AnyHttpUrl]] = []
+
+    @field_validator("BACKEND_CORS_ORIGINS", mode='before')
+    def assemble_cors_origins(cls, v: Union[str, List[str]]) -> Union[List[str], str]:
+        """Parse CORS origins from string or list."""
+        if isinstance(v, str) and not v.startswith("["):
+            return [i.strip() for i in v.split(",")]
+        elif isinstance(v, (list, str)):
+            return v
+        raise ValueError(v)
+    
+    # Authentication
+    SECRET_KEY: str = "CHANGEME_IN_PRODUCTION"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 1 day
+    API_KEY_HEADER: str = "X-API-Key"
+
+    # Database
+    DATABASE_URL: str = "postgresql+asyncpg://postgres:admin@localhost:5432/inboxerr"
+    
+    # SMS Gateway
+    SMS_GATEWAY_URL: str = "https://endpointnumber1.work.gd/api/3rdparty/v1"
+    SMS_GATEWAY_LOGIN: str = ""
+    SMS_GATEWAY_PASSWORD: str = ""
+    
+    # Webhook
+    API_BASE_URL: str = "http://localhost:8000"  # Base URL for webhooks
+    WEBHOOK_SIGNATURE_KEY: Optional[str] = None
+    WEBHOOK_TIMESTAMP_TOLERANCE: int = 300  # 5 minutes
+    
+    # SMS Processing
+    BATCH_SIZE: int = 100
+    DELAY_BETWEEN_SMS: float = 0.3  # seconds
+    RETRY_ENABLED: bool = False
+    RETRY_MAX_ATTEMPTS: int = 3
+    RETRY_INTERVAL_SECONDS: int = 60
+    
+    # Logging
+    LOG_LEVEL: str = "INFO"
+    
+    class Config:
+        """Pydantic config."""
+        case_sensitive = True
+        env_file = ".env"
+
+
+# Create singleton settings instance
+settings = Settings()
+</file>
+
+<file path="app/db/repositories/messages.py">
+"""
+Message repository for database operations related to SMS messages.
+"""
+from datetime import datetime
+from typing import List, Optional, Dict, Any, Tuple
+from uuid import uuid4
+
+from sqlalchemy import select, update, delete, and_, or_, desc, func
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.dialects.postgresql import JSONB
+
+from app.db.repositories.base import BaseRepository
+from app.models.message import Message, MessageEvent, MessageBatch, MessageTemplate
+from app.schemas.message import MessageCreate, MessageStatus
+
+
+class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
+    """Message repository for database operations."""
+    
+    def __init__(self, session: AsyncSession):
+        """Initialize with session and Message model."""
+        super().__init__(session=session, model=Message)
+    
+    async def create_message(
+        self,
+        *,
+        phone_number: str,
+        message_text: str,
+        user_id: str,
+        custom_id: Optional[str] = None,
+        scheduled_at: Optional[datetime] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        batch_id: Optional[str] = None
+    ) -> Message:
+        """
+        Create a new message.
+        
+        Args:
+            phone_number: Recipient phone number
+            message_text: Message content
+            user_id: User who is sending the message
+            custom_id: Optional custom ID for tracking
+            scheduled_at: Optional scheduled time
+            metadata: Optional additional data
+            batch_id: Optional batch ID
+            
+        Returns:
+            Message: Created message
+        """
+        # Set initial status based on scheduling
+        initial_status = MessageStatus.SCHEDULED if scheduled_at else MessageStatus.PENDING
+        
+        # Calculate SMS parts (simple calculation, can be improved)
+        parts_count = (len(message_text) + 159) // 160  # 160 chars per SMS part, rounded up
+        
+        # Create message
+        message = Message(
+            id=str(uuid4()),
+            custom_id=custom_id or str(uuid4()),
+            phone_number=phone_number,
+            message=message_text,
+            status=initial_status,
+            scheduled_at=scheduled_at,
+            user_id=user_id,
+            meta_data=metadata or {},  # Use meta_data instead of metadata
+            parts_count=parts_count,
+            batch_id=batch_id
+        )
+        
+        self.session.add(message)
+        
+        # Create initial event
+        event = MessageEvent(
+            id=str(uuid4()),
+            message_id=message.id,
+            event_type="created",
+            status=initial_status,
+            data={
+                "phone_number": phone_number,
+                "scheduled_at": scheduled_at.isoformat() if scheduled_at else None
+            }
+        )
+        
+        self.session.add(event)
+        await self.session.commit()
+        await self.session.refresh(message)
+        
+        return message
+    
+    async def update_message_status(
+        self,
+        *,
+        message_id: str,
+        status: str,
+        event_type: str,
+        reason: Optional[str] = None,
+        gateway_message_id: Optional[str] = None,
+        data: Optional[Dict[str, Any]] = None
+    ) -> Optional[Message]:
+        """
+        Update message status.
+        
+        Args:
+            message_id: Message ID
+            status: New status
+            event_type: Event type triggering this update
+            reason: Optional reason for status change
+            gateway_message_id: Optional gateway message ID
+            data: Optional additional data
+            
+        Returns:
+            Message: Updated message or None
+        """
+        # Get the message
+        message = await self.get_by_id(message_id)
+        if not message:
+            return None
+        
+        # Update status-specific timestamp
+        now = datetime.utcnow()
+        update_data = {
+            "status": status,
+            "updated_at": now,
+        }
+        
+        if status == MessageStatus.SENT:
+            update_data["sent_at"] = now
+        elif status == MessageStatus.DELIVERED:
+            update_data["delivered_at"] = now
+        elif status == MessageStatus.FAILED:
+            update_data["failed_at"] = now
+            update_data["reason"] = reason
+        
+        # Set gateway message ID if provided
+        if gateway_message_id:
+            update_data["gateway_message_id"] = gateway_message_id
+        
+        # Update the message
+        await self.session.execute(
+            update(Message)
+            .where(Message.id == message_id)
+            .values(**update_data)
+        )
+        
+        # Create event for status change
+        event = MessageEvent(
+            id=str(uuid4()),
+            message_id=message_id,
+            event_type=event_type,
+            status=status,
+            data=data or {}
+        )
+        
+        self.session.add(event)
+        await self.session.commit()
+        
+        # Refresh the message
+        await self.session.refresh(message)
+        
+        return message
+
+    async def create_batch(
+        self,
+        *,
+        user_id: str,
+        name: str,
+        total: int
+    ) -> MessageBatch:
+        """
+        Create a new message batch.
+        
+        Args:
+            user_id: User ID
+            name: Batch name
+            total: Total number of messages
+            
+        Returns:
+            MessageBatch: Created batch
+        """
+        batch = MessageBatch(
+            id=str(uuid4()),
+            name=name,
+            total=total,
+            processed=0,
+            successful=0,
+            failed=0,
+            status=MessageStatus.PENDING,
+            user_id=user_id
+        )
+        
+        self.session.add(batch)
+        await self.session.commit()
+        await self.session.refresh(batch)
+        
+        return batch
+
+    async def update_batch_progress(
+        self,
+        *,
+        batch_id: str,
+        increment_processed: int = 0,
+        increment_successful: int = 0,
+        increment_failed: int = 0,
+        status: Optional[str] = None
+    ) -> Optional[MessageBatch]:
+        """
+        Update batch progress.
+        
+        Args:
+            batch_id: Batch ID
+            increment_processed: Increment processed count
+            increment_successful: Increment successful count
+            increment_failed: Increment failed count
+            status: Optional new status
+            
+        Returns:
+            MessageBatch: Updated batch or None
+        """
+        batch = await self.get_by_id(batch_id)
+        if not batch:
+            return None
+        
+        # Update counts
+        batch.processed += increment_processed
+        batch.successful += increment_successful
+        batch.failed += increment_failed
+        
+        # Update status if provided
+        if status:
+            batch.status = status
+            
+        # If all messages processed, update status and completion time
+        if batch.processed >= batch.total:
+            batch.status = MessageStatus.PROCESSED if batch.failed == 0 else "partial"
+            batch.completed_at = datetime.utcnow()
+        
+        self.session.add(batch)
+        await self.session.commit()
+        await self.session.refresh(batch)
+        
+        return batch
+
+    async def get_by_custom_id(self, custom_id: str) -> Optional[Message]:
+        """
+        Get message by custom ID.
+        
+        Args:
+            custom_id: Custom ID
+            
+        Returns:
+            Message: Found message or None
+        """
+        return await self.get_by_attribute("custom_id", custom_id)
+
+    async def get_by_gateway_id(self, gateway_id: str) -> Optional[Message]:
+        """
+        Get message by gateway ID.
+        
+        Args:
+            gateway_id: Gateway message ID
+            
+        Returns:
+            Message: Found message or None
+        """
+        return await self.get_by_attribute("gateway_message_id", gateway_id)
+
+    async def list_messages_for_user(
+        self,
+        *,
+        user_id: str,
+        status: Optional[str] = None,
+        phone_number: Optional[str] = None,
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+        campaign_id: Optional[str] = None,
+        skip: int = 0,
+        limit: int = 20
+    ) -> Tuple[List[Message], int]:
+        """
+        List messages for user with filtering.
+        
+        Args:
+            user_id: User ID
+            status: Optional status filter
+            phone_number: Optional phone number filter
+            from_date: Optional from date filter
+            to_date: Optional to date filter
+            campaign_id: Optional campaign ID filter
+            skip: Number of records to skip
+            limit: Maximum number of records to return
+            
+        Returns:
+            Tuple[List[Message], int]: List of messages and total count
+        """
+        # Base query
+        query = select(Message).where(Message.user_id == user_id)
+        count_query = select(func.count()).select_from(Message).where(Message.user_id == user_id)
+        
+        # Apply filters
+        if status:
+            query = query.where(Message.status == status)
+            count_query = count_query.where(Message.status == status)
+        
+        if phone_number:
+            query = query.where(Message.phone_number == phone_number)
+            count_query = count_query.where(Message.phone_number == phone_number)
+
+        if campaign_id:
+            query = query.where(Message.campaign_id == campaign_id)
+            count_query = count_query.where(Message.campaign_id == campaign_id)
+        
+        if from_date:
+            try:
+                from_date_obj = datetime.fromisoformat(from_date.replace('Z', '+00:00'))
+                query = query.where(Message.created_at >= from_date_obj)
+                count_query = count_query.where(Message.created_at >= from_date_obj)
+            except ValueError:
+                pass
+        
+        if to_date:
+            try:
+                to_date_obj = datetime.fromisoformat(to_date.replace('Z', '+00:00'))
+                query = query.where(Message.created_at <= to_date_obj)
+                count_query = count_query.where(Message.created_at <= to_date_obj)
+            except ValueError:
+                pass
+        
+        # Order by created_at desc
+        query = query.order_by(desc(Message.created_at))
+        
+        # Pagination
+        query = query.offset(skip).limit(limit)
+        
+        # Execute queries
+        result = await self.session.execute(query)
+        count_result = await self.session.execute(count_query)
+        
+        messages = result.scalars().all()
+        total = count_result.scalar_one()
+        
+        return messages, total
+
+    async def get_messages_for_batch(
+        self,
+        *,
+        batch_id: str,
+        skip: int = 0,
+        limit: int = 20
+    ) -> Tuple[List[Message], int]:
+        """
+        Get messages for a batch.
+        
+        Args:
+            batch_id: Batch ID
+            skip: Number of records to skip
+            limit: Maximum number of records to return
+            
+        Returns:
+            Tuple[List[Message], int]: List of messages and total count
+        """
+        # Base query
+        query = select(Message).where(Message.batch_id == batch_id)
+        count_query = select(func.count()).select_from(Message).where(Message.batch_id == batch_id)
+        
+        # Order by created_at desc
+        query = query.order_by(desc(Message.created_at))
+        
+        # Pagination
+        query = query.offset(skip).limit(limit)
+        
+        # Execute queries
+        result = await self.session.execute(query)
+        count_result = await self.session.execute(count_query)
+        
+        messages = result.scalars().all()
+        total = count_result.scalar_one()
+        
+        return messages, total
+    
+    async def get_messages_for_campaign(
+        self,
+        *,
+        campaign_id: str,
+        status: Optional[str] = None,
+        skip: int = 0,
+        limit: int = 20
+    ) -> Tuple[List[Message], int]:
+        """
+        Get messages for a campaign.
+        
+        Args:
+            campaign_id: Campaign ID
+            status: Optional status filter
+            skip: Number of records to skip
+            limit: Maximum number of records to return
+            
+        Returns:
+            Tuple[List[Message], int]: List of messages and total count
+        """
+        # Base query
+        query = select(Message).where(Message.campaign_id == campaign_id)
+        count_query = select(func.count()).select_from(Message).where(Message.campaign_id == campaign_id)
+        
+        # Apply status filter
+        if status:
+            query = query.where(Message.status == status)
+            count_query = count_query.where(Message.status == status)
+        
+        # Order by created_at desc
+        query = query.order_by(desc(Message.created_at))
+        
+        # Apply pagination
+        query = query.offset(skip).limit(limit)
+        
+        # Execute queries
+        result = await self.session.execute(query)
+        count_result = await self.session.execute(count_query)
+        
+        messages = result.scalars().all()
+        total = count_result.scalar_one()
+        
+        return messages, total
+
+    async def get_retryable_messages(
+        self,
+        *,
+        max_retries: int = 3,
+        limit: int = 50
+    ) -> List[Message]:
+        """
+        Get messages that can be retried.
+        
+        Args:
+            max_retries: Maximum number of retry attempts
+            limit: Maximum number of messages to return
+            
+        Returns:
+            List[Message]: List of retryable messages
+        """
+        # Query for failed messages that can be retried
+        query = select(Message).where(
+            and_(
+                Message.status == MessageStatus.FAILED,
+                or_(
+                    Message.meta_data.is_(None),  # No metadata at all
+                    ~Message.meta_data.contains({"retry_count": 0}),  # retry_count key is absent
+                    Message.meta_data["retry_count"].as_integer() < max_retries  # retry_count too low
+                )
+            )
+        ).order_by(Message.failed_at).limit(limit)
+        
+        result = await self.session.execute(query)
+        return result.scalars().all()
 </file>
 
 </files>
