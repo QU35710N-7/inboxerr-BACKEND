@@ -7,9 +7,11 @@ import json
 from typing import Dict, Any, Optional, List, Tuple
 import httpx
 from fastapi.encoders import jsonable_encoder
+from datetime import datetime, timezone 
 
 from app.core.config import settings
 from app.db.repositories.messages import MessageRepository
+from app.db.repositories.webhooks import WebhookRepository
 from app.schemas.message import MessageStatus
 from app.services.event_bus.bus import get_event_bus
 from app.services.event_bus.events import EventType
@@ -139,7 +141,7 @@ async def unregister_webhook_from_gateway(webhook_id: str) -> bool:
 
 async def process_gateway_webhook(raw_body: bytes, headers: Dict[str, str]) -> Tuple[bool, Dict[str, Any]]:
     """
-    Process a webhook received from the SMS Gateway.
+    Process a webhook received from the SMS Gateway with enhanced error handling.
     
     Args:
         raw_body: Raw request body
@@ -149,59 +151,163 @@ async def process_gateway_webhook(raw_body: bytes, headers: Dict[str, str]) -> T
         Tuple[bool, Dict]: (success, processed_data)
     """
     # Decode raw body for payload processing
-    payload_str = raw_body.decode('utf-8')
+    try:
+        payload_str = raw_body.decode('utf-8')
+    except UnicodeDecodeError:
+        logger.error("Failed to decode webhook payload")
+        return False, {"error": "Invalid payload encoding"}
     
     try:
         # Parse JSON
-        payload_dict = json.loads(payload_str)
-    except json.JSONDecodeError as e:
-        logger.error(f"Invalid JSON in webhook: {e}")
-        return False, {"error": "Invalid JSON"}
-    
-    # Verify webhook signature if enabled
-    if settings.WEBHOOK_SIGNATURE_KEY:
-        if not verify_webhook_signature(payload_str, headers):
-            logger.warning("Invalid webhook signature")
-            return False, {"error": "Invalid signature"}
-    
-    # Validate basic payload structure
-    try:
-        base_payload = WebhookPayload(**payload_dict)
-    except Exception as e:
-        logger.error(f"Invalid webhook payload structure: {e}")
-        return False, {"error": "Invalid payload structure"}
-    
-    event_type = base_payload.event
-    gateway_id = base_payload.id
-    
-    logger.info(f"Processing webhook event: {event_type}, gateway ID: {gateway_id}")
-    
-    # Process based on event type
-    try:
-        if event_type == "sms:received":
-            payload = SmsReceivedPayload(**payload_dict["payload"])
-            result = await process_sms_received(base_payload, payload)
-        elif event_type == "sms:sent":
-            payload = SmsSentPayload(**payload_dict["payload"])
-            result = await process_sms_sent(base_payload, payload)
-        elif event_type == "sms:delivered":
-            payload = SmsDeliveredPayload(**payload_dict["payload"])
-            result = await process_sms_delivered(base_payload, payload)
-        elif event_type == "sms:failed":
-            payload = SmsFailedPayload(**payload_dict["payload"])
-            result = await process_sms_failed(base_payload, payload)
-        elif event_type == "system:ping":
-            payload = SystemPingPayload(**payload_dict["payload"])
-            result = await process_system_ping(base_payload, payload)
-        else:
-            logger.warning(f"Unknown webhook event type: {event_type}")
-            return False, {"error": "Unknown event type"}
-            
-        return True, result
+        try:
+            payload_dict = json.loads(payload_str)
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON in webhook: {e}")
+            return False, {"error": "Invalid JSON payload", "details": str(e)}
         
+        # Verify webhook signature if enabled
+        if settings.WEBHOOK_SIGNATURE_KEY:
+            signature_valid, signature_error = verify_webhook_signature(payload_str, headers)
+            if not signature_valid:
+                logger.warning(f"Invalid webhook signature: {signature_error}")
+                return False, {"error": "Invalid signature", "details": signature_error}
+        
+        # Validate basic payload structure
+        try:
+            base_payload = WebhookPayload(**payload_dict)
+        except Exception as e:
+            logger.error(f"Invalid webhook payload structure: {e}")
+            return False, {"error": "Invalid payload structure", "details": str(e)}
+        
+        event_type = base_payload.event
+        gateway_id = base_payload.id
+        
+        logger.info(f"Processing webhook event: {event_type}, gateway ID: {gateway_id}")
+        
+        # Record the incoming webhook event in database
+        try:
+            from app.db.session import get_repository
+            webhook_repo = await get_repository(WebhookRepository)
+            
+            # Create webhook event record
+            await webhook_repo.create_webhook_event(
+                event_type=event_type,
+                payload=payload_dict,
+                phone_number=payload_dict.get("payload", {}).get("phoneNumber"),
+                gateway_message_id=gateway_id
+            )
+        except Exception as e:
+            # Log error but continue processing - this is just for auditing
+            logger.error(f"Error recording webhook event: {e}")
+        
+        # Process based on event type
+        try:
+            if event_type == "sms:received":
+                payload = SmsReceivedPayload(**payload_dict["payload"])
+                result = await process_sms_received(base_payload, payload)
+            elif event_type == "sms:sent":
+                payload = SmsSentPayload(**payload_dict["payload"])
+                result = await process_sms_sent(base_payload, payload)
+            elif event_type == "sms:delivered":
+                payload = SmsDeliveredPayload(**payload_dict["payload"])
+                result = await process_sms_delivered(base_payload, payload)
+            elif event_type == "sms:failed":
+                payload = SmsFailedPayload(**payload_dict["payload"])
+                result = await process_sms_failed(base_payload, payload)
+            elif event_type == "system:ping":
+                payload = SystemPingPayload(**payload_dict["payload"])
+                result = await process_system_ping(base_payload, payload)
+            else:
+                logger.warning(f"Unknown webhook event type: {event_type}")
+                return False, {"error": "Unknown event type", "event_type": event_type}
+                
+            # Log successful processing
+            logger.info(f"Successfully processed webhook event: {event_type}, gateway ID: {gateway_id}")
+            
+            # Mark event as processed if we created one
+            try:
+                webhook_events = await webhook_repo.get_unprocessed_events(limit=10)
+                for event in webhook_events:
+                    if event.gateway_message_id == gateway_id:
+                        await webhook_repo.mark_event_processed(event_id=event.id)
+            except Exception as e:
+                logger.error(f"Error marking webhook event as processed: {e}")
+            
+            return True, result
+            
+        except Exception as e:
+            logger.error(f"Error processing webhook event {event_type}: {e}", exc_info=True)
+            
+            # Try to handle specific event processing errors gracefully
+            error_details = {"error_type": type(e).__name__, "gateway_id": gateway_id}
+            
+            # Publish error event
+            try:
+                from app.services.event_bus.bus import get_event_bus
+                from app.services.event_bus.events import EventType
+                
+                event_bus = get_event_bus()
+                await event_bus.publish(
+                    EventType.WEBHOOK_PROCESSED,
+                    {
+                        "success": False,
+                        "event_type": event_type,
+                        "gateway_id": gateway_id,
+                        "error": str(e),
+                        "timestamp": datetime.now(timezone.utc).isoformat()
+                    }
+                )
+            except Exception as publish_error:
+                logger.error(f"Error publishing webhook error event: {publish_error}")
+                
+            return False, {"error": f"Error processing {event_type} event", "details": str(e), **error_details}
+            
     except Exception as e:
-        logger.error(f"Error processing webhook: {e}", exc_info=True)
-        return False, {"error": str(e)}
+        logger.error(f"Unexpected error in webhook processing: {e}", exc_info=True)
+        return False, {"error": "Unexpected error", "details": str(e)}
+
+
+def verify_webhook_signature(payload: str, headers: Dict[str, str]) -> Tuple[bool, Optional[str]]:
+    """
+    Verify webhook signature from SMS Gateway with detailed error reporting.
+    
+    Args:
+        payload: Webhook payload string
+        headers: Request headers
+        
+    Returns:
+        Tuple[bool, Optional[str]]: (is_valid, error_message_or_none)
+    """
+    signature = headers.get("X-Signature")
+    timestamp = headers.get("X-Timestamp")
+    
+    if not signature:
+        return False, "Missing X-Signature header"
+    
+    if not timestamp:
+        return False, "Missing X-Timestamp header"
+    
+    # Verify timestamp is recent (within tolerance)
+    try:
+        ts = int(timestamp)
+        current_time = int(time.time())
+        if abs(current_time - ts) > settings.WEBHOOK_TIMESTAMP_TOLERANCE:
+            return False, f"Timestamp too old: {timestamp} (current: {current_time})"
+    except (ValueError, TypeError):
+        return False, f"Invalid timestamp format: {timestamp}"
+    
+    # Calculate expected signature
+    message = (payload + timestamp).encode()
+    expected_signature = hmac.new(
+        settings.WEBHOOK_SIGNATURE_KEY.encode(),
+        message,
+        hashlib.sha256
+    ).hexdigest()
+    
+    # Compare signatures (constant-time comparison)
+    is_valid = hmac.compare_digest(expected_signature, signature)
+    
+    return is_valid, None if is_valid else "Signature mismatch"
 
 def verify_webhook_signature(payload: str, headers: Dict[str, str]) -> bool:
     """

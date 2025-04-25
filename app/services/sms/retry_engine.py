@@ -2,7 +2,7 @@
 import asyncio
 import logging
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 
 from app.core.config import settings
@@ -89,7 +89,7 @@ class RetryEngine:
             List[Dict]: List of messages that should be retried
         """
         # Parameters for retry candidate selection
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         max_retries = settings.RETRY_MAX_ATTEMPTS
         
         try:

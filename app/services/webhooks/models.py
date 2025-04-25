@@ -2,7 +2,7 @@
 """
 Pydantic models for webhook payloads from SMS Gateway.
 """
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional, Literal
 from pydantic import BaseModel, Field
 

@@ -1,6 +1,6 @@
 # app/schemas/campaign.py
 from typing import List, Optional, Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
 from uuid import UUID
 
 from pydantic import BaseModel, Field, validator

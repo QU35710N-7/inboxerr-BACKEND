@@ -1,7 +1,7 @@
 # app/services/campaigns/processor.py
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 import uuid
 
@@ -66,7 +66,7 @@ class CampaignProcessor:
         updated = await self.campaign_repository.update_campaign_status(
             campaign_id=campaign_id,
             status="active",
-            started_at=datetime.utcnow()
+            started_at=datetime.now(timezone.utc)
         )
         
         if not updated:
@@ -147,7 +147,7 @@ class CampaignProcessor:
         updated = await self.campaign_repository.update_campaign_status(
             campaign_id=campaign_id,
             status="cancelled",
-            completed_at=datetime.utcnow()
+            completed_at=datetime.now(timezone.utc)
         )
         
         return updated is not None
@@ -182,7 +182,7 @@ class CampaignProcessor:
             await self.campaign_repository.update_campaign_status(
                 campaign_id=campaign_id,
                 status="failed",
-                completed_at=datetime.utcnow()
+                completed_at=datetime.now(timezone.utc)
             )
         finally:
             # Remove from processing set
@@ -219,7 +219,7 @@ class CampaignProcessor:
                 await self.campaign_repository.update_campaign_status(
                     campaign_id=campaign.id,
                     status="completed",
-                    completed_at=datetime.utcnow()
+                    completed_at=datetime.now(timezone.utc)
                 )
                 return
             

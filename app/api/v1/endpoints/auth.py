@@ -1,7 +1,7 @@
 """
 API endpoints for authentication.
 """
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status, Body
@@ -54,7 +54,7 @@ async def login_for_access_token(
         
         # Create access token
         access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-        expires_at = datetime.utcnow() + access_token_expires
+        expires_at = datetime.now(timezone.utc) + access_token_expires
         
         access_token = create_access_token(
             data={

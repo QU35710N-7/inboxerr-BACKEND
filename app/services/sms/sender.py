@@ -5,7 +5,7 @@ import asyncio
 import logging
 import uuid
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Tuple, Union
 
 from app.core.config import settings
@@ -91,7 +91,7 @@ class SMSSender:
             SMSGatewayError: If there's an error sending the message
         """
         # Validate phone number
-        is_valid, formatted_number, error = validate_phone(phone_number)
+        is_valid, formatted_number, error, _ = validate_phone(phone_number)
         if not is_valid:
             raise ValidationError(message=f"Invalid phone number: {error}")
         
@@ -107,7 +107,7 @@ class SMSSender:
         )
         
         # If scheduled for future, return message details
-        if scheduled_at and scheduled_at > datetime.utcnow():
+        if scheduled_at and scheduled_at > datetime.now(timezone.utc):
             logger.info(f"Message {db_message.id} scheduled for {scheduled_at}")
             
             # Publish event
@@ -209,7 +209,7 @@ class SMSSender:
         # Create batch in database
         batch = await self.message_repository.create_batch(
             user_id=user_id,
-            name=f"Batch {datetime.utcnow().isoformat()}",
+            name=f"Batch {datetime.now(timezone.utc).isoformat()}",
             total=len(messages)
         )
         
@@ -469,7 +469,7 @@ class SMSSender:
             )
             
             # Skip if scheduled for the future
-            if db_message.scheduled_at and db_message.scheduled_at > datetime.utcnow():
+            if db_message.scheduled_at and db_message.scheduled_at > datetime.now(timezone.utc):
                 tasks.append(asyncio.create_task(
                     asyncio.sleep(0)  # Dummy task for scheduled messages
                 ))
@@ -595,7 +595,7 @@ class SMSSender:
         messages = []
         for phone in phone_numbers:
             # Basic validation
-            is_valid, formatted_number, error = validate_phone(phone)
+            is_valid, formatted_number, error, _ = validate_phone(phone)
             if is_valid:
                 messages.append(
                     MessageCreate(
@@ -840,7 +840,7 @@ class SMSSender:
                 "status": MessageStatus.SENT,
                 "gateway_message_id": f"sim_{uuid.uuid4()}",
                 "phone_number": phone_number,
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": datetime.now(timezone.utc).isoformat()
             }
         
         # Use semaphore to limit concurrent requests
@@ -891,7 +891,7 @@ class SMSSender:
                         "status": status,
                         "gateway_message_id": gateway_id,
                         "phone_number": phone_number,
-                        "timestamp": datetime.utcnow().isoformat()
+                        "timestamp": datetime.now(timezone.utc).isoformat()
                     }
                     
             except client.ClientError as e:
@@ -919,6 +919,176 @@ class SMSSender:
         
         self._last_send_time = asyncio.get_event_loop().time()
 
+    async def send_with_template(
+        self,
+        *,
+        template_id: str,
+        phone_number: str,
+        variables: Dict[str, str],
+        user_id: str,
+        scheduled_at: Optional[datetime] = None,
+        custom_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Send a message using a template.
+        
+        Args:
+            template_id: Template ID
+            phone_number: Recipient phone number
+            variables: Dictionary of variable values
+            user_id: User ID
+            scheduled_at: Optional scheduled delivery time
+            custom_id: Optional custom ID for tracking
+            
+        Returns:
+            Dict: Message details with status
+            
+        Raises:
+            ValidationError: If phone number is invalid or template is not found
+            SMSGatewayError: If there's an error sending the message
+        """
+        # Get template repository
+        from app.db.session import get_repository
+        from app.db.repositories.templates import TemplateRepository
+        
+        template_repo = await get_repository(TemplateRepository)
+        
+        # Get template
+        template = await template_repo.get_by_id(template_id)
+        if not template:
+            raise ValidationError(message=f"Template {template_id} not found")
+        
+        # Check authorization
+        if template.user_id != user_id:
+            raise ValidationError(message="Not authorized to use this template")
+        
+        # Apply template
+        message_text = await template_repo.apply_template(
+            template_id=template_id,
+            variables=variables
+        )
+        
+        # Check for missing variables
+        import re
+        missing_vars = re.findall(r"{{([a-zA-Z0-9_]+)}}", message_text)
+        if missing_vars:
+            raise ValidationError(
+                message="Missing template variables", 
+                details={"missing_variables": missing_vars}
+            )
+        
+        # Send message
+        metadata = {
+            "template_id": template_id,
+            "template_variables": variables
+        }
+        
+        return await self.send_message(
+            phone_number=phone_number,
+            message_text=message_text,
+            user_id=user_id,
+            scheduled_at=scheduled_at,
+            custom_id=custom_id,
+            metadata=metadata
+        )
+
+    async def send_batch_with_template(
+        self,
+        *,
+        template_id: str,
+        recipients: List[Dict[str, Any]],
+        user_id: str,
+        scheduled_at: Optional[datetime] = None,
+        options: Optional[BatchOptions] = None
+    ) -> Dict[str, Any]:
+        """
+        Send a batch of messages using a template.
+        
+        Args:
+            template_id: Template ID
+            recipients: List of recipients with their variables
+                    Each recipient should have 'phone_number' and 'variables' keys
+            user_id: User ID
+            scheduled_at: Optional scheduled delivery time
+            options: Optional batch processing options
+            
+        Returns:
+            Dict: Batch details with status
+            
+        Raises:
+            ValidationError: If template is not found or recipients format is invalid
+            SMSGatewayError: If there's an error sending the messages
+        """
+        # Get template repository
+        from app.db.session import get_repository
+        from app.db.repositories.templates import TemplateRepository
+        
+        template_repo = await get_repository(TemplateRepository)
+        
+        # Get template
+        template = await template_repo.get_by_id(template_id)
+        if not template:
+            raise ValidationError(message=f"Template {template_id} not found")
+        
+        # Check authorization
+        if template.user_id != user_id:
+            raise ValidationError(message="Not authorized to use this template")
+        
+        # Validate recipients format
+        for idx, recipient in enumerate(recipients):
+            if "phone_number" not in recipient:
+                raise ValidationError(message=f"Recipient at index {idx} is missing 'phone_number'")
+            if "variables" not in recipient:
+                raise ValidationError(message=f"Recipient at index {idx} is missing 'variables'")
+        
+        # Create messages for each recipient
+        messages = []
+        for recipient in recipients:
+            # Apply template for each recipient
+            message_text = await template_repo.apply_template(
+                template_id=template_id,
+                variables=recipient["variables"]
+            )
+            
+            # Check for missing variables
+            import re
+            missing_vars = re.findall(r"{{([a-zA-Z0-9_]+)}}", message_text)
+            if missing_vars:
+                # Skip this recipient but continue with others
+                continue
+            
+            # Create message
+            messages.append(
+                MessageCreate(
+                    phone_number=recipient["phone_number"],
+                    message=message_text,
+                    scheduled_at=scheduled_at,
+                    custom_id=recipient.get("custom_id")
+                )
+            )
+        
+        if not messages:
+            raise ValidationError(message="No valid recipients found after applying templates")
+        
+        # Create batch metadata
+        batch_metadata = {
+            "template_id": template_id,
+            "recipients_count": len(recipients),
+            "messages_count": len(messages)
+        }
+        
+        # Use standard batch sending
+        batch_result = await self.send_batch(
+            messages=messages,
+            user_id=user_id,
+            options=options
+        )
+        
+        # Add template info to result
+        batch_result["template_id"] = template_id
+        batch_result["template_name"] = template.name
+        
+        return batch_result
 
 # Dependency injection function
 async def get_sms_sender():

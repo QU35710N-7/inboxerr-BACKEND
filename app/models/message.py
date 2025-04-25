@@ -1,7 +1,7 @@
 """
 Database models for SMS messages.
 """
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
 
 from sqlalchemy import Column, String, DateTime, Boolean, JSON, Integer, ForeignKey, Text

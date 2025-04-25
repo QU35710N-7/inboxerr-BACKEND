@@ -3,7 +3,7 @@ Main API router that includes all endpoint routers.
 """
 from fastapi import APIRouter
 
-from app.api.v1.endpoints import auth, messages, webhooks, metrics, campaigns
+from app.api.v1.endpoints import auth, messages, webhooks, metrics, campaigns, templates
 
 
 # Create main API router
@@ -24,6 +24,11 @@ api_router.include_router(
     campaigns.router, 
     prefix="/campaigns", 
     tags=["Campaigns"]
+)
+api_router.include_router(
+    templates.router, 
+    prefix="/templates", 
+    tags=["Templates"]
 )
 api_router.include_router(
     webhooks.router, 

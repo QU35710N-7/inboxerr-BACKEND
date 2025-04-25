@@ -5,7 +5,7 @@ import asyncio
 import time
 from typing import Dict, Any, Optional, Tuple
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 from app.core.config import settings
 

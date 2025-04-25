@@ -1,7 +1,7 @@
 """
 Message repository for database operations related to SMS messages.
 """
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any, Tuple
 from uuid import uuid4
 
@@ -30,7 +30,8 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
         custom_id: Optional[str] = None,
         scheduled_at: Optional[datetime] = None,
         metadata: Optional[Dict[str, Any]] = None,
-        batch_id: Optional[str] = None
+        batch_id: Optional[str] = None,
+        campaign_id: Optional[str] = None
     ) -> Message:
         """
         Create a new message.
@@ -43,6 +44,7 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
             scheduled_at: Optional scheduled time
             metadata: Optional additional data
             batch_id: Optional batch ID
+            campaign_id: Optional campaign ID
             
         Returns:
             Message: Created message
@@ -64,7 +66,8 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
             user_id=user_id,
             meta_data=metadata or {},  # Use meta_data instead of metadata
             parts_count=parts_count,
-            batch_id=batch_id
+            batch_id=batch_id,
+            campaign_id=campaign_id
         )
         
         self.session.add(message)
@@ -77,11 +80,26 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
             status=initial_status,
             data={
                 "phone_number": phone_number,
-                "scheduled_at": scheduled_at.isoformat() if scheduled_at else None
+                "scheduled_at": scheduled_at.isoformat() if scheduled_at else None,
+                "campaign_id": campaign_id
             }
         )
         
         self.session.add(event)
+        
+        # If associated with campaign, increment total message count
+        if campaign_id:
+            # Get campaign
+            from app.db.repositories.campaigns import CampaignRepository
+            campaign_repo = CampaignRepository(self.session)
+            campaign = await campaign_repo.get_by_id(campaign_id)
+            
+            if campaign:
+                # Use existing campaign repository method to update total messages
+                # This ensures all campaign updates go through the repository
+                campaign.total_messages += 1
+                self.session.add(campaign)
+        
         await self.session.commit()
         await self.session.refresh(message)
         
@@ -117,7 +135,7 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
             return None
         
         # Update status-specific timestamp
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         update_data = {
             "status": status,
             "updated_at": now,
@@ -232,7 +250,7 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
         # If all messages processed, update status and completion time
         if batch.processed >= batch.total:
             batch.status = MessageStatus.PROCESSED if batch.failed == 0 else "partial"
-            batch.completed_at = datetime.utcnow()
+            batch.completed_at = datetime.now(timezone.utc)
         
         self.session.add(batch)
         await self.session.commit()

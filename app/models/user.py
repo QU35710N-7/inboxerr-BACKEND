@@ -1,7 +1,7 @@
 """
 Database models for user management.
 """
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
 
 from sqlalchemy import Boolean, Column, String, DateTime, JSON, ForeignKey

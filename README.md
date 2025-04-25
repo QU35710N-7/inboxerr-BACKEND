@@ -280,6 +280,76 @@ response = requests.post(url, headers=headers, files=files, data=data)
 print(response.json())
 ```
 
+# Inboxerr API Updates
+
+## Message Template System
+
+The Inboxerr API now includes a robust Message Template System, allowing you to:
+
+- Create reusable templates with variable placeholders
+- Apply variables to templates and preview the results
+- Send messages using templates with personalized data
+- Manage templates (create, update, delete, list)
+
+### Getting Started with Templates
+
+1. **Create a new template**:
+   ```bash
+   curl -X POST "http://localhost:8000/api/v1/templates" \
+     -H "Authorization: Bearer YOUR_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "name": "Welcome Template",
+       "content": "Hello {{name}}, welcome to our service!",
+       "description": "Welcome message for new users"
+     }'
+   ```
+
+2. **Send a message using a template**:
+   ```bash
+   curl -X POST "http://localhost:8000/api/v1/templates/send" \
+     -H "Authorization: Bearer YOUR_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "template_id": "YOUR_TEMPLATE_ID",
+       "phone_number": "+1234567890",
+       "variables": {
+         "name": "John"
+       }
+     }'
+   ```
+
+See the full [Message Template System User Guide](path/to/message-template-system-user-guide.md) for more details.
+
+## Database Management
+
+We've added tools to simplify database migration and setup:
+
+### Generating Migrations
+
+To generate a new migration after changing your models:
+
+```bash
+python scripts/generate_migration.py "Description of your changes"
+```
+
+### Setting Up a Test Database
+
+To set up a test database with sample data:
+
+```bash
+python scripts/setup_test_db.py
+```
+
+This will:
+1. Create a test database if it doesn't exist
+2. Run all migrations
+3. Create a test user and sample templates
+
+Test user credentials:
+- Email: test@example.com
+- Password: Test1234!
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.

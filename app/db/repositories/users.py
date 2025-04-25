@@ -1,7 +1,7 @@
 """
 User repository for database operations related to users.
 """
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
 from uuid import uuid4
 
@@ -185,7 +185,7 @@ class UserRepository(BaseRepository[User, UserCreate, UserUpdate]):
             APIKey.key == key, 
             APIKey.is_active == True
         ).values(
-            last_used_at=datetime.utcnow()
+            last_used_at=datetime.now(timezone.utc)
         )
         
         result = await self.session.execute(query)

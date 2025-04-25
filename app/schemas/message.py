@@ -2,7 +2,7 @@
 Pydantic schemas for message-related API operations.
 """
 from typing import List, Optional, Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pydantic import BaseModel, Field, validator
 

@@ -2,7 +2,7 @@
 Base database model with common fields and methods.
 """
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from sqlalchemy import Column, DateTime, String

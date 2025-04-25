@@ -3,7 +3,7 @@ Event type definitions for the event bus.
 """
 from enum import Enum, auto
 from typing import Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 class EventType(str, Enum):
@@ -81,7 +81,7 @@ class Event:
         """
         self.event_type = event_type
         self.data = data
-        self.timestamp = timestamp or datetime.utcnow()
+        self.timestamp = timestamp or datetime.now(timezone.utc)
     
     def to_dict(self) -> Dict[str, Any]:
         """

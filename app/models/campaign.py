@@ -1,5 +1,5 @@
 # app/models/campaign.py
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional
 
 from sqlalchemy import Column, String, DateTime, Boolean, JSON, Integer, ForeignKey, Text

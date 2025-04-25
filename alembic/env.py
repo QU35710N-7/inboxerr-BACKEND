@@ -1,4 +1,10 @@
 from logging.config import fileConfig
+import os
+import sys
+from pathlib import Path
+
+# Add the parent directory to sys.path
+sys.path.append(str(Path(__file__).parent.parent))
 
 from sqlalchemy import engine_from_config
 from sqlalchemy import pool
@@ -23,11 +29,12 @@ if config.config_file_name is not None:
 # target_metadata = mymodel.Base.metadata
 target_metadata = Base.metadata
 
-# other values from the config, defined by the needs of env.py,
-# can be acquired:
-# my_important_option = config.get_main_option("my_important_option")
-# ... etc.
+# Get database URL from environment or settings
+db_url = os.environ.get("ALEMBIC_DB_URL", settings.DATABASE_URL)
 
+# Convert asyncpg URL to standard psycopg2 URL for Alembic
+if "+asyncpg" in db_url:
+    db_url = db_url.replace("+asyncpg", "")
 
 
 def run_migrations_offline() -> None:
@@ -42,7 +49,9 @@ def run_migrations_offline() -> None:
     script output.
 
     """
-    config.set_main_option("sqlalchemy.url", settings.DATABASE_URL.replace("postgresql+asyncpg", "postgresql"))
+    # Set SQL Alchemy URL from our db_url
+    config.set_main_option("sqlalchemy.url", db_url)
+    
     url = config.get_main_option("sqlalchemy.url")
     
     context.configure(
@@ -63,9 +72,8 @@ def run_migrations_online() -> None:
     and associate a connection with the context.
 
     """
-
-    # 🔧 Inject corrected DB URL for Alembic
-    config.set_main_option("sqlalchemy.url", settings.DATABASE_URL.replace("postgresql+asyncpg", "postgresql"))
+    # Set SQL Alchemy URL from our db_url
+    config.set_main_option("sqlalchemy.url", db_url)
 
     connectable = engine_from_config(
         config.get_section(config.config_ini_section, {}),

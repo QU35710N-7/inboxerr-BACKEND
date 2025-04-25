@@ -1,7 +1,7 @@
 """
 Webhook repository for database operations related to webhooks.
 """
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Dict, Any, Tuple
 from uuid import uuid4
 
@@ -137,7 +137,7 @@ class WebhookRepository(BaseRepository[Webhook, Dict[str, Any], Dict[str, Any]])
         if not is_success and retry_count < 3:  # Configure max retries
             # Schedule next retry with exponential backoff
             backoff = 5 * (2 ** retry_count)  # 5, 10, 20 minutes
-            delivery.next_retry_at = datetime.utcnow() + timedelta(minutes=backoff)
+            delivery.next_retry_at = datetime.now(timezone.utc) + timedelta(minutes=backoff)
         
         self.session.add(delivery)
         await self.session.commit()
@@ -147,7 +147,7 @@ class WebhookRepository(BaseRepository[Webhook, Dict[str, Any], Dict[str, Any]])
         await self._update_webhook_stats(
             webhook_id=webhook_id,
             is_success=is_success,
-            last_triggered=datetime.utcnow()
+            last_triggered=datetime.now(timezone.utc)
         )
         
         return delivery
@@ -195,7 +195,7 @@ class WebhookRepository(BaseRepository[Webhook, Dict[str, Any], Dict[str, Any]])
         Returns:
             List[WebhookDelivery]: List of deliveries pending retry
         """
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         
         query = select(WebhookDelivery).where(
             and_(
@@ -245,7 +245,7 @@ class WebhookRepository(BaseRepository[Webhook, Dict[str, Any], Dict[str, Any]])
         if not is_success and delivery.retry_count < 3:  # Configure max retries
             # Schedule next retry with exponential backoff
             backoff = 5 * (2 ** delivery.retry_count)  # 5, 10, 20 minutes
-            delivery.next_retry_at = datetime.utcnow() + timedelta(minutes=backoff)
+            delivery.next_retry_at = datetime.now(timezone.utc) + timedelta(minutes=backoff)
         else:
             delivery.next_retry_at = None
         
@@ -257,7 +257,7 @@ class WebhookRepository(BaseRepository[Webhook, Dict[str, Any], Dict[str, Any]])
         await self._update_webhook_stats(
             webhook_id=delivery.webhook_id,
             is_success=is_success,
-            last_triggered=datetime.utcnow()
+            last_triggered=datetime.now(timezone.utc)
         )
         
         return delivery

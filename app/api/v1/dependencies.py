@@ -5,7 +5,7 @@ from fastapi import Depends, HTTPException, status, Header
 from fastapi.security import OAuth2PasswordBearer
 from typing import Optional, List
 import jwt
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from app.core.config import settings
 from app.core.exceptions import AuthenticationError, AuthorizationError
@@ -55,7 +55,7 @@ async def get_current_user(
         token_data = TokenData(**payload)
         
         # Check if token is expired
-        if token_data.exp and datetime.utcnow() > token_data.exp:
+        if token_data.exp and datetime.now(timezone.utc) > token_data.exp:
             raise AuthenticationError("Token has expired")
         
         # Get user from database
@@ -101,7 +101,7 @@ async def verify_api_key(
             raise AuthenticationError("API key is inactive")
         
         # Check if API key is expired
-        if api_key_record.expires_at and datetime.utcnow() > api_key_record.expires_at:
+        if api_key_record.expires_at and datetime.now(timezone.utc) > api_key_record.expires_at:
             raise AuthenticationError("API key has expired")
         
         # Get user associated with API key
