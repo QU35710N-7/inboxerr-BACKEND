@@ -20,6 +20,7 @@ from app.schemas.message import (
 from app.services.sms.sender import get_sms_sender
 from app.schemas.user import User
 from app.utils.pagination import PaginationParams, paginate_response
+from app.utils.pagination import PaginatedResponse
 
 router = APIRouter()
 
@@ -195,7 +196,7 @@ async def get_message(
         raise HTTPException(status_code=500, detail=f"Error retrieving message: {str(e)}")
 
 
-@router.get("/", response_model=List[MessageResponse])
+@router.get("/", response_model=PaginatedResponse[MessageResponse])
 async def list_messages(
     pagination: PaginationParams = Depends(),
     status: Optional[str] = Query(None, description="Filter by message status"),
