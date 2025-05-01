@@ -10,17 +10,18 @@ from datetime import datetime, timedelta, timezone
 from app.core.config import settings
 from app.core.exceptions import AuthenticationError, AuthorizationError
 from app.schemas.user import User, TokenData, UserRole
+from app.db.session import get_repository_factory
 from app.db.repositories.users import UserRepository
 from app.services.rate_limiter import RateLimiter
 
 # OAuth2 scheme for token authentication
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"{settings.API_PREFIX}/auth/token")
 
+#: Dependency injection provider for UserRepository.
+#: This uses FastAPI's built-in dependency system to automatically inject
+get_user_repository = get_repository_factory(UserRepository)
 
-async def get_user_repository():
-    """Get user repository."""
-    from app.db.session import get_repository
-    return await get_repository(UserRepository)
+
 
 
 async def get_rate_limiter():
