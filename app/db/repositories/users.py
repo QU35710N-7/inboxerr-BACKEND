@@ -3,6 +3,7 @@ User repository for database operations related to users.
 """
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
+from app.utils.ids import generate_prefixed_id, IDPrefix
 from uuid import uuid4
 
 from sqlalchemy import select, update

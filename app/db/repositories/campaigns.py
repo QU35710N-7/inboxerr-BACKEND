@@ -1,7 +1,8 @@
 # app/db/repositories/campaigns.py
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any, Tuple
-from uuid import uuid4
+from app.utils.ids import generate_prefixed_id, IDPrefix
+
 
 from sqlalchemy import select, update, and_, or_, desc, func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -42,8 +43,9 @@ class CampaignRepository(BaseRepository[Campaign, Dict[str, Any], Dict[str, Any]
         Returns:
             Campaign: Created campaign
         """
+        campaign_id = generate_prefixed_id(IDPrefix.CAMPAIGN)
         campaign = Campaign(
-            id=str(uuid4()),
+            id=campaign_id,
             name=name,
             description=description,
             status="draft",

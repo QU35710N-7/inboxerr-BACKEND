@@ -7,9 +7,12 @@ from uuid import uuid4
 
 from sqlalchemy import select, update, delete, and_, or_, desc, func
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.exc import IntegrityError
 
 import logging
+from app.utils.ids import generate_prefixed_id, IDPrefix
 from app.models.campaign import Campaign
 from app.db.repositories.base import BaseRepository
 from app.models.message import Message, MessageEvent, MessageBatch, MessageTemplate
@@ -46,8 +49,8 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
         parts_count = (len(message_text) + 159) // 160  # 160 chars per SMS part
         
         # Generate IDs upfront
-        message_id = str(uuid4())
-        event_id = str(uuid4())
+        message_id = generate_prefixed_id(IDPrefix.MESSAGE)
+        event_id = generate_prefixed_id(IDPrefix.EVENT)
         
         # Create message instance
         message = Message(
@@ -77,25 +80,29 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
             }
         )
         
-        # Add both objects to session before any flush/commit
-        self.session.add(message)
-        self.session.add(event)
+        # Begin transaction using savepoint if a transaction is already active
+        async with self.session.begin_nested():
+            # Add both objects to session
+            self.session.add(message)
+            self.session.add(event)
+            
+            # Handle campaign update if needed
+            if campaign_id:
+                try:
+                    # Execute campaign update with direct SQL for better performance in high volume
+                    await self.session.execute(
+                        update(Campaign)
+                        .where(Campaign.id == campaign_id)
+                        .values(total_messages=Campaign.total_messages + 1)
+                    )
+                except Exception as e:
+                    # Log but don't fail the message creation if campaign update fails
+                    logger.error(f"Error updating campaign {campaign_id} message count: {e}")
         
-        # Handle campaign update if needed
-        if campaign_id:
-            try:
-                # Execute campaign update with direct SQL for better performance in high volume
-                await self.session.execute(
-                    update(Campaign)
-                    .where(Campaign.id == campaign_id)
-                    .values(total_messages=Campaign.total_messages + 1)
-                )
-            except Exception as e:
-                # Log but don't fail the message creation if campaign update fails
-                logger.error(f"Error updating campaign {campaign_id} message count: {e}")
-        
-        # Commit all changes in one transaction
+        # Commit the outer transaction
         await self.session.commit()
+        
+        # Refresh message
         await self.session.refresh(message)
         
         return message
@@ -111,7 +118,7 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
         data: Optional[Dict[str, Any]] = None
     ) -> Optional[Message]:
         """
-        Update message status.
+        Update message status with improved concurrency handling.
         
         Args:
             message_id: Message ID
@@ -124,7 +131,7 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
         Returns:
             Message: Updated message or None
         """
-        # Get the message
+        # Get the message first to check if it exists
         message = await self.get_by_id(message_id)
         if not message:
             return None
@@ -148,23 +155,37 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
         if gateway_message_id:
             update_data["gateway_message_id"] = gateway_message_id
         
-        # Update the message
-        await self.session.execute(
-            update(Message)
-            .where(Message.id == message_id)
-            .values(**update_data)
-        )
+        # Set a specific savepoint for this operation
+        async with self.session.begin_nested() as nested:
+            try:
+                # Update the message
+                await self.session.execute(
+                    update(Message)
+                    .where(Message.id == message_id)
+                    .values(**update_data)
+                )
+                
+                # Create event for status change with unique ID
+                event_id = generate_prefixed_id(IDPrefix.EVENT)  # Generate new ID for each event
+                event = MessageEvent(
+                    id=event_id,
+                    message_id=message_id,
+                    event_type=event_type,
+                    status=status,
+                    data=data or {}
+                )
+                
+                # Add event to session
+                self.session.add(event)
+                
+                # Commit the nested transaction
+                await nested.commit()
+            except Exception as e:
+                # Transaction will automatically roll back on exception
+                logger.error(f"Error updating message status: {e}")
+                return None
         
-        # Create event for status change
-        event = MessageEvent(
-            id=str(uuid4()),
-            message_id=message_id,
-            event_type=event_type,
-            status=status,
-            data=data or {}
-        )
-        
-        self.session.add(event)
+        # Complete the outer transaction
         await self.session.commit()
         
         # Refresh the message
@@ -190,8 +211,9 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
         Returns:
             MessageBatch: Created batch
         """
+        batch_id = generate_prefixed_id(IDPrefix.BATCH)
         batch = MessageBatch(
-            id=str(uuid4()),
+            id=batch_id,
             name=name,
             total=total,
             processed=0,
@@ -201,8 +223,9 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
             user_id=user_id
         )
         
-        self.session.add(batch)
-        await self.session.commit()
+        async with self.session.begin():
+            self.session.add(batch)
+        
         await self.session.refresh(batch)
         
         return batch
@@ -217,7 +240,7 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
         status: Optional[str] = None
     ) -> Optional[MessageBatch]:
         """
-        Update batch progress.
+        Update batch progress with proper transaction handling.
         
         Args:
             batch_id: Batch ID
@@ -229,29 +252,112 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
         Returns:
             MessageBatch: Updated batch or None
         """
-        batch = await self.get_by_id(batch_id)
-        if not batch:
-            return None
+        # For high volume operations, get a fresh session
+        from app.db.session import async_session_factory
         
-        # Update counts
-        batch.processed += increment_processed
-        batch.successful += increment_successful
-        batch.failed += increment_failed
-        
-        # Update status if provided
-        if status:
-            batch.status = status
+        async with async_session_factory() as fresh_session:
+            async with fresh_session.begin():
+                # Get batch with SELECT FOR UPDATE to prevent race conditions
+                query = select(MessageBatch).where(MessageBatch.id == batch_id)
+                result = await fresh_session.execute(query.with_for_update())
+                batch = result.scalar_one_or_none()
+                
+                if not batch:
+                    return None
+                
+                # Update counts
+                batch.processed += increment_processed
+                batch.successful += increment_successful
+                batch.failed += increment_failed
+                
+                # Update status if provided
+                if status:
+                    batch.status = status
+                    
+                # If all messages processed, update status and completion time
+                if batch.processed >= batch.total:
+                    batch.status = MessageStatus.PROCESSED if batch.failed == 0 else "partial"
+                    batch.completed_at = datetime.now(timezone.utc)
+                
+                # Persist changes
+                fresh_session.add(batch)
+                # Commit happens automatically at the end of context manager
             
-        # If all messages processed, update status and completion time
-        if batch.processed >= batch.total:
-            batch.status = MessageStatus.PROCESSED if batch.failed == 0 else "partial"
-            batch.completed_at = datetime.now(timezone.utc)
+            # Refresh to get updated data
+            result = await fresh_session.execute(query)
+            updated_batch = result.scalar_one_or_none()
+            
+            return updated_batch
+
+    async def update_batch_progress_safe(
+        self,
+        *,
+        batch_id: str,
+        increment_processed: int = 0,
+        increment_successful: int = 0,
+        increment_failed: int = 0,
+        status: Optional[str] = None
+    ) -> Optional[MessageBatch]:
+        """
+        Update batch progress with proper transaction handling.
         
-        self.session.add(batch)
-        await self.session.commit()
-        await self.session.refresh(batch)
+        Args:
+            batch_id: Batch ID
+            increment_processed: Increment processed count
+            increment_successful: Increment successful count
+            increment_failed: Increment failed count
+            status: Optional new status
+            
+        Returns:
+            MessageBatch: Updated batch or None
+        """
+        # Get a completely fresh session for this operation
+        from app.db.session import async_session_factory
         
-        return batch
+        async with async_session_factory() as fresh_session:
+            try:
+                async with fresh_session.begin():
+                    # Get batch with SELECT FOR UPDATE to prevent race conditions
+                    query = select(MessageBatch).where(MessageBatch.id == batch_id)
+                    result = await fresh_session.execute(query.with_for_update())
+                    batch = result.scalar_one_or_none()
+                    
+                    if not batch:
+                        return None
+                    
+                    # Update counts
+                    batch.processed += increment_processed
+                    batch.successful += increment_successful
+                    batch.failed += increment_failed
+                    
+                    # Update status if provided
+                    if status:
+                        batch.status = status
+                        
+                    # If all messages processed, update status and completion time
+                    if batch.processed >= batch.total:
+                        batch.status = MessageStatus.PROCESSED if batch.failed == 0 else "partial"
+                        batch.completed_at = datetime.now(timezone.utc)
+                    
+                    # Add the updated batch to the session
+                    fresh_session.add(batch)
+                    
+                    # Get updated batch after updates are applied
+                    # This is automatically refreshed at transaction commit
+                    
+                # Now outside the transaction, we can safely refresh
+                query = select(MessageBatch).where(MessageBatch.id == batch_id)
+                result = await fresh_session.execute(query)
+                updated_batch = result.scalar_one_or_none()
+                    
+                return updated_batch
+            
+            except Exception as e:
+                logger.error(f"Error in update_batch_progress_safe: {e}")
+                return None
+            finally:
+                # Explicitly close session to prevent connection leaks
+                await fresh_session.close()
 
     async def get_by_custom_id(self, custom_id: str) -> Optional[Message]:
         """
@@ -456,8 +562,7 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
                 Message.status == MessageStatus.FAILED,
                 or_(
                     Message.meta_data.is_(None),  # No metadata at all
-                    ~Message.meta_data.contains({"retry_count": 0}),  # retry_count key is absent
-                    Message.meta_data["retry_count"].as_integer() < max_retries  # retry_count too low
+                    ~Message.meta_data.contains({"retry_count": max_retries})  # retry_count less than max
                 )
             )
         ).order_by(Message.failed_at).limit(limit)

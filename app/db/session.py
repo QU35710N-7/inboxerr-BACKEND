@@ -2,7 +2,7 @@
 Database session management.
 """
 import logging
-from typing import AsyncGenerator, Type
+from typing import AsyncGenerator, Type, Any
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
@@ -10,21 +10,29 @@ from sqlalchemy.orm import sessionmaker
 from app.core.config import settings
 from app.db.base import Base
 
-# Create async engine
+logger = logging.getLogger("inboxerr.db")
+
+# Create async engine with optimized pool settings
 engine = create_async_engine(
     settings.DATABASE_URL,
     echo=settings.DEBUG,
-    future=True
+    future=True,
+    # Enhanced pool settings for better concurrency
+    pool_size=20,  # Increased from default to handle more connections
+    max_overflow=30,  # Allow more connections during peak load
+    pool_timeout=30,  # Longer timeout to prevent premature failures
+    pool_recycle=3600,  # Recycle connections hourly
+    pool_pre_ping=True  # Verify connections before use
 )
 
 # Create async session factory
 async_session_factory = sessionmaker(
     engine, 
     class_=AsyncSession, 
-    expire_on_commit=False
+    expire_on_commit=False,
+    # Disable autoflush to prevent unexpected flushes during operations
+    autoflush=False  
 )
-
-logger = logging.getLogger("inboxerr.db")
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
@@ -75,7 +83,10 @@ async def close_database_connections() -> None:
 
 async def get_repository(repo_type: Type):
     """
-    Get repository instance.
+    Get repository instance with improved session management.
+    
+    Creates a fresh session for each repository instance to prevent
+    session conflicts in concurrent operations.
     
     Args:
         repo_type: Repository class
@@ -83,5 +94,19 @@ async def get_repository(repo_type: Type):
     Returns:
         Repository instance
     """
-    async with async_session_factory() as session:
-        return repo_type(session)
+    # Create a new session directly (without context manager)
+    # This allows the repository to manage the session lifecycle
+    session = async_session_factory()
+    return repo_type(session)
+
+
+# Repository management functions
+async def close_repository(repository: Any) -> None:
+    """
+    Close a repository's session.
+    
+    Args:
+        repository: Repository instance
+    """
+    if hasattr(repository, 'session'):
+        await repository.session.close()

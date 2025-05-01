@@ -4,7 +4,7 @@ Repository for message template operations.
 """
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any, Tuple
-from uuid import uuid4
+from app.utils.ids import generate_prefixed_id, IDPrefix
 import re
 
 from sqlalchemy import select, update, and_, or_, desc, func
@@ -52,8 +52,9 @@ class TemplateRepository(BaseRepository[MessageTemplate, MessageTemplateCreate, 
             variables = list(set(re.findall(pattern, content)))
         
         # Create template
+        template_id = generate_prefixed_id(IDPrefix.TEMPLATE)
         template = MessageTemplate(
-            id=str(uuid4()),
+            id=template_id,
             name=name,
             content=content,
             description=description,

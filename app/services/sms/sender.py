@@ -236,7 +236,7 @@ class SMSSender:
             "status": batch.status,
             "created_at": batch.created_at
         }
-    
+
     async def _process_batch(
         self,
         *,
@@ -247,7 +247,7 @@ class SMSSender:
         options: BatchOptions
     ) -> None:
         """
-        Process a batch of messages in background.
+        Process a batch of messages with improved concurrency handling.
         
         Args:
             messages: List of messages to send
@@ -260,12 +260,14 @@ class SMSSender:
         successful = 0
         failed = 0
         
+        # Create a semaphore to limit concurrent processing
+        send_semaphore = asyncio.Semaphore(5)  # Limit concurrent sends
+        
         try:
-            # Calculate optimal chunk size based on total messages
+            # Calculate optimal chunk size - smaller for better reliability
             total_messages = len(messages)
-            chunk_size = min(50, max(10, total_messages // 20))  # Dynamic sizing
+            chunk_size = min(20, max(5, total_messages // 10))  # Smaller chunks
             
-            # Create DB connection pool metrics
             logger.info(f"Processing batch {batch_id} with {total_messages} messages in chunks of {chunk_size}")
             
             # Process in chunks for better performance
@@ -274,21 +276,19 @@ class SMSSender:
                 chunk_successful = 0
                 chunk_failed = 0
                 
-                # Create all message records first in a single transaction (bulk insert)
-                # This is critical for high volume - create DB records efficiently
-                db_messages = []
-                try:
-                    # Get a fresh repository for this chunk
-                    from app.db.session import get_repository
-                    message_repo = await get_repository(MessageRepository)
-                    
-                    for msg in chunk:
+                # Process each message in the chunk with its own session
+                for msg in chunk:
+                    try:
+                        # Get a fresh repository for each message
+                        from app.db.session import get_repository
+                        message_repo = await get_repository(MessageRepository)
+                        
                         # Build metadata
                         metadata = {"batch_id": batch_id}
                         if campaign_id:
                             metadata["campaign_id"] = campaign_id
                         
-                        # Create message in database
+                        # Create message in database with explicit transaction
                         db_message = await message_repo.create_message(
                             phone_number=msg.phone_number,
                             message_text=msg.message,
@@ -299,51 +299,58 @@ class SMSSender:
                             batch_id=batch_id,
                             campaign_id=campaign_id
                         )
-                        db_messages.append(db_message)
-                except Exception as e:
-                    logger.error(f"Error creating messages for chunk: {e}")
-                    chunk_failed += len(chunk)
-                    continue
-                
-                # Now process the sending for non-scheduled messages with concurrent tasks
-                send_tasks = []
-                for db_message in db_messages:
-                    # Skip scheduled messages - they'll be processed by scheduler
-                    if db_message.scheduled_at and db_message.scheduled_at > datetime.now(timezone.utc):
-                        chunk_successful += 1
-                        continue
-                    
-                    # Create task to send via gateway
-                    send_tasks.append(
-                        self._send_message_with_error_handling(
-                            db_message=db_message,
-                            phone_number=db_message.phone_number,
-                            message_text=db_message.message
-                        )
-                    )
-                
-                # Execute send tasks with controlled concurrency
-                if send_tasks:
-                    # Process in sub-chunks for very large batches
-                    send_chunk_size = min(10, len(send_tasks))
-                    for j in range(0, len(send_tasks), send_chunk_size):
-                        sub_chunk = send_tasks[j:j+send_chunk_size]
-                        results = await asyncio.gather(*sub_chunk, return_exceptions=True)
+
+                        # Skip scheduled messages
+                        if db_message.scheduled_at and db_message.scheduled_at > datetime.now(timezone.utc):
+                            chunk_successful += 1
+                            continue
                         
-                        # Process results
-                        for result in results:
-                            if isinstance(result, Exception):
-                                chunk_failed += 1
-                                # Log but continue
-                                logger.error(f"Send error in batch {batch_id}: {str(result)}")
-                            else:
+                        # Process this message
+                        async with send_semaphore:
+                            try:
+                                # Process with fresh repository for each send
+                                result = await self._send_to_gateway(
+                                    phone_number=db_message.phone_number,
+                                    message_text=db_message.message,
+                                    custom_id=db_message.custom_id
+                                )
+                                
+                                # Get a fresh repository for status update
+                                status_repo = await get_repository(MessageRepository)
+                                
+                                # Update status with fresh repository
+                                await status_repo.update_message_status(
+                                    message_id=db_message.id,
+                                    status=result.get("status", MessageStatus.PENDING),
+                                    event_type="gateway_response",
+                                    gateway_message_id=result.get("gateway_message_id"),
+                                    data=result
+                                )
+                                
                                 chunk_successful += 1
+                            except Exception as e:
+                                # Update failure status with fresh repository
+                                try:
+                                    error_repo = await get_repository(MessageRepository)
+                                    
+                                    await error_repo.update_message_status(
+                                        message_id=db_message.id,
+                                        status=MessageStatus.FAILED,
+                                        event_type="send_error",
+                                        reason=str(e),
+                                        data={"error": str(e)}
+                                    )
+                                except Exception as update_error:
+                                    logger.error(f"Failed to update error status for message {db_message.id}: {update_error}")
+                                
+                                chunk_failed += 1
+                                logger.error(f"Send error in batch {batch_id}: {e}")
+                                
+                    except Exception as e:
+                        logger.error(f"Error processing message in chunk: {e}")
+                        chunk_failed += 1
                         
-                        # Small delay between sub-chunks
-                        if j + send_chunk_size < len(send_tasks):
-                            await asyncio.sleep(0.1)
-                
-                # Update batch progress with fresh session
+                # Update batch progress
                 try:
                     await self._update_batch_progress_safe(
                         batch_id=batch_id,
@@ -363,11 +370,11 @@ class SMSSender:
                 except Exception as e:
                     logger.error(f"Error updating batch progress: {e}")
                 
-                # Add delay between chunks to avoid overwhelming the system
+                # Add delay between chunks
                 if i + chunk_size < total_messages:
-                    await asyncio.sleep(options.delay_between_messages)
+                    await asyncio.sleep(options.delay_between_messages * 2)  # Double the delay for stability
             
-            # Final update with fresh session - ensure status is updated correctly
+            # Final update with status
             final_status = MessageStatus.PROCESSED
             if processed == 0:
                 final_status = MessageStatus.FAILED
@@ -619,8 +626,14 @@ class SMSSender:
                 is_encrypted=is_encrypted
             )
             
+            # Get a fresh repository for status update
+            from app.db.session import get_repository
+            from app.db.repositories.messages import MessageRepository
+            
+            status_repo = await get_repository(MessageRepository)
+            
             # Update message status
-            await self.message_repository.update_message_status(
+            await status_repo.update_message_status(
                 message_id=db_message.id,
                 status=result.get("status", MessageStatus.PENDING),
                 event_type="gateway_response",
@@ -631,21 +644,26 @@ class SMSSender:
             return result
             
         except Exception as e:
-            # Handle error
-            error_status = MessageStatus.FAILED
-            error_message = str(e)
-            logger.error(f"Error sending message {db_message.id}: {error_message}")
+            # Update status to failed with a fresh repository
+            try:
+                from app.db.session import get_repository
+                from app.db.repositories.messages import MessageRepository
+                
+                error_repo = await get_repository(MessageRepository)
+                
+                await error_repo.update_message_status(
+                    message_id=db_message.id,
+                    status=MessageStatus.FAILED,
+                    event_type="send_error",
+                    reason=str(e),
+                    data={"error": str(e)}
+                )
+            except Exception as update_error:
+                # If even the error update fails, just log it
+                logger.error(f"Failed to update error status for message {db_message.id}: {update_error}")
             
-            # Update message status
-            await self.message_repository.update_message_status(
-                message_id=db_message.id,
-                status=error_status,
-                event_type="send_error",
-                reason=error_message,
-                data={"error": error_message}
-            )
-            
-            # Re-raise to be caught by caller
+            # Log and re-raise
+            logger.error(f"Error sending message {db_message.id}: {e}")
             raise
     
     async def schedule_batch_from_numbers(
