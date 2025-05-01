@@ -12,9 +12,11 @@ from httpx import HTTPStatusError
 from app.core.config import settings
 from app.core.exceptions import ValidationError, SMSGatewayError, RetryableError, SMSAuthError
 from app.utils.phone import validate_phone
+from app.db.repositories.templates import TemplateRepository
 from app.db.repositories.messages import MessageRepository
 from app.schemas.message import MessageCreate, MessageStatus, BatchMessageRequest, BatchOptions
 from app.services.event_bus.events import EventType
+from app.db.session import get_repository_context, get_repository, get_session
 
 # Lazy import of android_sms_gateway to avoid import errors if not installed
 try:
@@ -34,7 +36,6 @@ class SMSSender:
     
     def __init__(
         self,
-        message_repository: MessageRepository,
         event_bus: Any
     ):
         """
@@ -44,7 +45,6 @@ class SMSSender:
             message_repository: Repository for message storage
             event_bus: Event bus for publishing events
         """
-        self.message_repository = message_repository
         self.event_bus = event_bus
         self._semaphore = asyncio.Semaphore(10)  # Limit concurrent requests
         self._last_send_time = 0
@@ -99,79 +99,81 @@ class SMSSender:
         # Generate id to track message in the system.
         custom_id = custom_id or str(uuid.uuid4())
 
-        # Create message in database
-        db_message = await self.message_repository.create_message(
-            phone_number=formatted_number,
-            message_text=message_text,
-            user_id=user_id,
-            custom_id=custom_id,
-            scheduled_at=scheduled_at,
-            metadata=metadata or {},
-            campaign_id=campaign_id
-        )
-        
-        # If scheduled for future, return message details
-        if scheduled_at and scheduled_at > datetime.now(timezone.utc):
-            logger.info(f"Message {db_message.id} scheduled for {scheduled_at}")
-            
-            # Publish event
-            await self.event_bus.publish(
-                EventType.MESSAGE_SCHEDULED,
-                {
-                    "message_id": db_message.id,
-                    "phone_number": formatted_number,
-                    "scheduled_at": scheduled_at.isoformat(),
-                    "user_id": user_id
-                }
-            )
-            
-            return db_message.dict()
-        
-        # Otherwise, send immediately
-        try:
-            result = await self._send_to_gateway(
+        # Use context manager for repository
+        async with get_repository_context(MessageRepository) as repo:
+            # Create message in database
+            db_message = await repo.create_message(
                 phone_number=formatted_number,
                 message_text=message_text,
-                custom_id=db_message.custom_id,
-                priority=priority,
-                ttl=ttl,
-                sim_number=sim_number,
-                is_encrypted=is_encrypted
+                user_id=user_id,
+                custom_id=custom_id,
+                scheduled_at=scheduled_at,
+                metadata=metadata or {},
+                campaign_id=campaign_id
             )
             
-            # Update message status
-            await self.message_repository.update_message_status(
-                message_id=db_message.id,
-                status=result.get("status", MessageStatus.PENDING),
-                event_type="gateway_response",
-                gateway_message_id=result.get("gateway_message_id"),
-                data=result
-            )
+            # If scheduled for future, return message details
+            if scheduled_at and scheduled_at > datetime.now(timezone.utc):
+                logger.info(f"Message {db_message.id} scheduled for {scheduled_at}")
+                
+                # Publish event
+                await self.event_bus.publish(
+                    EventType.MESSAGE_SCHEDULED,
+                    {
+                        "message_id": db_message.id,
+                        "phone_number": formatted_number,
+                        "scheduled_at": scheduled_at.isoformat(),
+                        "user_id": user_id
+                    }
+                )
+                
+                return db_message.dict()
             
-            # Get updated message
-            updated_message = await self.message_repository.get_by_id(db_message.id)
-            return updated_message.dict()
-            
-        except Exception as e:
-            # Handle error
-            error_status = MessageStatus.FAILED
-            error_message = str(e)
-            logger.error(f"Error sending message {db_message.id}: {error_message}")
-            
-            # Update message status
-            await self.message_repository.update_message_status(
-                message_id=db_message.id,
-                status=error_status,
-                event_type="send_error",
-                reason=error_message,
-                data={"error": error_message}
-            )
-            
-            # Re-raise as SMSGatewayError
-            if isinstance(e, RetryableError):
-                raise SMSGatewayError(message=error_message, code="GATEWAY_ERROR", status_code=503)
-            else:
-                raise SMSGatewayError(message=error_message, code="GATEWAY_ERROR")
+            # Otherwise, send immediately
+            try:
+                result = await self._send_to_gateway(
+                    phone_number=formatted_number,
+                    message_text=message_text,
+                    custom_id=db_message.custom_id,
+                    priority=priority,
+                    ttl=ttl,
+                    sim_number=sim_number,
+                    is_encrypted=is_encrypted
+                )
+                
+                # Update message status
+                await repo.update_message_status(
+                    message_id=db_message.id,
+                    status=result.get("status", MessageStatus.PENDING),
+                    event_type="gateway_response",
+                    gateway_message_id=result.get("gateway_message_id"),
+                    data=result
+                )
+                
+                # Get updated message
+                updated_message = await repo.get_by_id(db_message.id)
+                return updated_message.dict()
+                
+            except Exception as e:
+                # Handle error
+                error_status = MessageStatus.FAILED
+                error_message = str(e)
+                logger.error(f"Error sending message {db_message.id}: {error_message}")
+                
+                # Update message status
+                await repo.update_message_status(
+                    message_id=db_message.id,
+                    status=error_status,
+                    event_type="send_error",
+                    reason=error_message,
+                    data={"error": error_message}
+                )
+                
+                # Re-raise as SMSGatewayError
+                if isinstance(e, RetryableError):
+                    raise SMSGatewayError(message=error_message, code="GATEWAY_ERROR", status_code=503)
+                else:
+                    raise SMSGatewayError(message=error_message, code="GATEWAY_ERROR")
     
     async def send_batch(
         self,
@@ -208,34 +210,35 @@ class SMSSender:
                 retry_failed=True
             )
         
-        # Create batch in database
-        batch = await self.message_repository.create_batch(
-            user_id=user_id,
-            name=f"Batch {datetime.now(timezone.utc).isoformat()}",
-            total=len(messages)
-        )
-        
-        # Process in background
-        asyncio.create_task(
-            self._process_batch(
-                messages=messages,
+        # Create batch in database using context manager
+        async with get_repository_context(MessageRepository) as repo:
+            batch = await repo.create_batch(
                 user_id=user_id,
-                batch_id=batch.id,
-                campaign_id=campaign_id,
-                options=options
+                name=f"Batch {datetime.now(timezone.utc).isoformat()}",
+                total=len(messages)
             )
-        )
-        
-        # Return batch details
-        return {
-            "batch_id": batch.id,
-            "total": batch.total,
-            "processed": 0,
-            "successful": 0,
-            "failed": 0,
-            "status": batch.status,
-            "created_at": batch.created_at
-        }
+            
+            # Process in background
+            asyncio.create_task(
+                self._process_batch(
+                    messages=messages,
+                    user_id=user_id,
+                    batch_id=batch.id,
+                    campaign_id=campaign_id,
+                    options=options
+                )
+            )
+            
+            # Return batch details
+            return {
+                "batch_id": batch.id,
+                "total": batch.total,
+                "processed": 0,
+                "successful": 0,
+                "failed": 0,
+                "status": batch.status,
+                "created_at": batch.created_at
+            }
 
     async def _process_batch(
         self,
@@ -273,102 +276,43 @@ class SMSSender:
             # Process in chunks for better performance
             for i in range(0, total_messages, chunk_size):
                 chunk = messages[i:i+chunk_size]
-                chunk_successful = 0
-                chunk_failed = 0
-                
-                # Process each message in the chunk with its own session
-                for msg in chunk:
-                    try:
-                        # Get a fresh repository for each message
-                        from app.db.session import get_repository
-                        message_repo = await get_repository(MessageRepository)
-                        
-                        # Build metadata
-                        metadata = {"batch_id": batch_id}
-                        if campaign_id:
-                            metadata["campaign_id"] = campaign_id
-                        
-                        # Create message in database with explicit transaction
-                        db_message = await message_repo.create_message(
-                            phone_number=msg.phone_number,
-                            message_text=msg.message,
-                            user_id=user_id,
-                            custom_id=msg.custom_id or str(uuid.uuid4()),
-                            scheduled_at=msg.scheduled_at,
-                            metadata=metadata,
-                            batch_id=batch_id,
-                            campaign_id=campaign_id
-                        )
 
-                        # Skip scheduled messages
-                        if db_message.scheduled_at and db_message.scheduled_at > datetime.now(timezone.utc):
-                            chunk_successful += 1
-                            continue
-                        
-                        # Process this message
-                        async with send_semaphore:
-                            try:
-                                # Process with fresh repository for each send
-                                result = await self._send_to_gateway(
-                                    phone_number=db_message.phone_number,
-                                    message_text=db_message.message,
-                                    custom_id=db_message.custom_id
-                                )
-                                
-                                # Get a fresh repository for status update
-                                status_repo = await get_repository(MessageRepository)
-                                
-                                # Update status with fresh repository
-                                await status_repo.update_message_status(
-                                    message_id=db_message.id,
-                                    status=result.get("status", MessageStatus.PENDING),
-                                    event_type="gateway_response",
-                                    gateway_message_id=result.get("gateway_message_id"),
-                                    data=result
-                                )
-                                
-                                chunk_successful += 1
-                            except Exception as e:
-                                # Update failure status with fresh repository
-                                try:
-                                    error_repo = await get_repository(MessageRepository)
-                                    
-                                    await error_repo.update_message_status(
-                                        message_id=db_message.id,
-                                        status=MessageStatus.FAILED,
-                                        event_type="send_error",
-                                        reason=str(e),
-                                        data={"error": str(e)}
-                                    )
-                                except Exception as update_error:
-                                    logger.error(f"Failed to update error status for message {db_message.id}: {update_error}")
-                                
-                                chunk_failed += 1
-                                logger.error(f"Send error in batch {batch_id}: {e}")
-                                
-                    except Exception as e:
-                        logger.error(f"Error processing message in chunk: {e}")
-                        chunk_failed += 1
-                        
-                # Update batch progress
-                try:
-                    await self._update_batch_progress_safe(
+                # Process all messages in this chunk concurrently
+                tasks = [
+                    self._process_single_message_safely(
+                        message=msg,
+                        user_id=user_id,
+                        batch_id=batch_id,
+                        campaign_id=campaign_id,
+                        semaphore=send_semaphore
+                    )
+                    for msg in chunk
+                ]
+            
+                # Wait for all tasks in this chunk
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                # Count successes and failures
+                chunk_successful = sum(1 for r in results if r is True)
+                chunk_failed = sum(1 for r in results if r is False or isinstance(r, Exception))
+
+                # Update batch progress with a proper context-managed repository
+                async with get_repository_context(MessageRepository) as repo:
+                    await repo.update_batch_progress(
                         batch_id=batch_id,
                         increment_processed=len(chunk),
                         increment_successful=chunk_successful,
                         increment_failed=chunk_failed
                     )
-                    
-                    # Update counters
-                    processed += len(chunk)
-                    successful += chunk_successful
-                    failed += chunk_failed
-                    
-                    # Report progress
-                    progress_pct = (processed / total_messages) * 100
-                    logger.info(f"Batch {batch_id} progress: {progress_pct:.1f}% ({processed}/{total_messages})")
-                except Exception as e:
-                    logger.error(f"Error updating batch progress: {e}")
+
+                # Update counters
+                processed += len(chunk)
+                successful += chunk_successful
+                failed += chunk_failed
+
+                # Report progress
+                progress_pct = (processed / total_messages) * 100
+                logger.info(f"Batch {batch_id} progress: {progress_pct:.1f}% ({processed}/{total_messages})")
                 
                 # Add delay between chunks
                 if i + chunk_size < total_messages:
@@ -381,12 +325,13 @@ class SMSSender:
             elif failed > 0:
                 final_status = "partial"
             
-            await self._update_batch_progress_safe(
-                batch_id=batch_id,
-                status=final_status
-            )
+            async with get_repository_context(MessageRepository) as repo:
+                await repo.update_batch_progress(
+                    batch_id=batch_id,
+                    status=final_status
+                )
             
-            # Publish event
+            # Publish event - this doesn't need a database connection
             await self.event_bus.publish(
                 EventType.BATCH_COMPLETED,
                 {
@@ -404,36 +349,101 @@ class SMSSender:
         except Exception as e:
             logger.error(f"Batch processing error: {e}", exc_info=True)
             
-            # Try to update batch status to error state
+            # Update batch status to error state with proper connection handling
             try:
-                await self._update_batch_progress_safe(
-                    batch_id=batch_id,
-                    status=MessageStatus.FAILED
-                )
+                async with get_repository_context(MessageRepository) as repo:
+                    await repo.update_batch_progress(
+                        batch_id=batch_id,
+                        status=MessageStatus.FAILED
+                    )
             except Exception as update_error:
                 logger.error(f"Failed to update batch status after error: {update_error}")
 
-    async def _update_batch_progress_safe(self, batch_id: str, **kwargs) -> None:
+    # This method looks good with your changes!
+    async def _process_single_message_safely(
+        self,
+        *,
+        message: MessageCreate,
+        user_id: str,
+        batch_id: str,
+        campaign_id: Optional[str] = None,
+        semaphore: asyncio.Semaphore
+    ) -> bool:
         """
-        Update batch progress with a fresh session to avoid conflicts.
-        Critical for high-volume processing.
+        Process a single message with proper connection handling.
+        
+        Args:
+            message: Message to process
+            user_id: User ID
+            batch_id: Batch ID
+            campaign_id: Optional campaign ID
+            semaphore: Semaphore for concurrency control
+            
+        Returns:
+            bool: True if successful, False if failed
         """
+        # Use the context manager to ensure proper session lifecycle
         try:
-            # Get a fresh repository to avoid session conflicts
-            from app.db.session import get_repository
-            from app.db.repositories.messages import MessageRepository
-            
-            # Create a new repository instance with a fresh session
-            message_repo = await get_repository(MessageRepository)
-            
-            # Update the batch progress
-            await message_repo.update_batch_progress(
-                batch_id=batch_id,
-                **kwargs
-            )
+            async with get_repository_context(MessageRepository) as repo:
+                # Build metadata
+                metadata = {"batch_id": batch_id}
+                if campaign_id:
+                    metadata["campaign_id"] = campaign_id
+                
+                # Create message in database
+                db_message = await repo.create_message(
+                    phone_number=message.phone_number,
+                    message_text=message.message,
+                    user_id=user_id,
+                    custom_id=message.custom_id or str(uuid.uuid4()),
+                    scheduled_at=message.scheduled_at,
+                    metadata=metadata,
+                    batch_id=batch_id,
+                    campaign_id=campaign_id
+                )
+
+                # Skip scheduled messages
+                if db_message.scheduled_at and db_message.scheduled_at > datetime.now(timezone.utc):
+                    return True
+                
+                # Process this message with rate limiting
+                async with semaphore:
+                    # Send message
+                    result = await self._send_to_gateway(
+                        phone_number=db_message.phone_number,
+                        message_text=db_message.message,
+                        custom_id=db_message.custom_id
+                    )
+                    
+                    # Update message status in the same session
+                    await repo.update_message_status(
+                        message_id=db_message.id,
+                        status=result.get("status", MessageStatus.PENDING),
+                        event_type="gateway_response",
+                        gateway_message_id=result.get("gateway_message_id"),
+                        data=result
+                    )
+                    
+                    return True
+                    
         except Exception as e:
-            logger.error(f"Error in _update_batch_progress_safe for batch {batch_id}: {e}")
-            # Don't re-raise - we want batch processing to continue even if updates fail
+            logger.error(f"Error processing message: {e}")
+            
+            # Try to record the failure if we have a message
+            if 'db_message' in locals():
+                try:
+                    async with get_repository_context(MessageRepository) as err_repo:
+                        await err_repo.update_message_status(
+                            message_id=db_message.id,
+                            status=MessageStatus.FAILED,
+                            event_type="send_error",
+                            reason=str(e),
+                            data={"error": str(e)}
+                        )
+                except Exception as update_error:
+                    logger.error(f"Failed to update error status: {update_error}")
+            
+            return False
 
     async def _process_single_message(
         self,
@@ -543,43 +553,50 @@ class SMSSender:
         """
         # Create tasks for all messages
         tasks = []
-        for msg in messages:
-            try:
-                # Create database entries first to get IDs
-                db_message = await self.message_repository.create_message(
-                    phone_number=msg["phone_number"],
-                    message_text=msg["message_text"],
-                    user_id=user_id,
-                    custom_id=msg.get("custom_id"),
-                    scheduled_at=msg.get("scheduled_at"),
-                    metadata=msg.get("metadata", {}),
-                    campaign_id=campaign_id
-                )
-                
-                # Skip if scheduled for the future
-                if db_message.scheduled_at and db_message.scheduled_at > datetime.now(timezone.utc):
-                    tasks.append(asyncio.create_task(
-                        asyncio.sleep(0)  # Dummy task for scheduled messages
-                    ))
-                    continue
-                    
-                # Create task to send via gateway
-                task = asyncio.create_task(
-                    self._send_message_with_error_handling(
-                        db_message=db_message,
+        created_messages = []
+        
+        # Use a single session for all initial creation
+        async with get_repository_context(MessageRepository) as repo:
+            for msg in messages:
+                try:
+                    # Create database entries first to get IDs
+                    db_message = await repo.create_message(
                         phone_number=msg["phone_number"],
                         message_text=msg["message_text"],
-                        priority=msg.get("priority", 0),
-                        ttl=msg.get("ttl"),
-                        sim_number=msg.get("sim_number"),
-                        is_encrypted=msg.get("is_encrypted", False)
+                        user_id=user_id,
+                        custom_id=msg.get("custom_id"),
+                        scheduled_at=msg.get("scheduled_at"),
+                        metadata=msg.get("metadata", {}),
+                        campaign_id=campaign_id
                     )
+                    
+                    created_messages.append(db_message)
+                    
+                except Exception as e:
+                    logger.error(f"Error creating message: {e}")
+        
+        # Process messages with separate tasks
+        for db_message in created_messages:
+            # Skip if scheduled for the future
+            if db_message.scheduled_at and db_message.scheduled_at > datetime.now(timezone.utc):
+                tasks.append(asyncio.create_task(
+                    asyncio.sleep(0)  # Dummy task for scheduled messages
+                ))
+                continue
+                
+            # Create task to send via gateway
+            task = asyncio.create_task(
+                self._send_message_with_error_handling(
+                    db_message=db_message,
+                    phone_number=db_message.phone_number,
+                    message_text=db_message.message,
+                    priority=0,  # Default priority
+                    ttl=None,
+                    sim_number=None,
+                    is_encrypted=False
                 )
-                tasks.append(task)
-            
-            except Exception as e:
-                logger.error(f"Error creating or queuing message: {e}")
-                await self.message_repository.session.rollback()
+            )
+            tasks.append(task)
         
         # Wait for all tasks to complete
         if tasks:
@@ -626,38 +643,30 @@ class SMSSender:
                 is_encrypted=is_encrypted
             )
             
-            # Get a fresh repository for status update
-            from app.db.session import get_repository
-            from app.db.repositories.messages import MessageRepository
-            
-            status_repo = await get_repository(MessageRepository)
-            
-            # Update message status
-            await status_repo.update_message_status(
-                message_id=db_message.id,
-                status=result.get("status", MessageStatus.PENDING),
-                event_type="gateway_response",
-                gateway_message_id=result.get("gateway_message_id"),
-                data=result
-            )
+            # Update status with a fresh session
+            async with get_repository_context(MessageRepository) as repo:
+                # Update message status
+                await repo.update_message_status(
+                    message_id=db_message.id,
+                    status=result.get("status", MessageStatus.PENDING),
+                    event_type="gateway_response",
+                    gateway_message_id=result.get("gateway_message_id"),
+                    data=result
+                )
             
             return result
             
         except Exception as e:
-            # Update status to failed with a fresh repository
+            # Update status to failed with a fresh session
             try:
-                from app.db.session import get_repository
-                from app.db.repositories.messages import MessageRepository
-                
-                error_repo = await get_repository(MessageRepository)
-                
-                await error_repo.update_message_status(
-                    message_id=db_message.id,
-                    status=MessageStatus.FAILED,
-                    event_type="send_error",
-                    reason=str(e),
-                    data={"error": str(e)}
-                )
+                async with get_repository_context(MessageRepository) as repo:
+                    await repo.update_message_status(
+                        message_id=db_message.id,
+                        status=MessageStatus.FAILED,
+                        event_type="send_error",
+                        reason=str(e),
+                        data={"error": str(e)}
+                    )
             except Exception as update_error:
                 # If even the error update fails, just log it
                 logger.error(f"Failed to update error status for message {db_message.id}: {update_error}")
@@ -737,22 +746,23 @@ class SMSSender:
         Returns:
             Dict: Message details or None if not found
         """
-        # Try to get by ID first
-        message = await self.message_repository.get_by_id(message_id)
-        
-        # If not found, try custom ID
-        if not message:
-            message = await self.message_repository.get_by_custom_id(message_id)
+        async with get_repository_context(MessageRepository) as repo:
+            # Try to get by ID first
+            message = await repo.get_by_id(message_id)
             
-        # If not found, try gateway ID
-        if not message:
-            message = await self.message_repository.get_by_gateway_id(message_id)
-        
-        # Check authorization
-        if message and str(message.user_id) != str(user_id):
-            return None
-        
-        return message.dict() if message else None
+            # If not found, try custom ID
+            if not message:
+                message = await repo.get_by_custom_id(message_id)
+                
+            # If not found, try gateway ID
+            if not message:
+                message = await repo.get_by_gateway_id(message_id)
+            
+            # Check authorization
+            if message and str(message.user_id) != str(user_id):
+                return None
+            
+            return message.dict() if message else None
     
     async def list_messages(
         self,
@@ -777,22 +787,23 @@ class SMSSender:
         if not user_id:
             return [], 0
         
-        # Get messages
-        messages, total = await self.message_repository.list_messages_for_user(
-            user_id=user_id,
-            status=filters.get("status"),
-            phone_number=filters.get("phone_number"),
-            from_date=filters.get("from_date"),
-            to_date=filters.get("to_date"),
-            campaign_id=filters.get("campaign_id"),  # Support filtering by campaign
-            skip=skip,
-            limit=limit
-        )
-        
-        # Convert to dict
-        message_dicts = [message.dict() for message in messages]
-        
-        return message_dicts, total
+        async with get_repository_context(MessageRepository) as repo:
+            # Get messages
+            messages, total = await repo.list_messages_for_user(
+                user_id=user_id,
+                status=filters.get("status"),
+                phone_number=filters.get("phone_number"),
+                from_date=filters.get("from_date"),
+                to_date=filters.get("to_date"),
+                campaign_id=filters.get("campaign_id"),  # Support filtering by campaign
+                skip=skip,
+                limit=limit
+            )
+            
+            # Convert to dict
+            message_dicts = [message.dict() for message in messages]
+            
+            return message_dicts, total
     
     async def update_message_status(
         self,
@@ -814,25 +825,26 @@ class SMSSender:
         Returns:
             Dict: Updated message or None if not found
         """
-        # Get message
-        message = await self.message_repository.get_by_id(message_id)
-        if not message:
-            return None
-        
-        # Check authorization
-        if str(message.user_id) != str(user_id):
-            return None
-        
-        # Update status
-        updated = await self.message_repository.update_message_status(
-            message_id=message_id,
-            status=status,
-            event_type="manual_update",
-            reason=reason,
-            data={"updated_by": user_id}
-        )
-        
-        return updated.dict() if updated else None
+        async with get_repository_context(MessageRepository) as repo:
+            # Get message
+            message = await repo.get_by_id(message_id)
+            if not message:
+                return None
+            
+            # Check authorization
+            if str(message.user_id) != str(user_id):
+                return None
+            
+            # Update status
+            updated = await repo.update_message_status(
+                message_id=message_id,
+                status=status,
+                event_type="manual_update",
+                reason=reason,
+                data={"updated_by": user_id}
+            )
+            
+            return updated.dict() if updated else None
     
     async def delete_message(self, message_id: str, user_id: str) -> bool:
         """
@@ -845,17 +857,18 @@ class SMSSender:
         Returns:
             bool: True if deleted, False otherwise
         """
-        # Get message
-        message = await self.message_repository.get_by_id(message_id)
-        if not message:
-            return False
-        
-        # Check authorization
-        if str(message.user_id) != str(user_id):
-            return False
-        
-        # Delete message
-        return await self.message_repository.delete(id=message_id)
+        async with get_repository_context(MessageRepository) as repo:
+            # Get message
+            message = await repo.get_by_id(message_id)
+            if not message:
+                return False
+            
+            # Check authorization
+            if str(message.user_id) != str(user_id):
+                return False
+            
+            # Delete message
+            return await repo.delete(id=message_id)
     
     async def get_task_status(self, task_id: str, user_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -868,35 +881,36 @@ class SMSSender:
         Returns:
             Dict: Task status or None if not found
         """
-        # Get batch
-        batch = await self.message_repository.get_by_id(task_id)
-        if not batch:
-            return None
-        
-        # Check authorization
-        if str(batch.user_id) != str(user_id):
-            return None
-        
-        # Get message stats
-        messages, total = await self.message_repository.get_messages_for_batch(
-            batch_id=task_id,
-            limit=5  # Just get the first few for preview
-        )
-        
-        # Convert to dict
-        message_previews = [message.dict() for message in messages]
-        
-        return {
-            "id": batch.id,
-            "status": batch.status,
-            "total": batch.total,
-            "processed": batch.processed,
-            "successful": batch.successful,
-            "failed": batch.failed,
-            "created_at": batch.created_at,
-            "completed_at": batch.completed_at,
-            "message_previews": message_previews
-        }
+        async with get_repository_context(MessageRepository) as repo:
+            # Get batch
+            batch = await repo.get_by_id(task_id)
+            if not batch:
+                return None
+            
+            # Check authorization
+            if str(batch.user_id) != str(user_id):
+                return None
+            
+            # Get message stats
+            messages, total = await repo.get_messages_for_batch(
+                batch_id=task_id,
+                limit=5  # Just get the first few for preview
+            )
+            
+            # Convert to dict
+            message_previews = [message.dict() for message in messages]
+            
+            return {
+                "id": batch.id,
+                "status": batch.status,
+                "total": batch.total,
+                "processed": batch.processed,
+                "successful": batch.successful,
+                "failed": batch.failed,
+                "created_at": batch.created_at,
+                "completed_at": batch.completed_at,
+                "message_previews": message_previews
+            }
 
     async def _send_to_gateway(
         self,
@@ -1059,35 +1073,31 @@ class SMSSender:
             ValidationError: If phone number is invalid or template is not found
             SMSGatewayError: If there's an error sending the message
         """
-        # Get template repository
-        from app.db.session import get_repository
-        from app.db.repositories.templates import TemplateRepository
-        
-        template_repo = await get_repository(TemplateRepository)
-        
-        # Get template
-        template = await template_repo.get_by_id(template_id)
-        if not template:
-            raise ValidationError(message=f"Template {template_id} not found")
-        
-        # Check authorization
-        if template.user_id != user_id:
-            raise ValidationError(message="Not authorized to use this template")
-        
-        # Apply template
-        message_text = await template_repo.apply_template(
-            template_id=template_id,
-            variables=variables
-        )
-        
-        # Check for missing variables
-        import re
-        missing_vars = re.findall(r"{{([a-zA-Z0-9_]+)}}", message_text)
-        if missing_vars:
-            raise ValidationError(
-                message="Missing template variables", 
-                details={"missing_variables": missing_vars}
+        # Use context manager for template repository
+        async with get_repository_context(TemplateRepository) as template_repo:
+            # Get template
+            template = await template_repo.get_by_id(template_id)
+            if not template:
+                raise ValidationError(message=f"Template {template_id} not found")
+            
+            # Check authorization
+            if template.user_id != user_id:
+                raise ValidationError(message="Not authorized to use this template")
+            
+            # Apply template
+            message_text = await template_repo.apply_template(
+                template_id=template_id,
+                variables=variables
             )
+            
+            # Check for missing variables
+            import re
+            missing_vars = re.findall(r"{{([a-zA-Z0-9_]+)}}", message_text)
+            if missing_vars:
+                raise ValidationError(
+                    message="Missing template variables", 
+                    details={"missing_variables": missing_vars}
+                )
         
         # Send message
         metadata = {
@@ -1131,56 +1141,52 @@ class SMSSender:
             ValidationError: If template is not found or recipients format is invalid
             SMSGatewayError: If there's an error sending the messages
         """
-        # Get template repository
-        from app.db.session import get_repository
-        from app.db.repositories.templates import TemplateRepository
-        
-        template_repo = await get_repository(TemplateRepository)
-        
-        # Get template
-        template = await template_repo.get_by_id(template_id)
-        if not template:
-            raise ValidationError(message=f"Template {template_id} not found")
-        
-        # Check authorization
-        if template.user_id != user_id:
-            raise ValidationError(message="Not authorized to use this template")
-        
-        # Validate recipients format
-        for idx, recipient in enumerate(recipients):
-            if "phone_number" not in recipient:
-                raise ValidationError(message=f"Recipient at index {idx} is missing 'phone_number'")
-            if "variables" not in recipient:
-                raise ValidationError(message=f"Recipient at index {idx} is missing 'variables'")
-        
-        # Create messages for each recipient
-        messages = []
-        for recipient in recipients:
-            # Apply template for each recipient
-            message_text = await template_repo.apply_template(
-                template_id=template_id,
-                variables=recipient["variables"]
-            )
+        # Use context manager for template repository
+        async with get_repository_context(TemplateRepository) as template_repo:
+            # Get template
+            template = await template_repo.get_by_id(template_id)
+            if not template:
+                raise ValidationError(message=f"Template {template_id} not found")
             
-            # Check for missing variables
-            import re
-            missing_vars = re.findall(r"{{([a-zA-Z0-9_]+)}}", message_text)
-            if missing_vars:
-                # Skip this recipient but continue with others
-                continue
+            # Check authorization
+            if template.user_id != user_id:
+                raise ValidationError(message="Not authorized to use this template")
             
-            # Create message
-            messages.append(
-                MessageCreate(
-                    phone_number=recipient["phone_number"],
-                    message=message_text,
-                    scheduled_at=scheduled_at,
-                    custom_id=recipient.get("custom_id")
+            # Validate recipients format
+            for idx, recipient in enumerate(recipients):
+                if "phone_number" not in recipient:
+                    raise ValidationError(message=f"Recipient at index {idx} is missing 'phone_number'")
+                if "variables" not in recipient:
+                    raise ValidationError(message=f"Recipient at index {idx} is missing 'variables'")
+            
+            # Create messages for each recipient
+            messages = []
+            for recipient in recipients:
+                # Apply template for each recipient
+                message_text = await template_repo.apply_template(
+                    template_id=template_id,
+                    variables=recipient["variables"]
                 )
-            )
-        
-        if not messages:
-            raise ValidationError(message="No valid recipients found after applying templates")
+                
+                # Check for missing variables
+                import re
+                missing_vars = re.findall(r"{{([a-zA-Z0-9_]+)}}", message_text)
+                if missing_vars:
+                    # Skip this recipient but continue with others
+                    continue
+                
+                # Create message
+                messages.append(
+                    MessageCreate(
+                        phone_number=recipient["phone_number"],
+                        message=message_text,
+                        scheduled_at=scheduled_at,
+                        custom_id=recipient.get("custom_id")
+                    )
+                )
+            
+            if not messages:
+                raise ValidationError(message="No valid recipients found after applying templates")
         
         # Create batch metadata
         batch_metadata = {
@@ -1203,13 +1209,13 @@ class SMSSender:
         return batch_result
 
 # Dependency injection function
-async def get_sms_sender():
-    """Get SMS sender service instance."""
-    from app.db.session import get_repository
-    from app.db.repositories.messages import MessageRepository
+async def get_sms_sender() -> SMSSender:
+    """
+    Dependency injection provider for SMSSender.
+    
+    Returns:
+        SMSSender: An instance of the SMS sending service with event bus.
+    """ 
     from app.services.event_bus.bus import get_event_bus
-    
-    message_repository = await get_repository(MessageRepository)
-    event_bus = get_event_bus()
-    
-    return SMSSender(message_repository, event_bus)
+    event_bus = get_event_bus()    
+    return SMSSender(event_bus)

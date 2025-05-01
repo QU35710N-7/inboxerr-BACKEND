@@ -34,6 +34,22 @@ class BaseRepository(Generic[ModelType, CreateSchemaType, UpdateSchemaType]):
         """
         self.session = session
         self.model = model
+        self.session_is_owned = False
+    
+    async def __aenter__(self):
+        """Support async context manager protocol."""
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Clean up resources when exiting context."""
+        if self._session_is_owned:
+            await self.close()
+    
+    async def close(self):
+        """Close the session if we own it."""
+        if self.session:
+            await self.session.close()
+            self.session = None
     
     async def get_by_id(self, id: str) -> Optional[ModelType]:
         """
@@ -205,3 +221,19 @@ class BaseRepository(Generic[ModelType, CreateSchemaType, UpdateSchemaType]):
         
         result = await self.session.execute(query)
         return result.scalar_one()
+    
+
+    async def execute_in_transaction(self, func, *args, **kwargs):
+        """
+        Execute a function within a transaction.
+        
+        Args:
+            func: Async function to execute
+            args: Function positional arguments
+            kwargs: Function keyword arguments
+            
+        Returns:
+            The result of the function
+        """
+        async with self.session.begin():
+            return await func(*args, **kwargs)

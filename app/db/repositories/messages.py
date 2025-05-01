@@ -252,42 +252,39 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
         Returns:
             MessageBatch: Updated batch or None
         """
-        # For high volume operations, get a fresh session
-        from app.db.session import async_session_factory
+        # Use a proper transaction
+        async with self.session.begin():
+            # Get batch with FOR UPDATE to prevent race conditions
+            query = select(MessageBatch).where(MessageBatch.id == batch_id)
+            result = await self.session.execute(query.with_for_update())
+            batch = result.scalar_one_or_none()
+            
+            if not batch:
+                return None
+            
+            # Update counts
+            batch.processed += increment_processed
+            batch.successful += increment_successful
+            batch.failed += increment_failed
+            
+            # Update status if provided
+            if status:
+                batch.status = status
+                
+            # If all messages processed, update status and completion time
+            if batch.processed >= batch.total:
+                batch.status = MessageStatus.PROCESSED if batch.failed == 0 else "partial"
+                batch.completed_at = datetime.now(timezone.utc)
+            
+            # Add batch to session
+            self.session.add(batch)
         
-        async with async_session_factory() as fresh_session:
-            async with fresh_session.begin():
-                # Get batch with SELECT FOR UPDATE to prevent race conditions
-                query = select(MessageBatch).where(MessageBatch.id == batch_id)
-                result = await fresh_session.execute(query.with_for_update())
-                batch = result.scalar_one_or_none()
-                
-                if not batch:
-                    return None
-                
-                # Update counts
-                batch.processed += increment_processed
-                batch.successful += increment_successful
-                batch.failed += increment_failed
-                
-                # Update status if provided
-                if status:
-                    batch.status = status
-                    
-                # If all messages processed, update status and completion time
-                if batch.processed >= batch.total:
-                    batch.status = MessageStatus.PROCESSED if batch.failed == 0 else "partial"
-                    batch.completed_at = datetime.now(timezone.utc)
-                
-                # Persist changes
-                fresh_session.add(batch)
-                # Commit happens automatically at the end of context manager
-            
-            # Refresh to get updated data
-            result = await fresh_session.execute(query)
-            updated_batch = result.scalar_one_or_none()
-            
-            return updated_batch
+        # Get updated batch
+        query = select(MessageBatch).where(MessageBatch.id == batch_id)
+        result = await self.session.execute(query)
+        updated_batch = result.scalar_one_or_none()
+        
+        return updated_batch
 
     async def update_batch_progress_safe(
         self,

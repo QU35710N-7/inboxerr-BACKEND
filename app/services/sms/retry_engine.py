@@ -11,6 +11,7 @@ from app.schemas.message import MessageStatus
 from app.services.event_bus.events import EventType
 from app.services.event_bus.bus import get_event_bus
 from app.core.exceptions import SMSGatewayError, RetryableError
+from app.db.session import get_repository_context
 
 logger = logging.getLogger("inboxerr.retry")
 
@@ -19,18 +20,17 @@ class RetryEngine:
     Service for retrying failed messages.
     
     Periodically checks for failed messages and attempts to resend them.
+    Uses proper context management for database connections to prevent leaks.
     """
     
-    def __init__(self, message_repository: MessageRepository, event_bus: Any, sms_sender: Any):
+    def __init__(self, event_bus: Any, sms_sender: Any):
         """
         Initialize retry engine with required dependencies.
         
         Args:
-            message_repository: Repository for message access
             event_bus: Event bus for publishing events
             sms_sender: SMS sender service for resending messages
         """
-        self.message_repository = message_repository
         self.event_bus = event_bus
         self.sms_sender = sms_sender
         self._running = False
@@ -59,8 +59,8 @@ class RetryEngine:
         logger.info("Retry engine stopped")
     
     async def _process_retries(self) -> None:
-        """Process messages pending retry."""
-        # Get messages that need retry
+        """Process messages pending retry using context managers for DB access."""
+        # Get messages that need retry - using context manager
         retry_candidates = await self._get_retry_candidates()
         
         if not retry_candidates:
@@ -85,43 +85,44 @@ class RetryEngine:
         """
         Get messages that are candidates for retry.
         
+        Uses context manager to ensure database connections are properly closed.
+        
         Returns:
             List[Dict]: List of messages that should be retried
         """
         # Parameters for retry candidate selection
         now = datetime.now(timezone.utc)
         max_retries = settings.RETRY_MAX_ATTEMPTS
+        retry_candidates = []
         
         try:
-            # Query for messages that:
-            # 1. Are in a failed state
-            # 2. Have not exceeded max retry attempts
-            # 3. Have a retryable error or no error specified
-            # 4. Last retry attempt was long enough ago (based on exponential backoff)
-            
-            # This is a simplified implementation - in production you might want
-            # more sophisticated filtering and prioritization
-            failed_messages = await self.message_repository.get_retryable_messages(
-                max_retries=max_retries,
-                limit=50  # Limit number of messages to process in one cycle
-            )
-            
-            # Filter messages based on retry delay (exponential backoff)
-            retry_candidates = []
-            
-            for message in failed_messages:
-                # Get retry attempt count (from message metadata or events)
-                retry_count = self._get_retry_count(message)
+            # Use context manager for database access
+            async with get_repository_context(MessageRepository) as message_repository:
+                # Query for messages that:
+                # 1. Are in a failed state
+                # 2. Have not exceeded max retry attempts
+                # 3. Have a retryable error or no error specified
+                # 4. Last retry attempt was long enough ago (based on exponential backoff)
                 
-                # Calculate backoff delay - 30s, 2m, 8m, 30m, 2h, etc.
-                backoff_seconds = 30 * (2 ** retry_count)
+                failed_messages = await message_repository.get_retryable_messages(
+                    max_retries=max_retries,
+                    limit=50  # Limit number of messages to process in one cycle
+                )
                 
-                # Get timestamp of last attempt
-                last_attempt = message.failed_at or message.updated_at
-                
-                # Check if enough time has passed for retry
-                if now - last_attempt > timedelta(seconds=backoff_seconds):
-                    retry_candidates.append(message)
+                # Filter messages based on retry delay (exponential backoff)
+                for message in failed_messages:
+                    # Get retry attempt count (from message metadata or events)
+                    retry_count = self._get_retry_count(message)
+                    
+                    # Calculate backoff delay - 30s, 2m, 8m, 30m, 2h, etc.
+                    backoff_seconds = 30 * (2 ** retry_count)
+                    
+                    # Get timestamp of last attempt
+                    last_attempt = message.failed_at or message.updated_at
+                    
+                    # Check if enough time has passed for retry
+                    if now - last_attempt > timedelta(seconds=backoff_seconds):
+                        retry_candidates.append(message)
             
             return retry_candidates
         
@@ -129,7 +130,6 @@ class RetryEngine:
             logger.error(f"Error getting retry candidates: {e}", exc_info=True)
             # Return empty list on error to prevent crashing the retry engine
             return []
-    
     
     def _get_retry_count(self, message: Any) -> int:
         """
@@ -153,7 +153,9 @@ class RetryEngine:
     
     async def _retry_message(self, message: Any) -> None:
         """
-        Retry sending a message.
+        Retry sending a message with proper context management.
+        
+        Uses context managers for all database operations to prevent connection leaks.
         
         Args:
             message: Message to retry
@@ -171,25 +173,27 @@ class RetryEngine:
             
             # Use semaphore to limit concurrent retries
             async with self._semaphore:
-                # Reset status to pending for retry
-                await self.message_repository.update_message_status(
-                    message_id=message_id,
-                    status=MessageStatus.PENDING,
-                    event_type="retry",
-                    data={
-                        "retry_count": retry_count + 1,
-                        "previous_error": message.reason
-                    }
-                )
-                
-                # Update metadata to track retry count
-                meta_data = getattr(message, 'meta_data', {}) or {}
-                if isinstance(meta_data, dict):
-                    meta_data['retry_count'] = retry_count + 1
-                    await self.message_repository.update(
-                        id=message_id,
-                        obj_in={"meta_data": meta_data}
+                # Reset status to pending for retry - using context manager
+                async with get_repository_context(MessageRepository) as message_repository:
+                    # Update message status
+                    await message_repository.update_message_status(
+                        message_id=message_id,
+                        status=MessageStatus.PENDING,
+                        event_type="retry",
+                        data={
+                            "retry_count": retry_count + 1,
+                            "previous_error": message.reason
+                        }
                     )
+                    
+                    # Update metadata to track retry count
+                    meta_data = getattr(message, 'meta_data', {}) or {}
+                    if isinstance(meta_data, dict):
+                        meta_data['retry_count'] = retry_count + 1
+                        await message_repository.update(
+                            id=message_id,
+                            obj_in={"meta_data": meta_data}
+                        )
                 
                 # Attempt to send again
                 result = await self.sms_sender._send_to_gateway(
@@ -198,16 +202,17 @@ class RetryEngine:
                     custom_id=custom_id or str(uuid.uuid4())
                 )
                 
-                # Update message status
-                await self.message_repository.update_message_status(
-                    message_id=message_id,
-                    status=result.get("status", MessageStatus.PENDING),
-                    event_type="retry_success",
-                    gateway_message_id=result.get("gateway_message_id"),
-                    data=result
-                )
+                # Update message status with new context manager
+                async with get_repository_context(MessageRepository) as message_repository:
+                    await message_repository.update_message_status(
+                        message_id=message_id,
+                        status=result.get("status", MessageStatus.PENDING),
+                        event_type="retry_success",
+                        gateway_message_id=result.get("gateway_message_id"),
+                        data=result
+                    )
                 
-                # Publish event
+                # Publish event - doesn't need database connection
                 await self.event_bus.publish(
                     EventType.MESSAGE_RETRIED,
                     {
@@ -223,53 +228,58 @@ class RetryEngine:
         except Exception as e:
             logger.error(f"Error retrying message {message_id}: {e}")
             
-            # Update status to failed with incremented retry count
-            error_message = str(e)
-            is_retryable = isinstance(e, RetryableError)
-            
-            await self.message_repository.update_message_status(
-                message_id=message_id,
-                status=MessageStatus.FAILED,
-                event_type="retry_failed",
-                reason=error_message,
-                data={
-                    "retry_count": retry_count + 1,
-                    "retryable": is_retryable
-                }
-            )
-            
-            # Publish event
-            await self.event_bus.publish(
-                EventType.MESSAGE_RETRY_FAILED,
-                {
-                    "message_id": message_id,
-                    "phone_number": phone_number,
-                    "retry_count": retry_count + 1,
-                    "error": error_message,
-                    "retryable": is_retryable
-                }
-            )
+            # Update status to failed with incremented retry count - in a new context
+            try:
+                error_message = str(e)
+                is_retryable = isinstance(e, RetryableError)
+                
+                async with get_repository_context(MessageRepository) as message_repository:
+                    await message_repository.update_message_status(
+                        message_id=message_id,
+                        status=MessageStatus.FAILED,
+                        event_type="retry_failed",
+                        reason=error_message,
+                        data={
+                            "retry_count": retry_count + 1,
+                            "retryable": is_retryable
+                        }
+                    )
+                
+                # Publish event
+                await self.event_bus.publish(
+                    EventType.MESSAGE_RETRY_FAILED,
+                    {
+                        "message_id": message_id,
+                        "phone_number": phone_number,
+                        "retry_count": retry_count + 1,
+                        "error": error_message,
+                        "retryable": is_retryable
+                    }
+                )
+            except Exception as update_error:
+                logger.error(f"Failed to update error status: {update_error}")
 
 
 # Singleton instance
 _retry_engine = None
 
 async def get_retry_engine():
-    """Get the singleton retry engine instance."""
+    """
+    Get the singleton retry engine instance.
+    
+    Note: This doesn't maintain any long-lived database connections,
+    as the repository is now created within context managers for each operation.
+    """
     global _retry_engine
     
     if _retry_engine is None:
-        from app.db.session import get_repository
-        from app.db.repositories.messages import MessageRepository
         from app.services.event_bus.bus import get_event_bus
         from app.services.sms.sender import get_sms_sender
         
-        message_repository = await get_repository(MessageRepository)
         event_bus = get_event_bus()
         sms_sender = await get_sms_sender()
         
         _retry_engine = RetryEngine(
-            message_repository=message_repository,
             event_bus=event_bus,
             sms_sender=sms_sender
         )

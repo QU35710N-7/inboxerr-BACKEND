@@ -20,6 +20,7 @@ from app.services.webhooks.models import (
     WebhookPayload, SmsReceivedPayload, SmsSentPayload, 
     SmsDeliveredPayload, SmsFailedPayload, SystemPingPayload
 )
+from app.db.session import get_repository_context
 
 logger = logging.getLogger("inboxerr.webhooks")
 
@@ -144,6 +145,8 @@ async def process_gateway_webhook(raw_body: bytes, headers: Dict[str, str]) -> T
     """
     Process a webhook received from the SMS Gateway with enhanced error handling.
     
+    Uses context managers for all database operations to prevent connection leaks.
+    
     Args:
         raw_body: Raw request body
         headers: Request headers
@@ -185,18 +188,19 @@ async def process_gateway_webhook(raw_body: bytes, headers: Dict[str, str]) -> T
         
         logger.info(f"Processing webhook event: {event_type}, gateway ID: {gateway_id}")
         
-        # Record the incoming webhook event in database
+        # Record the incoming webhook event in database using context manager
+        webhook_event_id = None
         try:
-            from app.db.session import get_repository
-            webhook_repo = await get_repository(WebhookRepository)
-            
-            # Create webhook event record
-            await webhook_repo.create_webhook_event(
-                event_type=event_type,
-                payload=payload_dict,
-                phone_number=payload_dict.get("payload", {}).get("phoneNumber"),
-                gateway_message_id=gateway_id
-            )
+            async with get_repository_context(WebhookRepository) as webhook_repo:
+                # Create webhook event record
+                webhook_event = await webhook_repo.create_webhook_event(
+                    event_type=event_type,
+                    payload=payload_dict,
+                    phone_number=payload_dict.get("payload", {}).get("phoneNumber"),
+                    gateway_message_id=gateway_id
+                )
+                if webhook_event:
+                    webhook_event_id = webhook_event.id
         except Exception as e:
             # Log error but continue processing - this is just for auditing
             logger.error(f"Error recording webhook event: {e}")
@@ -225,14 +229,13 @@ async def process_gateway_webhook(raw_body: bytes, headers: Dict[str, str]) -> T
             # Log successful processing
             logger.info(f"Successfully processed webhook event: {event_type}, gateway ID: {gateway_id}")
             
-            # Mark event as processed if we created one
-            try:
-                webhook_events = await webhook_repo.get_unprocessed_events(limit=10)
-                for event in webhook_events:
-                    if event.gateway_message_id == gateway_id:
-                        await webhook_repo.mark_event_processed(event_id=event.id)
-            except Exception as e:
-                logger.error(f"Error marking webhook event as processed: {e}")
+            # Mark event as processed if we created one - using context manager
+            if webhook_event_id:
+                try:
+                    async with get_repository_context(WebhookRepository) as webhook_repo:
+                        await webhook_repo.mark_event_processed(event_id=webhook_event_id)
+                except Exception as e:
+                    logger.error(f"Error marking webhook event as processed: {e}")
             
             return True, result
             
@@ -244,9 +247,6 @@ async def process_gateway_webhook(raw_body: bytes, headers: Dict[str, str]) -> T
             
             # Publish error event
             try:
-                from app.services.event_bus.bus import get_event_bus
-                from app.services.event_bus.events import EventType
-                
                 event_bus = get_event_bus()
                 await event_bus.publish(
                     EventType.WEBHOOK_PROCESSED,
@@ -310,52 +310,13 @@ def verify_webhook_signature(payload: str, headers: Dict[str, str]) -> Tuple[boo
     
     return is_valid, None if is_valid else "Signature mismatch"
 
-def verify_webhook_signature(payload: str, headers: Dict[str, str]) -> bool:
-    """
-    Verify webhook signature from SMS Gateway.
-    
-    Args:
-        payload: Webhook payload string
-        headers: Request headers
-        
-    Returns:
-        bool: True if signature is valid
-    """
-    signature = headers.get("X-Signature")
-    timestamp = headers.get("X-Timestamp")
-    
-    if not signature or not timestamp:
-        logger.warning("Missing signature headers")
-        return False
-    
-    # Verify timestamp is recent (within tolerance)
-    try:
-        ts = int(timestamp)
-        current_time = int(time.time())
-        if abs(current_time - ts) > settings.WEBHOOK_TIMESTAMP_TOLERANCE:
-            logger.warning(f"Webhook timestamp too old: {timestamp}")
-            return False
-    except (ValueError, TypeError):
-        logger.warning(f"Invalid timestamp: {timestamp}")
-        return False
-    
-    # Calculate expected signature
-    message = (payload + timestamp).encode()
-    expected_signature = hmac.new(
-        settings.WEBHOOK_SIGNATURE_KEY.encode(),
-        message,
-        hashlib.sha256
-    ).hexdigest()
-    
-    # Compare signatures (constant-time comparison)
-    return hmac.compare_digest(expected_signature, signature)
 
 async def process_sms_received(base_payload: WebhookPayload, payload: SmsReceivedPayload) -> Dict[str, Any]:
     """Process SMS received event."""
     # For inbound messages - not the main focus for now
     logger.info(f"Received SMS: {payload.phone_number} -> '{payload.message}'")
     
-    # Publish event for other components
+    # Publish event for other components - no DB operations needed
     event_bus = get_event_bus()
     await event_bus.publish(
         EventType.SMS_RECEIVED,
@@ -374,198 +335,272 @@ async def process_sms_received(base_payload: WebhookPayload, payload: SmsReceive
         "phone_number": payload.phone_number
     }
 
+
 async def process_sms_sent(base_payload: WebhookPayload, payload: SmsSentPayload) -> Dict[str, Any]:
-    """Process SMS sent event."""
-    logger.info(f"SMS sent to {payload.phone_number}, gateway ID: {base_payload.id}")
+    """
+    Process SMS sent event with proper context management.
     
-    # Get message repository
-    from app.db.session import get_repository
-    message_repo = await get_repository(MessageRepository)
+    Args:
+        base_payload: Base webhook payload
+        payload: SMS sent payload
+        
+    Returns:
+        Dict[str, Any]: Processing result
+    """
+    logger.info(f"SMS sent to {payload.phone_number}, gateway ID: {base_payload.id}")
     
     # Extract gateway message ID
     gateway_id = base_payload.id
+    user_id = None
+    message_id = None
     
-    # Find message by gateway ID
-    message = await message_repo.get_by_gateway_id(gateway_id)
-    if not message:
-        # This could be normal if we didn't originate this message
-        logger.info(f"No matching message found for gateway ID: {gateway_id}")
-        return {
-            "status": "acknowledged",
-            "event": "sms:sent",
-            "message_found": False
-        }
-    
-    # Update message status
-    updated_message = await message_repo.update_message_status(
-        message_id=message.id,
-        status=MessageStatus.SENT,
-        event_type="webhook",
-        gateway_message_id=gateway_id,
-        data=jsonable_encoder(base_payload)
-    )
-    
-    if not updated_message:
-        logger.warning(f"Failed to update message status for ID: {message.id}")
+    # Find message by gateway ID - using context manager
+    try:
+        async with get_repository_context(MessageRepository) as message_repo:
+            message = await message_repo.get_by_gateway_id(gateway_id)
+            if not message:
+                # This could be normal if we didn't originate this message
+                logger.info(f"No matching message found for gateway ID: {gateway_id}")
+                return {
+                    "status": "acknowledged",
+                    "event": "sms:sent",
+                    "message_found": False
+                }
+            
+            # Store these for use outside the context
+            message_id = message.id
+            user_id = message.user_id
+            
+            # Update message status
+            updated_message = await message_repo.update_message_status(
+                message_id=message_id,
+                status=MessageStatus.SENT,
+                event_type="webhook",
+                gateway_message_id=gateway_id,
+                data=jsonable_encoder(base_payload)
+            )
+            
+            if not updated_message:
+                logger.warning(f"Failed to update message status for ID: {message_id}")
+                return {
+                    "status": "error",
+                    "event": "sms:sent",
+                    "message_id": message_id,
+                    "error": "Failed to update message status"
+                }
+    except Exception as e:
+        logger.error(f"Error processing sms:sent webhook: {e}")
         return {
             "status": "error",
             "event": "sms:sent",
-            "message_id": message.id,
-            "error": "Failed to update message status"
+            "error": str(e)
         }
     
-    # Publish event
-    event_bus = get_event_bus()
-    await event_bus.publish(
-        EventType.MESSAGE_SENT,
-        {
-            "message_id": message.id,
-            "gateway_id": gateway_id,
-            "phone_number": payload.phone_number,
-            "user_id": message.user_id,
-            "timestamp": payload.sent_at.isoformat()
-        }
-    )
+    # Publish event - outside the database context
+    try:
+        event_bus = get_event_bus()
+        await event_bus.publish(
+            EventType.MESSAGE_SENT,
+            {
+                "message_id": message_id,
+                "gateway_id": gateway_id,
+                "phone_number": payload.phone_number,
+                "user_id": user_id,
+                "timestamp": payload.sent_at.isoformat()
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error publishing event for sms:sent: {e}")
     
     return {
         "status": "processed",
         "event": "sms:sent",
-        "message_id": message.id,
+        "message_id": message_id,
         "phone_number": payload.phone_number
     }
 
+
 async def process_sms_delivered(base_payload: WebhookPayload, payload: SmsDeliveredPayload) -> Dict[str, Any]:
-    """Process SMS delivered event."""
-    logger.info(f"SMS delivered to {payload.phone_number}, gateway ID: {base_payload.id}")
+    """
+    Process SMS delivered event with proper context management.
     
-    # Get message repository
-    from app.db.session import get_repository
-    message_repo = await get_repository(MessageRepository)
+    Args:
+        base_payload: Base webhook payload
+        payload: SMS delivered payload
+        
+    Returns:
+        Dict[str, Any]: Processing result
+    """
+    logger.info(f"SMS delivered to {payload.phone_number}, gateway ID: {base_payload.id}")
     
     # Extract gateway message ID
     gateway_id = base_payload.id
+    user_id = None
+    message_id = None
     
-    # Find message by gateway ID
-    message = await message_repo.get_by_gateway_id(gateway_id)
-    if not message:
-        logger.info(f"No matching message found for gateway ID: {gateway_id}")
-        return {
-            "status": "acknowledged",
-            "event": "sms:delivered",
-            "message_found": False
-        }
-    
-    # Update message status
-    updated_message = await message_repo.update_message_status(
-        message_id=message.id,
-        status=MessageStatus.DELIVERED,
-        event_type="webhook",
-        gateway_message_id=gateway_id,
-        data=jsonable_encoder(base_payload)
-    )
-    
-    if not updated_message:
-        logger.warning(f"Failed to update message status for ID: {message.id}")
+    # Find message by gateway ID - using context manager
+    try:
+        async with get_repository_context(MessageRepository) as message_repo:
+            message = await message_repo.get_by_gateway_id(gateway_id)
+            if not message:
+                logger.info(f"No matching message found for gateway ID: {gateway_id}")
+                return {
+                    "status": "acknowledged",
+                    "event": "sms:delivered",
+                    "message_found": False
+                }
+            
+            # Store these for use outside the context
+            message_id = message.id
+            user_id = message.user_id
+            
+            # Update message status
+            updated_message = await message_repo.update_message_status(
+                message_id=message_id,
+                status=MessageStatus.DELIVERED,
+                event_type="webhook",
+                gateway_message_id=gateway_id,
+                data=jsonable_encoder(base_payload)
+            )
+            
+            if not updated_message:
+                logger.warning(f"Failed to update message status for ID: {message_id}")
+                return {
+                    "status": "error",
+                    "event": "sms:delivered",
+                    "message_id": message_id,
+                    "error": "Failed to update message status"
+                }
+    except Exception as e:
+        logger.error(f"Error processing sms:delivered webhook: {e}")
         return {
             "status": "error",
             "event": "sms:delivered",
-            "message_id": message.id,
-            "error": "Failed to update message status"
+            "error": str(e)
         }
     
-    # Publish event
-    event_bus = get_event_bus()
-    await event_bus.publish(
-        EventType.MESSAGE_DELIVERED,
-        {
-            "message_id": message.id,
-            "gateway_id": gateway_id,
-            "phone_number": payload.phone_number,
-            "user_id": message.user_id,
-            "timestamp": payload.delivered_at.isoformat()
-        }
-    )
+    # Publish event - outside the database context
+    try:
+        event_bus = get_event_bus()
+        await event_bus.publish(
+            EventType.MESSAGE_DELIVERED,
+            {
+                "message_id": message_id,
+                "gateway_id": gateway_id,
+                "phone_number": payload.phone_number,
+                "user_id": user_id,
+                "timestamp": payload.delivered_at.isoformat()
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error publishing event for sms:delivered: {e}")
     
     return {
         "status": "processed",
         "event": "sms:delivered",
-        "message_id": message.id,
+        "message_id": message_id,
         "phone_number": payload.phone_number
     }
 
+
 async def process_sms_failed(base_payload: WebhookPayload, payload: SmsFailedPayload) -> Dict[str, Any]:
-    """Process SMS failed event."""
-    logger.info(f"SMS failed for {payload.phone_number}, reason: {payload.reason}, gateway ID: {base_payload.id}")
+    """
+    Process SMS failed event with proper context management.
     
-    # Get message repository
-    from app.db.session import get_repository
-    message_repo = await get_repository(MessageRepository)
+    Args:
+        base_payload: Base webhook payload
+        payload: SMS failed payload
+        
+    Returns:
+        Dict[str, Any]: Processing result
+    """
+    logger.info(f"SMS failed for {payload.phone_number}, reason: {payload.reason}, gateway ID: {base_payload.id}")
     
     # Extract gateway message ID and failure reason
     gateway_id = base_payload.id
     reason = payload.reason
+    user_id = None
+    message_id = None
     
-    # Find message by gateway ID
-    message = await message_repo.get_by_gateway_id(gateway_id)
-    if not message:
-        logger.info(f"No matching message found for gateway ID: {gateway_id}")
-        return {
-            "status": "acknowledged",
-            "event": "sms:failed",
-            "message_found": False
-        }
-    
-    # Update message status
-    updated_message = await message_repo.update_message_status(
-        message_id=message.id,
-        status=MessageStatus.FAILED,
-        event_type="webhook",
-        reason=reason,
-        gateway_message_id=gateway_id,
-        data=jsonable_encoder(base_payload)
-    )
-    
-    if not updated_message:
-        logger.warning(f"Failed to update message status for ID: {message.id}")
+    # Find message by gateway ID - using context manager
+    try:
+        async with get_repository_context(MessageRepository) as message_repo:
+            message = await message_repo.get_by_gateway_id(gateway_id)
+            if not message:
+                logger.info(f"No matching message found for gateway ID: {gateway_id}")
+                return {
+                    "status": "acknowledged",
+                    "event": "sms:failed",
+                    "message_found": False
+                }
+            
+            # Store these for use outside the context
+            message_id = message.id
+            user_id = message.user_id
+            
+            # Update message status
+            updated_message = await message_repo.update_message_status(
+                message_id=message_id,
+                status=MessageStatus.FAILED,
+                event_type="webhook",
+                reason=reason,
+                gateway_message_id=gateway_id,
+                data=jsonable_encoder(base_payload)
+            )
+            
+            if not updated_message:
+                logger.warning(f"Failed to update message status for ID: {message_id}")
+                return {
+                    "status": "error",
+                    "event": "sms:failed",
+                    "message_id": message_id,
+                    "error": "Failed to update message status"
+                }
+    except Exception as e:
+        logger.error(f"Error processing sms:failed webhook: {e}")
         return {
             "status": "error",
             "event": "sms:failed",
-            "message_id": message.id,
-            "error": "Failed to update message status"
+            "error": str(e)
         }
     
-    # Publish event
-    event_bus = get_event_bus()
-    await event_bus.publish(
-        EventType.MESSAGE_FAILED,
-        {
-            "message_id": message.id,
-            "gateway_id": gateway_id,
-            "phone_number": payload.phone_number,
-            "user_id": message.user_id,
-            "reason": reason,
-            "timestamp": payload.failed_at.isoformat()
-        }
-    )
+    # Publish event - outside the database context
+    try:
+        event_bus = get_event_bus()
+        await event_bus.publish(
+            EventType.MESSAGE_FAILED,
+            {
+                "message_id": message_id,
+                "gateway_id": gateway_id,
+                "phone_number": payload.phone_number,
+                "user_id": user_id,
+                "reason": reason,
+                "timestamp": payload.failed_at.isoformat()
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error publishing event for sms:failed: {e}")
     
     return {
         "status": "processed",
         "event": "sms:failed",
-        "message_id": message.id,
+        "message_id": message_id,
         "phone_number": payload.phone_number,
         "reason": reason
     }
+
 
 async def process_system_ping(base_payload: WebhookPayload, payload: SystemPingPayload) -> Dict[str, Any]:
     """Process system ping event."""
     logger.info(f"System ping received from device: {base_payload.device_id}")
     
-    # Simple acknowledgment
+    # Simple acknowledgment - no database operations needed
     return {
         "status": "acknowledged",
         "event": "system:ping",
         "device_id": base_payload.device_id
     }
+
 
 async def fetch_registered_webhooks_from_gateway() -> List[Dict[str, Any]]:
     """

@@ -18,6 +18,7 @@ from app.schemas.campaign import (
 from app.schemas.user import User
 from app.utils.pagination import PaginationParams, paginate_response
 from app.services.campaigns.processor import get_campaign_processor
+from app.db.session import get_repository_context
 
 router = APIRouter()
 
@@ -37,23 +38,21 @@ async def create_campaign(
     await rate_limiter.check_rate_limit(current_user.id, "create_campaign")
     
     try:
-        # Get repository
-        from app.db.session import get_repository
+        # Use repository context for proper connection management
         from app.db.repositories.campaigns import CampaignRepository
         
-        campaign_repo = await get_repository(CampaignRepository)
-        
-        # Create campaign
-        result = await campaign_repo.create_campaign(
-            name=campaign.name,
-            description=campaign.description,
-            user_id=current_user.id,
-            scheduled_start_at=campaign.scheduled_start_at,
-            scheduled_end_at=campaign.scheduled_end_at,
-            settings=campaign.settings
-        )
-        
-        return result
+        async with get_repository_context(CampaignRepository) as campaign_repo:
+            # Create campaign
+            result = await campaign_repo.create_campaign(
+                name=campaign.name,
+                description=campaign.description,
+                user_id=current_user.id,
+                scheduled_start_at=campaign.scheduled_start_at,
+                scheduled_end_at=campaign.scheduled_end_at,
+                settings=campaign.settings
+            )
+            
+            return result
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error creating campaign: {str(e)}")
@@ -85,65 +84,63 @@ async def create_campaign_from_csv(
         campaign_dict = json.loads(campaign_data)
         campaign_data = CampaignCreateFromCSV(**campaign_dict)
         
-        # Get repositories
-        from app.db.session import get_repository
+        # Use repository context for proper connection management
         from app.db.repositories.campaigns import CampaignRepository
         
-        campaign_repo = await get_repository(CampaignRepository)
-        
-        # Create campaign
-        campaign = await campaign_repo.create_campaign(
-            name=campaign_data.name,
-            description=campaign_data.description,
-            user_id=current_user.id,
-            scheduled_start_at=campaign_data.scheduled_start_at,
-            scheduled_end_at=campaign_data.scheduled_end_at,
-            settings=campaign_data.settings
-        )
-        
-        # Read CSV file
-        contents = await file.read()
-        csv_file = io.StringIO(contents.decode('utf-8'))
-        
-        # Parse CSV
-        csv_reader = csv.reader(csv_file, delimiter=delimiter)
-        
-        # Skip header if present
-        if has_header:
-            header = next(csv_reader)
-            try:
-                phone_index = header.index(phone_column)
-            except ValueError:
-                raise ValidationError(
-                    message=f"Column '{phone_column}' not found in CSV header",
-                    details={"available_columns": header}
-                )
-        else:
-            phone_index = 0  # Assume first column has phone numbers
-        
-        # Extract phone numbers
-        phone_numbers = []
-        for row in csv_reader:
-            if row and len(row) > phone_index:
-                phone = row[phone_index].strip()
-                if phone:
-                    phone_numbers.append(phone)
-        
-        if not phone_numbers:
-            raise ValidationError(message="No valid phone numbers found in CSV")
-        
-        # Add phone numbers to campaign
-        added_count = await campaign_repo.add_messages_to_campaign(
-            campaign_id=campaign.id,
-            phone_numbers=phone_numbers,
-            message_text=campaign_data.message_template,
-            user_id=current_user.id
-        )
-        
-        # Refresh campaign
-        campaign = await campaign_repo.get_by_id(campaign.id)
-        
-        return campaign
+        async with get_repository_context(CampaignRepository) as campaign_repo:
+            # Create campaign
+            campaign = await campaign_repo.create_campaign(
+                name=campaign_data.name,
+                description=campaign_data.description,
+                user_id=current_user.id,
+                scheduled_start_at=campaign_data.scheduled_start_at,
+                scheduled_end_at=campaign_data.scheduled_end_at,
+                settings=campaign_data.settings
+            )
+            
+            # Read CSV file
+            contents = await file.read()
+            csv_file = io.StringIO(contents.decode('utf-8'))
+            
+            # Parse CSV
+            csv_reader = csv.reader(csv_file, delimiter=delimiter)
+            
+            # Skip header if present
+            if has_header:
+                header = next(csv_reader)
+                try:
+                    phone_index = header.index(phone_column)
+                except ValueError:
+                    raise ValidationError(
+                        message=f"Column '{phone_column}' not found in CSV header",
+                        details={"available_columns": header}
+                    )
+            else:
+                phone_index = 0  # Assume first column has phone numbers
+            
+            # Extract phone numbers
+            phone_numbers = []
+            for row in csv_reader:
+                if row and len(row) > phone_index:
+                    phone = row[phone_index].strip()
+                    if phone:
+                        phone_numbers.append(phone)
+            
+            if not phone_numbers:
+                raise ValidationError(message="No valid phone numbers found in CSV")
+            
+            # Add phone numbers to campaign
+            added_count = await campaign_repo.add_messages_to_campaign(
+                campaign_id=campaign.id,
+                phone_numbers=phone_numbers,
+                message_text=campaign_data.message_template,
+                user_id=current_user.id
+            )
+            
+            # Refresh campaign
+            campaign = await campaign_repo.get_by_id(campaign.id)
+            
+            return campaign
         
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid campaign data JSON")
@@ -165,31 +162,29 @@ async def list_campaigns(
     Returns a paginated list of campaigns.
     """
     try:
-        # Get repository
-        from app.db.session import get_repository
+        # Use repository context for proper connection management
         from app.db.repositories.campaigns import CampaignRepository
         
-        campaign_repo = await get_repository(CampaignRepository)
-        
-        # Get campaigns with pagination
-        campaigns, total = await campaign_repo.get_campaigns_for_user(
-            user_id=current_user.id,
-            status=status,
-            skip=pagination.skip,
-            limit=pagination.limit
-        )
-        
-        # Calculate pagination info
-        total_pages = (total + pagination.limit - 1) // pagination.limit
-        
-        # Return paginated response
-        return {
-            "items": campaigns,
-            "total": total,
-            "page": pagination.page,
-            "size": pagination.limit,
-            "pages": total_pages
-        }
+        async with get_repository_context(CampaignRepository) as campaign_repo:
+            # Get campaigns with pagination
+            campaigns, total = await campaign_repo.get_campaigns_for_user(
+                user_id=current_user.id,
+                status=status,
+                skip=pagination.skip,
+                limit=pagination.limit
+            )
+            
+            # Calculate pagination info
+            total_pages = (total + pagination.limit - 1) // pagination.limit
+            
+            # Return paginated response
+            return {
+                "items": campaigns,
+                "total": total,
+                "page": pagination.page,
+                "size": pagination.limit,
+                "pages": total_pages
+            }
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error listing campaigns: {str(e)}")
@@ -204,21 +199,19 @@ async def get_campaign(
    Get details of a specific campaign.
    """
    try:
-       from app.db.session import get_repository
        from app.db.repositories.campaigns import CampaignRepository
        
-       campaign_repo = await get_repository(CampaignRepository)
-       
-       # Get campaign
-       campaign = await campaign_repo.get_by_id(campaign_id)
-       if not campaign:
-           raise NotFoundError(message=f"Campaign {campaign_id} not found")
-       
-       # Check authorization
-       if campaign.user_id != current_user.id:
-           raise HTTPException(status_code=403, detail="Not authorized to access this campaign")
-       
-       return campaign
+       async with get_repository_context(CampaignRepository) as campaign_repo:
+           # Get campaign
+           campaign = await campaign_repo.get_by_id(campaign_id)
+           if not campaign:
+               raise NotFoundError(message=f"Campaign {campaign_id} not found")
+           
+           # Check authorization
+           if campaign.user_id != current_user.id:
+               raise HTTPException(status_code=403, detail="Not authorized to access this campaign")
+           
+           return campaign
        
    except NotFoundError as e:
        raise HTTPException(status_code=404, detail=str(e))
@@ -238,40 +231,38 @@ async def update_campaign(
    Only draft campaigns can be fully updated. Active campaigns can only have their description updated.
    """
    try:
-       from app.db.session import get_repository
        from app.db.repositories.campaigns import CampaignRepository
        
-       campaign_repo = await get_repository(CampaignRepository)
-       
-       # Get campaign
-       campaign = await campaign_repo.get_by_id(campaign_id)
-       if not campaign:
-           raise NotFoundError(message=f"Campaign {campaign_id} not found")
-       
-       # Check authorization
-       if campaign.user_id != current_user.id:
-           raise HTTPException(status_code=403, detail="Not authorized to update this campaign")
-       
-       # Check if campaign can be updated
-       if campaign.status != "draft" and any([
-           campaign_update.scheduled_start_at is not None,
-           campaign_update.scheduled_end_at is not None,
-           campaign_update.name is not None
-       ]):
-           raise HTTPException(
-               status_code=400, 
-               detail="Only draft campaigns can have name or schedule updated"
-           )
-       
-       # Convert to dict and remove None values
-       update_data = {k: v for k, v in campaign_update.dict().items() if v is not None}
-       
-       # Update campaign
-       updated = await campaign_repo.update(id=campaign_id, obj_in=update_data)
-       if not updated:
-           raise HTTPException(status_code=500, detail="Failed to update campaign")
-       
-       return updated
+       async with get_repository_context(CampaignRepository) as campaign_repo:
+           # Get campaign
+           campaign = await campaign_repo.get_by_id(campaign_id)
+           if not campaign:
+               raise NotFoundError(message=f"Campaign {campaign_id} not found")
+           
+           # Check authorization
+           if campaign.user_id != current_user.id:
+               raise HTTPException(status_code=403, detail="Not authorized to update this campaign")
+           
+           # Check if campaign can be updated
+           if campaign.status != "draft" and any([
+               campaign_update.scheduled_start_at is not None,
+               campaign_update.scheduled_end_at is not None,
+               campaign_update.name is not None
+           ]):
+               raise HTTPException(
+                   status_code=400, 
+                   detail="Only draft campaigns can have name or schedule updated"
+               )
+           
+           # Convert to dict and remove None values
+           update_data = {k: v for k, v in campaign_update.dict().items() if v is not None}
+           
+           # Update campaign
+           updated = await campaign_repo.update(id=campaign_id, obj_in=update_data)
+           if not updated:
+               raise HTTPException(status_code=500, detail="Failed to update campaign")
+           
+           return updated
        
    except NotFoundError as e:
        raise HTTPException(status_code=404, detail=str(e))
@@ -291,7 +282,7 @@ async def start_campaign(
    This will change the campaign status to active and begin sending messages.
    """
    try:
-       # Start campaign
+       # Start campaign - campaign_processor already uses context managers internally
        success = await campaign_processor.start_campaign(
            campaign_id=campaign_id,
            user_id=current_user.id
@@ -300,14 +291,12 @@ async def start_campaign(
        if not success:
            raise HTTPException(status_code=400, detail="Failed to start campaign")
        
-       # Get updated campaign
-       from app.db.session import get_repository
+       # Get updated campaign - use context manager for this separate operation
        from app.db.repositories.campaigns import CampaignRepository
        
-       campaign_repo = await get_repository(CampaignRepository)
-       campaign = await campaign_repo.get_by_id(campaign_id)
-       
-       return campaign
+       async with get_repository_context(CampaignRepository) as campaign_repo:
+           campaign = await campaign_repo.get_by_id(campaign_id)
+           return campaign
        
    except Exception as e:
        raise HTTPException(status_code=500, detail=f"Error starting campaign: {str(e)}")
@@ -326,7 +315,7 @@ async def pause_campaign(
    The campaign can be resumed later.
    """
    try:
-       # Pause campaign
+       # Pause campaign - campaign_processor already uses context managers internally
        success = await campaign_processor.pause_campaign(
            campaign_id=campaign_id,
            user_id=current_user.id
@@ -335,14 +324,12 @@ async def pause_campaign(
        if not success:
            raise HTTPException(status_code=400, detail="Failed to pause campaign")
        
-       # Get updated campaign
-       from app.db.session import get_repository
+       # Get updated campaign - use context manager for this separate operation
        from app.db.repositories.campaigns import CampaignRepository
        
-       campaign_repo = await get_repository(CampaignRepository)
-       campaign = await campaign_repo.get_by_id(campaign_id)
-       
-       return campaign
+       async with get_repository_context(CampaignRepository) as campaign_repo:
+           campaign = await campaign_repo.get_by_id(campaign_id)
+           return campaign
        
    except Exception as e:
        raise HTTPException(status_code=500, detail=f"Error pausing campaign: {str(e)}")
@@ -361,7 +348,7 @@ async def cancel_campaign(
    The campaign cannot be resumed after cancellation.
    """
    try:
-       # Cancel campaign
+       # Cancel campaign - campaign_processor already uses context managers internally
        success = await campaign_processor.cancel_campaign(
            campaign_id=campaign_id,
            user_id=current_user.id
@@ -370,14 +357,12 @@ async def cancel_campaign(
        if not success:
            raise HTTPException(status_code=400, detail="Failed to cancel campaign")
        
-       # Get updated campaign
-       from app.db.session import get_repository
+       # Get updated campaign - use context manager for this separate operation
        from app.db.repositories.campaigns import CampaignRepository
        
-       campaign_repo = await get_repository(CampaignRepository)
-       campaign = await campaign_repo.get_by_id(campaign_id)
-       
-       return campaign
+       async with get_repository_context(CampaignRepository) as campaign_repo:
+           campaign = await campaign_repo.get_by_id(campaign_id)
+           return campaign
        
    except Exception as e:
        raise HTTPException(status_code=500, detail=f"Error cancelling campaign: {str(e)}")
@@ -396,35 +381,35 @@ async def get_campaign_messages(
    Returns a paginated list of messages for the specified campaign.
    """
    try:
-       # First check if campaign exists and belongs to user
-       from app.db.session import get_repository
+       # Use repository context for proper connection management
        from app.db.repositories.campaigns import CampaignRepository
        from app.db.repositories.messages import MessageRepository
        
-       campaign_repo = await get_repository(CampaignRepository)
-       campaign = await campaign_repo.get_by_id(campaign_id)
+       # First check if campaign exists and belongs to user
+       async with get_repository_context(CampaignRepository) as campaign_repo:
+           campaign = await campaign_repo.get_by_id(campaign_id)
+           
+           if not campaign:
+               raise NotFoundError(message=f"Campaign {campaign_id} not found")
+           
+           if campaign.user_id != current_user.id:
+               raise HTTPException(status_code=403, detail="Not authorized to access this campaign")
        
-       if not campaign:
-           raise NotFoundError(message=f"Campaign {campaign_id} not found")
-       
-       if campaign.user_id != current_user.id:
-           raise HTTPException(status_code=403, detail="Not authorized to access this campaign")
-       
-       # Get messages for campaign
-       message_repo = await get_repository(MessageRepository)
-       messages, total = await message_repo.get_messages_for_campaign(
-           campaign_id=campaign_id,
-           status=status,
-           skip=pagination.skip,
-           limit=pagination.limit
-       )
-       
-       # Return paginated response
-       return paginate_response(
-           items=[message.dict() for message in messages],
-           total=total,
-           pagination=pagination
-       )
+       # Get messages for campaign - in a separate context to avoid long transactions
+       async with get_repository_context(MessageRepository) as message_repo:
+           messages, total = await message_repo.get_messages_for_campaign(
+               campaign_id=campaign_id,
+               status=status,
+               skip=pagination.skip,
+               limit=pagination.limit
+           )
+           
+           # Return paginated response
+           return paginate_response(
+               items=[message.dict() for message in messages],
+               total=total,
+               pagination=pagination
+           )
        
    except NotFoundError as e:
        raise HTTPException(status_code=404, detail=str(e))
@@ -443,33 +428,31 @@ async def delete_campaign(
    Only draft campaigns can be deleted. Active, paused, or completed campaigns cannot be deleted.
    """
    try:
-       from app.db.session import get_repository
        from app.db.repositories.campaigns import CampaignRepository
        
-       campaign_repo = await get_repository(CampaignRepository)
-       
-       # Get campaign
-       campaign = await campaign_repo.get_by_id(campaign_id)
-       if not campaign:
-           raise NotFoundError(message=f"Campaign {campaign_id} not found")
-       
-       # Check authorization
-       if campaign.user_id != current_user.id:
-           raise HTTPException(status_code=403, detail="Not authorized to delete this campaign")
-       
-       # Check if campaign can be deleted
-       if campaign.status != "draft":
-           raise HTTPException(
-               status_code=400, 
-               detail="Only draft campaigns can be deleted"
-           )
-       
-       # Delete campaign
-       success = await campaign_repo.delete(id=campaign_id)
-       if not success:
-           raise HTTPException(status_code=500, detail="Failed to delete campaign")
-       
-       return JSONResponse(status_code=204, content=None)
+       async with get_repository_context(CampaignRepository) as campaign_repo:
+           # Get campaign
+           campaign = await campaign_repo.get_by_id(campaign_id)
+           if not campaign:
+               raise NotFoundError(message=f"Campaign {campaign_id} not found")
+           
+           # Check authorization
+           if campaign.user_id != current_user.id:
+               raise HTTPException(status_code=403, detail="Not authorized to delete this campaign")
+           
+           # Check if campaign can be deleted
+           if campaign.status != "draft":
+               raise HTTPException(
+                   status_code=400, 
+                   detail="Only draft campaigns can be deleted"
+               )
+           
+           # Delete campaign
+           success = await campaign_repo.delete(id=campaign_id)
+           if not success:
+               raise HTTPException(status_code=500, detail="Failed to delete campaign")
+           
+           return JSONResponse(status_code=204, content=None)
        
    except NotFoundError as e:
        raise HTTPException(status_code=404, detail=str(e))
