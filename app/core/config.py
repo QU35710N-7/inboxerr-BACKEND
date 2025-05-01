@@ -60,6 +60,8 @@ class Settings(BaseSettings):
         case_sensitive = True
         env_file = ".env"
 
+    # Mock settings for testing purposes
+    SMS_GATEWAY_MOCK: bool = True  # For development and testing
 
 # Create singleton settings instance
 settings = Settings()

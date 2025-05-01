@@ -9,10 +9,13 @@ from sqlalchemy import select, update, delete, and_, or_, desc, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import JSONB
 
+import logging
+from app.models.campaign import Campaign
 from app.db.repositories.base import BaseRepository
 from app.models.message import Message, MessageEvent, MessageBatch, MessageTemplate
 from app.schemas.message import MessageCreate, MessageStatus
 
+logger = logging.getLogger("inboxerr.db")
 
 class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
     """Message repository for database operations."""
@@ -20,7 +23,7 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
     def __init__(self, session: AsyncSession):
         """Initialize with session and Message model."""
         super().__init__(session=session, model=Message)
-    
+
     async def create_message(
         self,
         *,
@@ -34,48 +37,37 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
         campaign_id: Optional[str] = None
     ) -> Message:
         """
-        Create a new message.
-        
-        Args:
-            phone_number: Recipient phone number
-            message_text: Message content
-            user_id: User who is sending the message
-            custom_id: Optional custom ID for tracking
-            scheduled_at: Optional scheduled time
-            metadata: Optional additional data
-            batch_id: Optional batch ID
-            campaign_id: Optional campaign ID
-            
-        Returns:
-            Message: Created message
+        Create a new message with related objects in a single transaction.
         """
         # Set initial status based on scheduling
         initial_status = MessageStatus.SCHEDULED if scheduled_at else MessageStatus.PENDING
         
-        # Calculate SMS parts (simple calculation, can be improved)
-        parts_count = (len(message_text) + 159) // 160  # 160 chars per SMS part, rounded up
+        # Calculate SMS parts
+        parts_count = (len(message_text) + 159) // 160  # 160 chars per SMS part
         
-        # Create message
+        # Generate IDs upfront
+        message_id = str(uuid4())
+        event_id = str(uuid4())
+        
+        # Create message instance
         message = Message(
-            id=str(uuid4()),
+            id=message_id,  # Pre-assign ID
             custom_id=custom_id or str(uuid4()),
             phone_number=phone_number,
             message=message_text,
             status=initial_status,
             scheduled_at=scheduled_at,
             user_id=user_id,
-            meta_data=metadata or {},  # Use meta_data instead of metadata
+            meta_data=metadata or {},
             parts_count=parts_count,
             batch_id=batch_id,
             campaign_id=campaign_id
         )
         
-        self.session.add(message)
-        
-        # Create initial event
+        # Create event instance with pre-assigned message_id
         event = MessageEvent(
-            id=str(uuid4()),
-            message_id=message.id,
+            id=event_id,
+            message_id=message_id,
             event_type="created",
             status=initial_status,
             data={
@@ -85,26 +77,29 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
             }
         )
         
+        # Add both objects to session before any flush/commit
+        self.session.add(message)
         self.session.add(event)
         
-        # If associated with campaign, increment total message count
+        # Handle campaign update if needed
         if campaign_id:
-            # Get campaign
-            from app.db.repositories.campaigns import CampaignRepository
-            campaign_repo = CampaignRepository(self.session)
-            campaign = await campaign_repo.get_by_id(campaign_id)
-            
-            if campaign:
-                # Use existing campaign repository method to update total messages
-                # This ensures all campaign updates go through the repository
-                campaign.total_messages += 1
-                self.session.add(campaign)
+            try:
+                # Execute campaign update with direct SQL for better performance in high volume
+                await self.session.execute(
+                    update(Campaign)
+                    .where(Campaign.id == campaign_id)
+                    .values(total_messages=Campaign.total_messages + 1)
+                )
+            except Exception as e:
+                # Log but don't fail the message creation if campaign update fails
+                logger.error(f"Error updating campaign {campaign_id} message count: {e}")
         
+        # Commit all changes in one transaction
         await self.session.commit()
         await self.session.refresh(message)
         
         return message
-    
+
     async def update_message_status(
         self,
         *,

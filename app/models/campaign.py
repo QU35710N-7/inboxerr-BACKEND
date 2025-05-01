@@ -25,10 +25,10 @@ class Campaign(Base):
     failed_count = Column(Integer, default=0, nullable=False)
     
     # Campaign configuration
-    scheduled_start_at = Column(DateTime, nullable=True, index=True)
-    scheduled_end_at = Column(DateTime, nullable=True)
-    started_at = Column(DateTime, nullable=True)
-    completed_at = Column(DateTime, nullable=True)
+    scheduled_start_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    scheduled_end_at = Column(DateTime(timezone=True), nullable=True)
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
     
     # Campaign settings
     settings = Column(JSON, nullable=True, default=dict)  # Store campaign-specific settings

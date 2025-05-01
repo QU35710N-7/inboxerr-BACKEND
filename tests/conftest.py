@@ -17,6 +17,8 @@ from app.core.security import get_password_hash
 from app.models import base as models
 from app.schemas.user import User
 from app.api.v1 import dependencies
+from app.models.user import User as UserModel
+
 
 # Use test DB from env or fallback to SQLite
 TEST_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
@@ -80,13 +82,16 @@ async def initialize_test_db():
         user_repo = UserRepository(session)
         existing_user = await user_repo.get_by_email(TEST_USER["email"])
         if not existing_user:
-            hashed_pw = get_password_hash(TEST_USER["password"])
-            user = await user_repo.create(
+            user = UserModel(
+                id="test-user-id",
                 email=TEST_USER["email"],
-                hashed_password=hashed_pw,
+                hashed_password=get_password_hash(TEST_USER["password"]),
                 full_name=TEST_USER["full_name"],
-                role=TEST_USER["role"]
+                role=TEST_USER["role"],
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow()
             )
+            session.add(user)
         else:
             user = existing_user
 
@@ -100,6 +105,44 @@ async def initialize_test_db():
             )
 
         await session.commit()
+    
+            # --- Add existing message and task for tests that depend on them ---
+        from app.db.repositories.messages import MessageRepository
+        from datetime import timezone
+
+        now = datetime.now(timezone.utc)
+        message_repo = MessageRepository(session)
+
+
+        await message_repo.create_message(
+            phone_number="+1234567890",
+            message_text="Test message seeded for unit tests",
+            user_id=user.id,
+            custom_id="existing-msg-id",
+            metadata={}
+        )
+
+
+        # Create a batch using repository logic
+        batch = await message_repo.create_batch(
+            user_id=user.id,
+            name="Test Batch",
+            total=1  # One message in batch
+        )
+        # Override ID for the test that expects it
+        batch.id = "existing-task-id"
+
+        # Add a message linked to this batch
+        await message_repo.create_message(
+            phone_number="+1234567890",
+            message_text="Hello from seeded batch",
+            user_id=user.id,
+            custom_id="msg-in-batch",
+            metadata={"batch_id": batch.id}
+        )
+
+        await session.commit()
+
     print(f"✅ Test DB seeded at {TEST_DATABASE_URL}")
 
 @pytest_asyncio.fixture()

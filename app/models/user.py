@@ -30,9 +30,9 @@ class APIKey(Base):
     key = Column(String, unique=True, index=True, nullable=False)
     name = Column(String, nullable=False)
     user_id = Column(String, ForeignKey("user.id"), nullable=False)
-    expires_at = Column(DateTime, nullable=True)
+    expires_at = Column(DateTime(timezone=True), nullable=True)
     is_active = Column(Boolean, default=True, nullable=False)
-    last_used_at = Column(DateTime, nullable=True)
+    last_used_at = Column(DateTime(timezone=True), nullable=True)
     permissions = Column(JSON, default=list, nullable=False)
     
     # Relationships

@@ -20,8 +20,8 @@ class Base:
     
     # Common columns for all models
     id = Column(String, primary_key=True, index=True, default=lambda: str(uuid.uuid4()))
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc), nullable=False)
     
     def dict(self) -> Dict[str, Any]:
         """Convert model to dictionary."""

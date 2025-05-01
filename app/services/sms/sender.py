@@ -7,9 +7,10 @@ import uuid
 import time
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Tuple, Union
+from httpx import HTTPStatusError
 
 from app.core.config import settings
-from app.core.exceptions import ValidationError, SMSGatewayError, RetryableError
+from app.core.exceptions import ValidationError, SMSGatewayError, RetryableError, SMSAuthError
 from app.utils.phone import validate_phone
 from app.db.repositories.messages import MessageRepository
 from app.schemas.message import MessageCreate, MessageStatus, BatchMessageRequest, BatchOptions
@@ -95,6 +96,9 @@ class SMSSender:
         if not is_valid:
             raise ValidationError(message=f"Invalid phone number: {error}")
         
+        # Generate id to track message in the system.
+        custom_id = custom_id or str(uuid.uuid4())
+
         # Create message in database
         db_message = await self.message_repository.create_message(
             phone_number=formatted_number,
@@ -125,12 +129,10 @@ class SMSSender:
         
         # Otherwise, send immediately
         try:
-            # Send to gateway - use db_message.id as custom_id for 1:1 mapping
-            # This ensures webhooks can easily find the corresponding message
             result = await self._send_to_gateway(
                 phone_number=formatted_number,
                 message_text=message_text,
-                custom_id=db_message.id,  # Use our database ID directly
+                custom_id=db_message.custom_id,
                 priority=priority,
                 ttl=ttl,
                 sim_number=sim_number,
@@ -258,96 +260,174 @@ class SMSSender:
         successful = 0
         failed = 0
         
-        # Calculate chunk size based on total messages
-        # Use smaller chunks for larger batches to avoid overwhelming the system
-        total_messages = len(messages)
-        if total_messages <= 100:
-            chunk_size = 10
-        elif total_messages <= 1000:
-            chunk_size = 25
-        else:
-            chunk_size = 50
+        try:
+            # Calculate optimal chunk size based on total messages
+            total_messages = len(messages)
+            chunk_size = min(50, max(10, total_messages // 20))  # Dynamic sizing
             
-        # Process in chunks for better performance
-        for i in range(0, total_messages, chunk_size):
-            chunk = messages[i:i+chunk_size]
+            # Create DB connection pool metrics
+            logger.info(f"Processing batch {batch_id} with {total_messages} messages in chunks of {chunk_size}")
             
-            # Process chunk with concurrent tasks
-            tasks = []
-            for message in chunk:
-                # Create task for each message
-                task = asyncio.create_task(
-                    self._process_single_message(
-                        message=message,
-                        user_id=user_id,
-                        batch_id=batch_id,
-                        campaign_id=campaign_id
-                    )
-                )
-                tasks.append(task)
-            
-            # Wait for all tasks to complete
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            # Process results
-            for result in results:
-                processed += 1
+            # Process in chunks for better performance
+            for i in range(0, total_messages, chunk_size):
+                chunk = messages[i:i+chunk_size]
+                chunk_successful = 0
+                chunk_failed = 0
                 
-                if isinstance(result, Exception):
-                    # Failed message
-                    failed += 1
-                    logger.error(f"Error in batch {batch_id}: {str(result)}")
+                # Create all message records first in a single transaction (bulk insert)
+                # This is critical for high volume - create DB records efficiently
+                db_messages = []
+                try:
+                    # Get a fresh repository for this chunk
+                    from app.db.session import get_repository
+                    message_repo = await get_repository(MessageRepository)
                     
-                    # Stop on first error if configured
-                    if options.fail_on_first_error:
-                        break
-                else:
-                    # Successful message
-                    successful += 1
+                    for msg in chunk:
+                        # Build metadata
+                        metadata = {"batch_id": batch_id}
+                        if campaign_id:
+                            metadata["campaign_id"] = campaign_id
+                        
+                        # Create message in database
+                        db_message = await message_repo.create_message(
+                            phone_number=msg.phone_number,
+                            message_text=msg.message,
+                            user_id=user_id,
+                            custom_id=msg.custom_id or str(uuid.uuid4()),
+                            scheduled_at=msg.scheduled_at,
+                            metadata=metadata,
+                            batch_id=batch_id,
+                            campaign_id=campaign_id
+                        )
+                        db_messages.append(db_message)
+                except Exception as e:
+                    logger.error(f"Error creating messages for chunk: {e}")
+                    chunk_failed += len(chunk)
+                    continue
+                
+                # Now process the sending for non-scheduled messages with concurrent tasks
+                send_tasks = []
+                for db_message in db_messages:
+                    # Skip scheduled messages - they'll be processed by scheduler
+                    if db_message.scheduled_at and db_message.scheduled_at > datetime.now(timezone.utc):
+                        chunk_successful += 1
+                        continue
+                    
+                    # Create task to send via gateway
+                    send_tasks.append(
+                        self._send_message_with_error_handling(
+                            db_message=db_message,
+                            phone_number=db_message.phone_number,
+                            message_text=db_message.message
+                        )
+                    )
+                
+                # Execute send tasks with controlled concurrency
+                if send_tasks:
+                    # Process in sub-chunks for very large batches
+                    send_chunk_size = min(10, len(send_tasks))
+                    for j in range(0, len(send_tasks), send_chunk_size):
+                        sub_chunk = send_tasks[j:j+send_chunk_size]
+                        results = await asyncio.gather(*sub_chunk, return_exceptions=True)
+                        
+                        # Process results
+                        for result in results:
+                            if isinstance(result, Exception):
+                                chunk_failed += 1
+                                # Log but continue
+                                logger.error(f"Send error in batch {batch_id}: {str(result)}")
+                            else:
+                                chunk_successful += 1
+                        
+                        # Small delay between sub-chunks
+                        if j + send_chunk_size < len(send_tasks):
+                            await asyncio.sleep(0.1)
+                
+                # Update batch progress with fresh session
+                try:
+                    await self._update_batch_progress_safe(
+                        batch_id=batch_id,
+                        increment_processed=len(chunk),
+                        increment_successful=chunk_successful,
+                        increment_failed=chunk_failed
+                    )
+                    
+                    # Update counters
+                    processed += len(chunk)
+                    successful += chunk_successful
+                    failed += chunk_failed
+                    
+                    # Report progress
+                    progress_pct = (processed / total_messages) * 100
+                    logger.info(f"Batch {batch_id} progress: {progress_pct:.1f}% ({processed}/{total_messages})")
+                except Exception as e:
+                    logger.error(f"Error updating batch progress: {e}")
+                
+                # Add delay between chunks to avoid overwhelming the system
+                if i + chunk_size < total_messages:
+                    await asyncio.sleep(options.delay_between_messages)
             
-            # Update batch progress
-            await self.message_repository.update_batch_progress(
+            # Final update with fresh session - ensure status is updated correctly
+            final_status = MessageStatus.PROCESSED
+            if processed == 0:
+                final_status = MessageStatus.FAILED
+            elif failed > 0:
+                final_status = "partial"
+            
+            await self._update_batch_progress_safe(
                 batch_id=batch_id,
-                increment_processed=len(chunk),
-                increment_successful=sum(1 for r in results if not isinstance(r, Exception)),
-                increment_failed=sum(1 for r in results if isinstance(r, Exception))
+                status=final_status
             )
             
-            # Check if we should stop due to first error
-            if options.fail_on_first_error and failed > 0:
-                break
-                
-            # Delay between chunks to avoid overwhelming gateway
-            if i + chunk_size < total_messages:
-                await asyncio.sleep(options.delay_between_messages * 2)  # Double delay between chunks
-        
-        # Update batch status
-        status = MessageStatus.PROCESSED
-        if processed == 0:
-            status = MessageStatus.FAILED
-        elif failed > 0:
-            status = "partial"
-        
-        await self.message_repository.update_batch_progress(
-            batch_id=batch_id,
-            status=status
-        )
-        
-        # Publish event
-        await self.event_bus.publish(
-            EventType.BATCH_COMPLETED,
-            {
-                "batch_id": batch_id,
-                "campaign_id": campaign_id,
-                "total": len(messages),
-                "processed": processed,
-                "successful": successful,
-                "failed": failed,
-                "status": status,
-                "user_id": user_id
-            }
-        )
-    
+            # Publish event
+            await self.event_bus.publish(
+                EventType.BATCH_COMPLETED,
+                {
+                    "batch_id": batch_id,
+                    "campaign_id": campaign_id,
+                    "total": total_messages,
+                    "processed": processed,
+                    "successful": successful,
+                    "failed": failed,
+                    "status": final_status,
+                    "user_id": user_id
+                }
+            )
+            
+        except Exception as e:
+            logger.error(f"Batch processing error: {e}", exc_info=True)
+            
+            # Try to update batch status to error state
+            try:
+                await self._update_batch_progress_safe(
+                    batch_id=batch_id,
+                    status=MessageStatus.FAILED
+                )
+            except Exception as update_error:
+                logger.error(f"Failed to update batch status after error: {update_error}")
+
+    async def _update_batch_progress_safe(self, batch_id: str, **kwargs) -> None:
+        """
+        Update batch progress with a fresh session to avoid conflicts.
+        Critical for high-volume processing.
+        """
+        try:
+            # Get a fresh repository to avoid session conflicts
+            from app.db.session import get_repository
+            from app.db.repositories.messages import MessageRepository
+            
+            # Create a new repository instance with a fresh session
+            message_repo = await get_repository(MessageRepository)
+            
+            # Update the batch progress
+            await message_repo.update_batch_progress(
+                batch_id=batch_id,
+                **kwargs
+            )
+        except Exception as e:
+            logger.error(f"Error in _update_batch_progress_safe for batch {batch_id}: {e}")
+            # Don't re-raise - we want batch processing to continue even if updates fail
+
     async def _process_single_message(
         self,
         *,
@@ -457,37 +537,42 @@ class SMSSender:
         # Create tasks for all messages
         tasks = []
         for msg in messages:
-            # Create database entries first to get IDs
-            db_message = await self.message_repository.create_message(
-                phone_number=msg["phone_number"],
-                message_text=msg["message_text"],
-                user_id=user_id,
-                custom_id=msg.get("custom_id"),
-                scheduled_at=msg.get("scheduled_at"),
-                metadata=msg.get("metadata", {}),
-                campaign_id=campaign_id
-            )
-            
-            # Skip if scheduled for the future
-            if db_message.scheduled_at and db_message.scheduled_at > datetime.now(timezone.utc):
-                tasks.append(asyncio.create_task(
-                    asyncio.sleep(0)  # Dummy task for scheduled messages
-                ))
-                continue
-                
-            # Create task to send via gateway
-            task = asyncio.create_task(
-                self._send_message_with_error_handling(
-                    db_message=db_message,
+            try:
+                # Create database entries first to get IDs
+                db_message = await self.message_repository.create_message(
                     phone_number=msg["phone_number"],
                     message_text=msg["message_text"],
-                    priority=msg.get("priority", 0),
-                    ttl=msg.get("ttl"),
-                    sim_number=msg.get("sim_number"),
-                    is_encrypted=msg.get("is_encrypted", False)
+                    user_id=user_id,
+                    custom_id=msg.get("custom_id"),
+                    scheduled_at=msg.get("scheduled_at"),
+                    metadata=msg.get("metadata", {}),
+                    campaign_id=campaign_id
                 )
-            )
-            tasks.append(task)
+                
+                # Skip if scheduled for the future
+                if db_message.scheduled_at and db_message.scheduled_at > datetime.now(timezone.utc):
+                    tasks.append(asyncio.create_task(
+                        asyncio.sleep(0)  # Dummy task for scheduled messages
+                    ))
+                    continue
+                    
+                # Create task to send via gateway
+                task = asyncio.create_task(
+                    self._send_message_with_error_handling(
+                        db_message=db_message,
+                        phone_number=msg["phone_number"],
+                        message_text=msg["message_text"],
+                        priority=msg.get("priority", 0),
+                        ttl=msg.get("ttl"),
+                        sim_number=msg.get("sim_number"),
+                        is_encrypted=msg.get("is_encrypted", False)
+                    )
+                )
+                tasks.append(task)
+            
+            except Exception as e:
+                logger.error(f"Error creating or queuing message: {e}")
+                await self.message_repository.session.rollback()
         
         # Wait for all tasks to complete
         if tasks:
@@ -527,7 +612,7 @@ class SMSSender:
             result = await self._send_to_gateway(
                 phone_number=phone_number,
                 message_text=message_text,
-                custom_id=db_message.id,  # Use database ID directly
+                custom_id=db_message.custom_id,
                 priority=priority,
                 ttl=ttl,
                 sim_number=sim_number,
@@ -794,7 +879,7 @@ class SMSSender:
             "completed_at": batch.completed_at,
             "message_previews": message_previews
         }
-    
+
     async def _send_to_gateway(
         self,
         *,
@@ -807,58 +892,46 @@ class SMSSender:
         is_encrypted: bool = False
     ) -> Dict[str, Any]:
         """
-        Send message to SMS gateway.
-        
-        Args:
-            phone_number: Recipient phone number
-            message_text: Message content
-            custom_id: Custom ID for tracking (usually our database ID)
-            priority: Message priority (0-127, ≥100 bypasses limits)
-            ttl: Time-to-live in seconds
-            sim_number: SIM card to use (1-3)
-            is_encrypted: Whether message is encrypted
-            
-        Returns:
-            Dict: Gateway response
-            
-        Raises:
-            SMSGatewayError: If there's an error sending the message
-            RetryableError: If the error is temporary and can be retried
+        Send message to SMS gateway with high-volume optimizations.
         """
-        # Enforce rate limit (only for non-high-priority messages)
-        if priority < 100:
-            await self._enforce_rate_limit()
+        # High-volume systems should avoid synchronized rate limiting
+        # Instead, we'll use semaphores for concurrency control
         
-        # Check if gateway client is available
-        if not SMS_GATEWAY_AVAILABLE:
-            # Simulate sending for development
-            logger.warning("Simulating SMS send to %s: %s", phone_number, message_text[:30])
-            await asyncio.sleep(0.5)  # Simulate API delay
+        # Check if gateway client is available or mock mode enabled
+        if not SMS_GATEWAY_AVAILABLE or getattr(settings, "SMS_GATEWAY_MOCK", False):
+            # Simulate sending for development/testing
+            logger.info(f"[MOCK] Sending SMS to {phone_number}: {message_text[:30]}...")
+            # Fast simulation for high volume
+            await asyncio.sleep(0.05)
             
             # Return simulated response
             return {
                 "status": MessageStatus.SENT,
-                "gateway_message_id": f"sim_{uuid.uuid4()}",
+                "gateway_message_id": f"mock_{uuid.uuid4()}",
                 "phone_number": phone_number,
                 "timestamp": datetime.now(timezone.utc).isoformat()
             }
         
-        # Use semaphore to limit concurrent requests
+        # Use semaphore to limit concurrent requests to gateway
         async with self._semaphore:
             try:
-                # Create client
+                # Create client with optimized connection settings
+                connect_timeout = 5.0  # shorter timeout for high volume
+                timeout = 10.0
+                
                 async with client.AsyncAPIClient(
                     login=settings.SMS_GATEWAY_LOGIN,
                     password=settings.SMS_GATEWAY_PASSWORD,
-                    base_url=settings.SMS_GATEWAY_URL
+                    base_url=settings.SMS_GATEWAY_URL,
+                    timeout=timeout,
+                    connect_timeout=connect_timeout
                 ) as sms_client:
-                    # Build message with additional parameters
+                    # Build message
                     message_params = {
                         "id": custom_id,
                         "message": message_text,
                         "phone_numbers": [phone_number],
                         "with_delivery_report": True,
-                        "priority": priority
                     }
                     
                     # Add optional parameters if provided
@@ -869,13 +942,17 @@ class SMSSender:
                     if is_encrypted:
                         message_params["is_encrypted"] = True
                     
-                    # Create message
+                    # Create message object
                     message = domain.Message(**message_params)
                     
-                    # Send message
-                    logger.debug(f"Sending to gateway: {phone_number}, message: {message_text[:30]}...")
+                    # Send with timing metrics for performance monitoring
+                    start_time = time.time()
                     response = await sms_client.send(message)
-                    logger.debug(f"Gateway response: {response}")
+                    elapsed = time.time() - start_time
+                    
+                    # Log timing for performance monitoring
+                    if elapsed > 1.0:
+                        logger.warning(f"Slow gateway response: {elapsed:.2f}s for message to {phone_number}")
                     
                     # Check for errors in recipients
                     recipient_state = response.recipients[0] if response.recipients else None
@@ -886,24 +963,41 @@ class SMSSender:
                     status = str(response.state.value).lower() if hasattr(response, 'state') else MessageStatus.PENDING
                     gateway_id = getattr(response, 'id', None)
                     
-                    # Return result
                     return {
                         "status": status,
                         "gateway_message_id": gateway_id,
                         "phone_number": phone_number,
                         "timestamp": datetime.now(timezone.utc).isoformat()
                     }
+            except HTTPStatusError as e:
+                if e.response.status_code == 401:
+                    logger.error("❌ Invalid SMS gateway credentials (401 Unauthorized)")
+                    raise SMSAuthError()
+                
+                # High volume optimization: determine if error is retryable
+                retryable_status_codes = [429, 503, 504]
+                if e.response.status_code in retryable_status_codes:
+                    retry_after = int(e.response.headers.get('Retry-After', "30"))
+                    raise RetryableError(
+                        message=f"Gateway rate limiting or temporary unavailability (status={e.response.status_code})",
+                        retry_after=retry_after
+                    )
                     
-            except client.ClientError as e:
-                logger.error(f"SMS gateway client error: {str(e)}")
-                raise RetryableError(
-                    message=f"SMS gateway client error: {str(e)}",
-                    retry_after=30.0
-                )
-            except Exception as e:
-                logger.error(f"SMS gateway error: {str(e)}")
                 raise SMSGatewayError(message=f"SMS gateway error: {str(e)}")
-    
+
+            except Exception as e:
+                logger.error(f"Unexpected gateway exception: {type(e).__name__}: {str(e)}")
+
+                # Improved retryable error detection for high-volume systems
+                retryable_exceptions = ["ConnectionError", "Timeout", "CancelledError", "ServiceUnavailable"]
+                if any(ex_type in str(type(e)) for ex_type in retryable_exceptions):
+                    raise RetryableError(
+                        message=f"Temporary SMS gateway issue: {str(e)}",
+                        retry_after=30
+                    )
+
+                raise SMSGatewayError(message=f"SMS gateway error: {str(e)}")
+
     async def _enforce_rate_limit(self) -> None:
         """
         Enforce rate limiting for SMS sending.

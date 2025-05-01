@@ -25,7 +25,7 @@ class Webhook(Base):
     gateway_webhook_id = Column(String, nullable=True)  # ID from SMS gateway
     
     # Stats
-    last_triggered_at = Column(DateTime, nullable=True)
+    last_triggered_at = Column(DateTime(timezone=True), nullable=True)
     success_count = Column(Integer, default=0, nullable=False)
     failure_count = Column(Integer, default=0, nullable=False)
     
@@ -45,7 +45,7 @@ class WebhookDelivery(Base):
     is_success = Column(Boolean, nullable=False)
     error_message = Column(String, nullable=True)
     retry_count = Column(Integer, default=0, nullable=False)
-    next_retry_at = Column(DateTime, nullable=True)
+    next_retry_at = Column(DateTime(timezone=True), nullable=True)
     
     # Relationships
     webhook = relationship("Webhook", back_populates="deliveries")

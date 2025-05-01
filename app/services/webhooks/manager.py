@@ -10,6 +10,7 @@ from fastapi.encoders import jsonable_encoder
 from datetime import datetime, timezone 
 
 from app.core.config import settings
+from app.core.exceptions import SMSGatewayError
 from app.db.repositories.messages import MessageRepository
 from app.db.repositories.webhooks import WebhookRepository
 from app.schemas.message import MessageStatus
@@ -565,3 +566,24 @@ async def process_system_ping(base_payload: WebhookPayload, payload: SystemPingP
         "event": "system:ping",
         "device_id": base_payload.device_id
     }
+
+async def fetch_registered_webhooks_from_gateway() -> List[Dict[str, Any]]:
+    """
+    Fetch registered webhooks from the SMS Gateway.
+    Returns a list of registered webhooks or raises an error.
+    """
+    if not settings.SMS_GATEWAY_URL or not settings.SMS_GATEWAY_LOGIN or not settings.SMS_GATEWAY_PASSWORD:
+        raise SMSGatewayError("SMS Gateway credentials not configured", code="SMS_GATEWAY_CONFIG_MISSING")
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{settings.SMS_GATEWAY_URL}/webhooks",
+                auth=(settings.SMS_GATEWAY_LOGIN, settings.SMS_GATEWAY_PASSWORD),
+                timeout=10.0
+            )
+            response.raise_for_status()
+            return response.json()
+    except Exception as e:
+        logger.error(f"Error fetching registered webhooks: {e}")
+        raise

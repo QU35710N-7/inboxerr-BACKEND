@@ -24,10 +24,10 @@ class Message(Base):
     campaign = relationship("Campaign", back_populates="messages")
     
     # Timestamps for status tracking
-    scheduled_at = Column(DateTime, nullable=True, index=True)
-    sent_at = Column(DateTime, nullable=True)
-    delivered_at = Column(DateTime, nullable=True)
-    failed_at = Column(DateTime, nullable=True)
+    scheduled_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    sent_at = Column(DateTime(timezone=True), nullable=True)
+    delivered_at = Column(DateTime(timezone=True), nullable=True)
+    failed_at = Column(DateTime(timezone=True), nullable=True)
     
     # Additional data
     reason = Column(String, nullable=True)
@@ -67,7 +67,7 @@ class MessageBatch(Base):
     failed = Column(Integer, default=0, nullable=False)
     status = Column(String, nullable=False, default="pending", index=True)
     user_id = Column(String, ForeignKey("user.id"), nullable=False, index=True)
-    completed_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
     
     # Relationships
     messages = relationship("Message", back_populates="batch")

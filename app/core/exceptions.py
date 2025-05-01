@@ -107,3 +107,18 @@ class WebhookError(InboxerrException):
         details: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(message=message, code=code, status_code=400, details=details)
+
+
+class SMSAuthError(SMSGatewayError):
+    """Raised when SMS gateway credentials are invalid."""
+    def __init__(
+        self,
+        message: str = "Invalid SMS gateway credentials",
+        details: Optional[Dict[str, Any]] = None
+    ):
+        super().__init__(
+            message=message,
+            code="SMS_AUTH_ERROR",
+            status_code=401,
+            details=details
+        )

@@ -9,6 +9,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Body, Header, st
 from app.api.v1.dependencies import get_current_user
 from app.schemas.user import User
 from app.services.webhooks.manager import process_gateway_webhook
+from app.services.webhooks.manager import fetch_registered_webhooks_from_gateway
+
 
 router = APIRouter()
 logger = logging.getLogger("inboxerr.webhooks")
@@ -55,3 +57,12 @@ async def webhook_receiver(
         )
     
     return result
+
+@router.get("/registered", tags=["Webhooks"])
+async def get_registered_gateway_webhooks(current_user: User = Depends(get_current_user)):
+    """
+    Fetch registered webhooks from the external SMS Gateway.
+    This helps confirm webhook registration status.
+    """
+    webhooks = await fetch_registered_webhooks_from_gateway()
+    return {"registered_webhooks": webhooks}
