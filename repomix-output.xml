@@ -67,6 +67,7 @@ app/db/base.py
 app/db/repositories/base.py
 app/db/repositories/campaigns.py
 app/db/repositories/messages.py
+app/db/repositories/metrics.py
 app/db/repositories/templates.py
 app/db/repositories/users.py
 app/db/repositories/webhooks.py
@@ -75,6 +76,7 @@ app/main.py
 app/models/base.py
 app/models/campaign.py
 app/models/message.py
+app/models/metrics.py
 app/models/user.py
 app/models/webhook.py
 app/schemas/campaign.py
@@ -572,6 +574,374 @@ def downgrade() -> None:
                type_=postgresql.TIMESTAMP(),
                existing_nullable=True)
     # ### end Alembic commands ###
+</file>
+
+<file path="app/db/repositories/metrics.py">
+"""
+Repository for metrics operations.
+"""
+from datetime import datetime, timezone, date, timedelta
+from typing import List, Optional, Dict, Any, Tuple
+
+from sqlalchemy import select, update, and_, func, desc
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.dialects.postgresql import insert
+
+from app.db.repositories.base import BaseRepository
+from app.models.metrics import UserMetrics
+
+
+class MetricsRepository(BaseRepository[UserMetrics, Dict[str, Any], Dict[str, Any]]):
+    """Repository for metrics operations."""
+    
+    def __init__(self, session: AsyncSession):
+        """Initialize with session and UserMetrics model."""
+        super().__init__(session=session, model=UserMetrics)
+    
+    async def get_or_create_for_day(
+        self,
+        *,
+        user_id: str,
+        day: date
+    ) -> UserMetrics:
+        """
+        Get or create metrics for a specific user and day.
+        
+        Args:
+            user_id: User ID
+            day: Date for metrics
+            
+        Returns:
+            UserMetrics: Metrics for the specified day
+        """
+        # Check if metrics exist for this user and day
+        query = select(UserMetrics).where(
+            and_(
+                UserMetrics.user_id == user_id,
+                UserMetrics.date == day
+            )
+        )
+        result = await self.session.execute(query)
+        metrics = result.scalar_one_or_none()
+        
+        if metrics:
+            return metrics
+        
+        # Create new metrics if not found
+        metrics = UserMetrics(
+            user_id=user_id,
+            date=day,
+            messages_sent=0,
+            messages_delivered=0,
+            messages_failed=0,
+            messages_scheduled=0,
+            campaigns_created=0,
+            campaigns_completed=0,
+            campaigns_active=0,
+            templates_created=0,
+            templates_used=0,
+            quota_total=1000,  # Default quota
+            quota_used=0
+        )
+        
+        self.session.add(metrics)
+        await self.session.commit()
+        await self.session.refresh(metrics)
+        
+        return metrics
+    
+    async def increment_metric(
+        self,
+        *,
+        user_id: str,
+        date: date,
+        metric_name: str,
+        increment: int = 1
+    ) -> Optional[UserMetrics]:
+        """
+        Increment a specific metric for a user on a specific day.
+        
+        Args:
+            user_id: User ID
+            date: Date for metrics
+            metric_name: Name of metric to increment
+            increment: Amount to increment by
+            
+        Returns:
+            UserMetrics: Updated metrics or None if error
+        """
+        # Get or create metrics for this day
+        metrics = await self.get_or_create_for_day(user_id=user_id, day=date)
+        
+        # Update specific metric
+        if hasattr(metrics, metric_name):
+            current_value = getattr(metrics, metric_name)
+            setattr(metrics, metric_name, current_value + increment)
+            
+            # Also update quota_used if incrementing sent messages
+            if metric_name == "messages_sent":
+                metrics.quota_used += increment
+            
+            self.session.add(metrics)
+            await self.session.commit()
+            await self.session.refresh(metrics)
+            
+            return metrics
+        
+        return None
+    
+    async def get_metrics_for_day(
+        self,
+        *,
+        user_id: str,
+        day: date
+    ) -> Optional[UserMetrics]:
+        """
+        Get metrics for a specific user and day.
+        
+        Args:
+            user_id: User ID
+            day: Date for metrics
+            
+        Returns:
+            UserMetrics: Metrics for the specified day or None if not found
+        """
+        query = select(UserMetrics).where(
+            and_(
+                UserMetrics.user_id == user_id,
+                UserMetrics.date == day
+            )
+        )
+        result = await self.session.execute(query)
+        return result.scalar_one_or_none()
+    
+    async def get_metrics_range(
+        self,
+        *,
+        user_id: str,
+        start_date: date,
+        end_date: date
+    ) -> List[UserMetrics]:
+        """
+        Get metrics for a specific user over a date range.
+        
+        Args:
+            user_id: User ID
+            start_date: Start date (inclusive)
+            end_date: End date (inclusive)
+            
+        Returns:
+            List[UserMetrics]: List of metrics for the date range
+        """
+        query = select(UserMetrics).where(
+            and_(
+                UserMetrics.user_id == user_id,
+                UserMetrics.date >= start_date,
+                UserMetrics.date <= end_date
+            )
+        ).order_by(UserMetrics.date)
+        
+        result = await self.session.execute(query)
+        return result.scalars().all()
+    
+    async def get_monthly_metrics(
+        self,
+        *,
+        user_id: str,
+        year: int,
+        month: int
+    ) -> List[UserMetrics]:
+        """
+        Get metrics for a specific user for a full month.
+        
+        Args:
+            user_id: User ID
+            year: Year
+            month: Month (1-12)
+            
+        Returns:
+            List[UserMetrics]: List of metrics for the month
+        """
+        # Calculate start and end date for the month
+        start_date = date(year, month, 1)
+        if month == 12:
+            end_date = date(year + 1, 1, 1) - timedelta(days=1)
+        else:
+            end_date = date(year, month + 1, 1) - timedelta(days=1)
+        
+        return await self.get_metrics_range(
+            user_id=user_id,
+            start_date=start_date,
+            end_date=end_date
+        )
+    
+    async def get_summary_metrics(
+        self,
+        *,
+        user_id: str,
+        start_date: date,
+        end_date: date
+    ) -> Dict[str, Any]:
+        """
+        Get summarized metrics for a specific user over a date range.
+        
+        Args:
+            user_id: User ID
+            start_date: Start date (inclusive)
+            end_date: End date (inclusive)
+            
+        Returns:
+            Dict[str, Any]: Summarized metrics
+        """
+        # Get metrics for the date range
+        metrics_list = await self.get_metrics_range(
+            user_id=user_id,
+            start_date=start_date,
+            end_date=end_date
+        )
+        
+        # Calculate summary metrics
+        total_sent = sum(m.messages_sent for m in metrics_list)
+        total_delivered = sum(m.messages_delivered for m in metrics_list)
+        total_failed = sum(m.messages_failed for m in metrics_list)
+        
+        # Calculate delivery rate
+        delivery_rate = 0
+        if total_sent > 0:
+            delivery_rate = (total_delivered / total_sent) * 100
+        
+        # Get latest quota information
+        quota_used = metrics_list[-1].quota_used if metrics_list else 0
+        quota_total = metrics_list[-1].quota_total if metrics_list else 1000
+        
+        # Create summary
+        return {
+            "period": {
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat()
+            },
+            "messages": {
+                "sent": total_sent,
+                "delivered": total_delivered,
+                "failed": total_failed,
+                "delivery_rate": round(delivery_rate, 1)
+            },
+            "campaigns": {
+                "created": sum(m.campaigns_created for m in metrics_list),
+                "completed": sum(m.campaigns_completed for m in metrics_list),
+                "active": metrics_list[-1].campaigns_active if metrics_list else 0
+            },
+            "templates": {
+                "created": sum(m.templates_created for m in metrics_list),
+                "used": sum(m.templates_used for m in metrics_list)
+            },
+            "quota": {
+                "used": quota_used,
+                "total": quota_total,
+                "percent": round((quota_used / quota_total) * 100, 1) if quota_total > 0 else 0
+            }
+        }
+    
+    async def update_daily_metrics(self, day: Optional[date] = None) -> int:
+        """
+        Update metrics for all users for a specific day based on actual data.
+        This is useful for background jobs that rebuild metrics.
+        
+        Args:
+            day: Date to update metrics for (defaults to yesterday)
+            
+        Returns:
+            int: Number of users updated
+        """
+        from app.db.repositories.messages import MessageRepository
+        from app.db.repositories.campaigns import CampaignRepository
+        from app.db.repositories.templates import TemplateRepository
+        from app.db.repositories.users import UserRepository
+        
+        # Default to yesterday if no day provided
+        if day is None:
+            day = date.today() - timedelta(days=1)
+        
+        # Get all active users
+        async with self.session.begin_nested():
+            # Get all users
+            query = select("*").select_from(UserRepository.model)
+            result = await self.session.execute(query)
+            users = result.fetchall()
+            
+            updates_count = 0
+            
+            # For each user, calculate and store metrics
+            for user_row in users:
+                user_id = user_row[0]  # Assuming id is the first column
+                
+                # Calculate message metrics
+                msg_query = select(
+                    MessageRepository.model.status,
+                    func.count(MessageRepository.model.id)
+                ).where(
+                    and_(
+                        MessageRepository.model.user_id == user_id,
+                        MessageRepository.model.created_at >= datetime.combine(day, datetime.min.time()),
+                        MessageRepository.model.created_at < datetime.combine(day + timedelta(days=1), datetime.min.time())
+                    )
+                ).group_by(MessageRepository.model.status)
+                
+                msg_result = await self.session.execute(msg_query)
+                msg_counts = dict(msg_result.fetchall())
+                
+                # Calculate campaign metrics
+                campaign_query = select(
+                    CampaignRepository.model.status,
+                    func.count(CampaignRepository.model.id)
+                ).where(
+                    CampaignRepository.model.user_id == user_id
+                ).group_by(CampaignRepository.model.status)
+                
+                campaign_result = await self.session.execute(campaign_query)
+                campaign_counts = dict(campaign_result.fetchall())
+                
+                # Calculate template metrics for the day
+                template_created_query = select(
+                    func.count(TemplateRepository.model.id)
+                ).where(
+                    and_(
+                        TemplateRepository.model.user_id == user_id,
+                        TemplateRepository.model.created_at >= datetime.combine(day, datetime.min.time()),
+                        TemplateRepository.model.created_at < datetime.combine(day + timedelta(days=1), datetime.min.time())
+                    )
+                )
+                
+                template_created_result = await self.session.execute(template_created_query)
+                templates_created = template_created_result.scalar_one_or_none() or 0
+                
+                # Get or create metrics for this day
+                metrics = await self.get_or_create_for_day(user_id=user_id, day=day)
+                
+                # Update metrics with actual values
+                metrics.messages_sent = msg_counts.get('sent', 0)
+                metrics.messages_delivered = msg_counts.get('delivered', 0)
+                metrics.messages_failed = msg_counts.get('failed', 0)
+                metrics.messages_scheduled = msg_counts.get('scheduled', 0)
+                
+                metrics.campaigns_created = sum(1 for status, count in campaign_counts.items() 
+                                            if campaign_counts.get('created_at') and campaign_counts['created_at'] >= day)
+                metrics.campaigns_completed = campaign_counts.get('completed', 0) + campaign_counts.get('cancelled', 0)
+                metrics.campaigns_active = campaign_counts.get('active', 0)
+                
+                metrics.templates_created = templates_created
+                
+                # Calculate quota used based on messages sent
+                metrics.quota_used = msg_counts.get('sent', 0) + msg_counts.get('delivered', 0) + msg_counts.get('failed', 0)
+                
+                # Save updated metrics
+                self.session.add(metrics)
+                updates_count += 1
+        
+        # Commit all changes
+        await self.session.commit()
+        
+        return updates_count
 </file>
 
 <file path="app/main.py">
@@ -4534,53 +4904,6 @@ async def get_task_status(
         raise HTTPException(status_code=500, detail=f"Error retrieving task status: {str(e)}")
 </file>
 
-<file path="app/api/v1/endpoints/metrics.py">
-"""
-API endpoints for metrics and reporting.
-"""
-from fastapi import APIRouter, Depends, HTTPException
-
-from app.api.v1.dependencies import get_current_user
-from app.schemas.user import User
-
-router = APIRouter()
-
-@router.get("/")
-async def get_metrics(
-    current_user: User = Depends(get_current_user)
-):
-    """
-    Get system metrics and statistics.
-    """
-    # This is a stub - implementation will be added later
-    return {
-        "message_count": {
-            "total": 0,
-            "sent": 0,
-            "delivered": 0,
-            "failed": 0
-        },
-        "user_count": 1,
-        "webhook_count": 0
-    }
-
-@router.get("/usage")
-async def get_usage_metrics(
-    current_user: User = Depends(get_current_user)
-):
-    """
-    Get usage metrics for the current user.
-    """
-    # This is a stub - implementation will be added later
-    return {
-        "message_count": 0,
-        "quota": {
-            "used": 0,
-            "total": 1000
-        }
-    }
-</file>
-
 <file path="app/api/v1/endpoints/templates.py">
 # app/api/v1/endpoints/templates.py
 """
@@ -4902,129 +5225,6 @@ async def send_with_template(
         raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error sending message: {str(e)}")
-</file>
-
-<file path="app/core/events.py">
-"""
-Event handlers for application lifecycle events.
-"""
-import asyncio
-import logging
-from typing import Dict, List, Any
-
-from app.core.config import settings
-from app.services.event_bus.bus import get_event_bus
-from app.services.event_bus.events import EventType
-
-logger = logging.getLogger("inboxerr")
-
-# Collection of background tasks to manage
-background_tasks: List[asyncio.Task] = []
-
-
-async def startup_event_handler() -> None:
-    """
-    Handle application startup.
-    
-    Initialize services, database connections, and start background processes.
-    """
-    logger.info("Starting Inboxerr Backend application")
-    
-    # Initialize database (async)
-    try:
-        # We'll implement this in the database module
-        from app.db.session import initialize_database
-        await initialize_database()
-        logger.info("Database initialized successfully")
-    except Exception as e:
-        logger.error(f"Error initializing database: {e}")
-        # Don't raise error to allow startup to continue
-    
-    # Initialize event bus
-    try:
-        event_bus = get_event_bus()
-        await event_bus.initialize()
-        logger.info("Event bus initialized successfully")
-    except Exception as e:
-        logger.error(f"Error initializing event bus: {e}")
-    
-    # Start retry engine if enabled
-    if settings.RETRY_ENABLED:
-        try:
-            from app.services.sms.retry_engine import get_retry_engine
-            retry_engine = await get_retry_engine()
-            retry_task = asyncio.create_task(retry_engine.start())
-            background_tasks.append(retry_task)
-            logger.info("Retry engine started successfully")
-        except Exception as e:
-            logger.error(f"Error starting retry engine: {e}")
-    
-    # Start webhook listener if enabled
-    try:
-        from app.services.webhooks.manager import initialize_webhook_manager
-        await initialize_webhook_manager()
-        logger.info("Webhook manager initialized successfully")
-    except Exception as e:
-        logger.error(f"Error initializing webhooks: {e}")
-    
-    # Initialize metrics collector
-    try:
-        from app.services.metrics.collector import initialize_metrics
-        await initialize_metrics()
-        logger.info("Metrics collector initialized successfully")
-    except Exception as e:
-        logger.error(f"Error initializing metrics: {e}")
-    
-    # Log successful startup
-    logger.info(f"✅ {settings.PROJECT_NAME} v{settings.VERSION} startup complete")
-
-
-async def shutdown_event_handler() -> None:
-    """
-    Handle application shutdown.
-    
-    Clean up resources and close connections properly.
-    """
-    logger.info("Shutting down Inboxerr Backend application")
-    
-    # Publish shutdown event
-    try:
-        event_bus = get_event_bus()
-        await event_bus.publish(EventType.SYSTEM_SHUTDOWN, {
-            "reason": "Application shutdown",
-            "graceful": True
-        })
-        logger.info("Published shutdown event")
-    except Exception as e:
-        logger.error(f"Error publishing shutdown event: {e}")
-    
-    # Cancel all background tasks
-    for task in background_tasks:
-        if not task.done():
-            task.cancel()
-            try:
-                # Wait briefly for task to cancel
-                await asyncio.wait_for(task, timeout=5.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                logger.warning(f"Task {task.get_name()} was cancelled")
-    
-    # Close database connections
-    try:
-        from app.db.session import close_database_connections
-        await close_database_connections()
-        logger.info("Database connections closed")
-    except Exception as e:
-        logger.error(f"Error closing database connections: {e}")
-    
-    # Shutdown webhook manager
-    try:
-        from app.services.webhooks.manager import shutdown_webhook_manager
-        await shutdown_webhook_manager()
-        logger.info("Webhook manager shutdown complete")
-    except Exception as e:
-        logger.error(f"Error shutting down webhook manager: {e}")
-    
-    logger.info("✅ Application shutdown complete")
 </file>
 
 <file path="app/core/exceptions.py">
@@ -5356,22 +5556,6 @@ def verify_webhook_signature(
     return hmac.compare_digest(expected, signature)
 </file>
 
-<file path="app/db/base.py">
-"""
-Import all models here to ensure they are registered with SQLAlchemy.
-"""
-# Import Base
-from app.models.base import Base
-
-# Import all models
-from app.models.user import User, APIKey
-from app.models.campaign import Campaign
-from app.models.message import Message, MessageEvent, MessageBatch, MessageTemplate
-from app.models.webhook import Webhook, WebhookDelivery, WebhookEvent
-
-# This allows alembic to auto-discover all models when creating migrations
-</file>
-
 <file path="app/db/repositories/base.py">
 """
 Base repository with common database operations.
@@ -5612,153 +5796,6 @@ class BaseRepository(Generic[ModelType, CreateSchemaType, UpdateSchemaType]):
         """
         async with self.session.begin():
             return await func(*args, **kwargs)
-</file>
-
-<file path="app/db/repositories/templates.py">
-# app/db/repositories/templates.py
-"""
-Repository for message template operations.
-"""
-from datetime import datetime, timezone
-from typing import List, Optional, Dict, Any, Tuple
-from app.utils.ids import generate_prefixed_id, IDPrefix
-import re
-
-from sqlalchemy import select, update, and_, or_, desc, func
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.db.repositories.base import BaseRepository
-from app.models.message import MessageTemplate
-from app.schemas.template import MessageTemplateCreate, MessageTemplateUpdate
-
-
-class TemplateRepository(BaseRepository[MessageTemplate, MessageTemplateCreate, MessageTemplateUpdate]):
-    """Repository for message template operations."""
-    
-    def __init__(self, session: AsyncSession):
-        """Initialize repository with session."""
-        super().__init__(session=session, model=MessageTemplate)
-    
-    async def create_template(
-        self,
-        *,
-        name: str,
-        content: str,
-        user_id: str,
-        description: Optional[str] = None,
-        variables: Optional[List[str]] = None,
-        is_active: bool = True
-    ) -> MessageTemplate:
-        """
-        Create a new message template.
-        
-        Args:
-            name: Template name
-            content: Template content with placeholders
-            user_id: User ID
-            description: Optional template description
-            variables: Optional list of variables
-            is_active: Whether the template is active
-            
-        Returns:
-            MessageTemplate: Created template
-        """
-        # Extract variables from content if not provided
-        if variables is None:
-            pattern = r"{{([a-zA-Z0-9_]+)}}"
-            variables = list(set(re.findall(pattern, content)))
-        
-        # Create template
-        template_id = generate_prefixed_id(IDPrefix.TEMPLATE)
-        template = MessageTemplate(
-            id=template_id,
-            name=name,
-            content=content,
-            description=description,
-            is_active=is_active,
-            user_id=user_id,
-            variables=variables
-        )
-        
-        self.session.add(template)
-        await self.session.commit()
-        await self.session.refresh(template)
-        
-        return template
-    
-    async def get_templates_for_user(
-        self,
-        *,
-        user_id: str,
-        active_only: bool = False,
-        skip: int = 0,
-        limit: int = 20
-    ) -> Tuple[List[MessageTemplate], int]:
-        """
-        Get message templates for a user.
-        
-        Args:
-            user_id: User ID
-            active_only: Whether to return only active templates
-            skip: Number of records to skip
-            limit: Maximum number of records to return
-            
-        Returns:
-            Tuple[List[MessageTemplate], int]: List of templates and total count
-        """
-        # Base query
-        query = select(MessageTemplate).where(MessageTemplate.user_id == user_id)
-        count_query = select(func.count()).select_from(MessageTemplate).where(MessageTemplate.user_id == user_id)
-        
-        # Filter active templates if requested
-        if active_only:
-            query = query.where(MessageTemplate.is_active == True)
-            count_query = count_query.where(MessageTemplate.is_active == True)
-        
-        # Order by name
-        query = query.order_by(MessageTemplate.name)
-        
-        # Apply pagination
-        query = query.offset(skip).limit(limit)
-        
-        # Execute queries
-        result = await self.session.execute(query)
-        count_result = await self.session.execute(count_query)
-        
-        templates = result.scalars().all()
-        total = count_result.scalar_one()
-        
-        return templates, total
-    
-    async def apply_template(
-        self,
-        *,
-        template_id: str,
-        variables: Dict[str, str]
-    ) -> Optional[str]:
-        """
-        Apply variables to a template.
-        
-        Args:
-            template_id: Template ID
-            variables: Dictionary of variable values
-            
-        Returns:
-            str: Processed template content or None if template not found
-        """
-        # Get template
-        template = await self.get_by_id(template_id)
-        if not template:
-            return None
-        
-        # Apply variables to template
-        content = template.content
-        
-        for key, value in variables.items():
-            # Replace {{key}} with value
-            content = content.replace(f"{{{{{key}}}}}", value)
-        
-        return content
 </file>
 
 <file path="app/db/repositories/webhooks.py">
@@ -6115,6 +6152,57 @@ class WebhookRepository(BaseRepository[Webhook, Dict[str, Any], Dict[str, Any]])
         return result.scalars().all()
 </file>
 
+<file path="app/models/metrics.py">
+"""
+Database models for metrics.
+"""
+from datetime import datetime, timezone, date
+from typing import Optional, Dict, Any
+
+from sqlalchemy import Column, String, Integer, Float, Date, DateTime, JSON, ForeignKey, UniqueConstraint
+from sqlalchemy.orm import relationship
+
+from app.models.base import Base
+
+
+class UserMetrics(Base):
+    """Model for storing user-level metrics."""
+    
+    # Identification and relationships
+    user_id = Column(String, ForeignKey("user.id"), nullable=False, index=True)
+    date = Column(Date, nullable=False, index=True)
+    
+    # Message metrics
+    messages_sent = Column(Integer, default=0, nullable=False)
+    messages_delivered = Column(Integer, default=0, nullable=False)
+    messages_failed = Column(Integer, default=0, nullable=False)
+    messages_scheduled = Column(Integer, default=0, nullable=False)
+    
+    # Campaign metrics
+    campaigns_created = Column(Integer, default=0, nullable=False)
+    campaigns_completed = Column(Integer, default=0, nullable=False)
+    campaigns_active = Column(Integer, default=0, nullable=False)
+    
+    # Template metrics
+    templates_created = Column(Integer, default=0, nullable=False)
+    templates_used = Column(Integer, default=0, nullable=False)
+    
+    # Usage metrics
+    quota_total = Column(Integer, default=1000, nullable=False)
+    quota_used = Column(Integer, default=0, nullable=False)
+    
+    # Additional stats
+    meta_data = Column(JSON, nullable=True)
+    
+    # Relationships
+    user = relationship("User", back_populates="metrics")
+    
+    # Constraints
+    __table_args__ = (
+        UniqueConstraint('user_id', 'date', name='uix_user_date'),
+    )
+</file>
+
 <file path="app/services/event_bus/bus.py">
 """
 Enhanced event bus implementation for asynchronous messaging between components.
@@ -6451,90 +6539,6 @@ _event_bus = EventBus()
 def get_event_bus() -> EventBus:
     """Get the singleton event bus instance."""
     return _event_bus
-</file>
-
-<file path="app/services/metrics/collector.py">
-# app/services/metrics/collector.py
-import logging
-from typing import Dict, Any, Optional
-
-from app.services.event_bus.bus import get_event_bus
-from app.services.event_bus.events import EventType
-
-logger = logging.getLogger("inboxerr.metrics")
-
-# Global metrics store (in-memory for MVP)
-_metrics = {
-    "messages": {
-        "total": 0,
-        "sent": 0,
-        "delivered": 0,
-        "failed": 0
-    },
-    "users": {
-        "total": 0,
-        "active": 0
-    },
-    "webhooks": {
-        "total": 0,
-        "delivered": 0,
-        "failed": 0
-    }
-}
-
-async def initialize_metrics() -> None:
-    """Initialize metrics collector."""
-    logger.info("Initializing metrics collector")
-    
-    # Subscribe to events
-    event_bus = get_event_bus()
-    
-    # Message events
-    await event_bus.subscribe(
-        EventType.MESSAGE_CREATED,
-        _handle_message_created,
-        "metrics.message_created"
-    )
-    
-    await event_bus.subscribe(
-        EventType.MESSAGE_SENT,
-        _handle_message_sent,
-        "metrics.message_sent"
-    )
-    
-    await event_bus.subscribe(
-        EventType.MESSAGE_DELIVERED,
-        _handle_message_delivered,
-        "metrics.message_delivered"
-    )
-    
-    await event_bus.subscribe(
-        EventType.MESSAGE_FAILED,
-        _handle_message_failed,
-        "metrics.message_failed"
-    )
-    
-    logger.info("Metrics collector initialized")
-
-async def get_metrics() -> Dict[str, Any]:
-    """Get current metrics."""
-    return _metrics
-
-async def _handle_message_created(data: Dict[str, Any]) -> None:
-    """Handle message created event."""
-    _metrics["messages"]["total"] += 1
-
-async def _handle_message_sent(data: Dict[str, Any]) -> None:
-    """Handle message sent event."""
-    _metrics["messages"]["sent"] += 1
-
-async def _handle_message_delivered(data: Dict[str, Any]) -> None:
-    """Handle message delivered event."""
-    _metrics["messages"]["delivered"] += 1
-
-async def _handle_message_failed(data: Dict[str, Any]) -> None:
-    """Handle message failed event."""
-    _metrics["messages"]["failed"] += 1
 </file>
 
 <file path="app/services/rate_limiter.py">
@@ -7556,6 +7560,67 @@ async def validate_permissions(
         raise AuthorizationError("Insufficient permissions")
 </file>
 
+<file path="app/api/v1/endpoints/metrics.py">
+"""
+API endpoints for metrics and reporting.
+"""
+from fastapi import APIRouter, Depends, HTTPException, Query
+from typing import Dict, Any, Optional
+
+from app.api.v1.dependencies import get_current_user
+from app.schemas.user import User
+from app.services.metrics.collector import get_user_metrics, get_system_metrics
+
+router = APIRouter()
+
+@router.get("/")
+async def get_metrics(
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Get system metrics and statistics.
+    Admin users get system-wide metrics, regular users get their own metrics.
+    """
+    if current_user.role == "admin":
+        # Admins get system-wide metrics
+        return await get_system_metrics()
+    else:
+        # Regular users get their own metrics
+        return await get_user_metrics(current_user.id)
+
+@router.get("/usage")
+async def get_usage_metrics(
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Get usage metrics for the current user.
+    """
+    user_metrics = await get_user_metrics(current_user.id)
+    
+    # Format for the usage endpoint
+    return {
+        "message_count": user_metrics["summary"]["messages"]["sent"],
+        "delivery_rate": user_metrics["summary"]["messages"]["delivery_rate"],
+        "quota": {
+            "used": user_metrics["summary"]["quota"]["used"],
+            "total": user_metrics["summary"]["quota"]["total"]
+        }
+    }
+
+@router.get("/dashboard")
+async def get_dashboard_metrics(
+    period: str = Query("week", description="Time period: day, week, month, year"),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Get metrics formatted for dashboard display.
+    """
+    metrics = await get_user_metrics(current_user.id, period=period)
+    
+    # Return data already formatted for dashboard
+    return metrics
+</file>
+
 <file path="app/api/v1/endpoints/webhooks.py">
 # app/api/v1/endpoints/webhooks.py
 """
@@ -7625,6 +7690,158 @@ async def get_registered_gateway_webhooks(current_user: User = Depends(get_curre
     """
     webhooks = await fetch_registered_webhooks_from_gateway()
     return {"registered_webhooks": webhooks}
+</file>
+
+<file path="app/core/events.py">
+"""
+Event handlers for application lifecycle events.
+"""
+import asyncio
+import logging
+from typing import Dict, List, Any
+
+from app.core.config import settings
+from app.services.event_bus.bus import get_event_bus
+from app.services.event_bus.events import EventType
+
+logger = logging.getLogger("inboxerr")
+
+# Collection of background tasks to manage
+background_tasks: List[asyncio.Task] = []
+
+
+async def startup_event_handler() -> None:
+    """
+    Handle application startup.
+    
+    Initialize services, database connections, and start background processes.
+    """
+    logger.info("Starting Inboxerr Backend application")
+    
+    # Initialize database (async)
+    try:
+        # We'll implement this in the database module
+        from app.db.session import initialize_database
+        await initialize_database()
+        logger.info("Database initialized successfully")
+    except Exception as e:
+        logger.error(f"Error initializing database: {e}")
+        # Don't raise error to allow startup to continue
+    
+    # Initialize event bus
+    try:
+        event_bus = get_event_bus()
+        await event_bus.initialize()
+        logger.info("Event bus initialized successfully")
+    except Exception as e:
+        logger.error(f"Error initializing event bus: {e}")
+    
+    # Start retry engine if enabled
+    if settings.RETRY_ENABLED:
+        try:
+            from app.services.sms.retry_engine import get_retry_engine
+            retry_engine = await get_retry_engine()
+            retry_task = asyncio.create_task(retry_engine.start())
+            background_tasks.append(retry_task)
+            logger.info("Retry engine started successfully")
+        except Exception as e:
+            logger.error(f"Error starting retry engine: {e}")
+    
+    # Start webhook listener if enabled
+    try:
+        from app.services.webhooks.manager import initialize_webhook_manager
+        await initialize_webhook_manager()
+        logger.info("Webhook manager initialized successfully")
+    except Exception as e:
+        logger.error(f"Error initializing webhooks: {e}")
+    
+    # Initialize metrics collector
+    try:
+        from app.services.metrics.collector import initialize_metrics
+        await initialize_metrics()
+        logger.info("Metrics collector initialized successfully")
+        # Start metrics background task
+        if settings.METRICS_ENABLED:
+            try:
+                from app.services.metrics.collector import schedule_metrics_update
+                metrics_task = asyncio.create_task(schedule_metrics_update())
+                metrics_task.set_name("metrics_updater")
+                background_tasks.append(metrics_task)
+                logger.info("Metrics background task started")
+            except Exception as e:
+                logger.error(f"Error starting metrics task: {e}")
+    except Exception as e:
+        logger.error(f"Error initializing metrics: {e}")
+    
+    # Log successful startup
+    logger.info(f"✅ {settings.PROJECT_NAME} v{settings.VERSION} startup complete")
+
+
+async def shutdown_event_handler() -> None:
+    """
+    Handle application shutdown.
+    
+    Clean up resources and close connections properly.
+    """
+    logger.info("Shutting down Inboxerr Backend application")
+    
+    # Publish shutdown event
+    try:
+        event_bus = get_event_bus()
+        await event_bus.publish(EventType.SYSTEM_SHUTDOWN, {
+            "reason": "Application shutdown",
+            "graceful": True
+        })
+        logger.info("Published shutdown event")
+    except Exception as e:
+        logger.error(f"Error publishing shutdown event: {e}")
+    
+    # Cancel all background tasks
+    for task in background_tasks:
+        if not task.done():
+            task.cancel()
+            try:
+                # Wait briefly for task to cancel
+                await asyncio.wait_for(task, timeout=5.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                logger.warning(f"Task {task.get_name()} was cancelled")
+    
+    # Close database connections
+    try:
+        from app.db.session import close_database_connections
+        await close_database_connections()
+        logger.info("Database connections closed")
+    except Exception as e:
+        logger.error(f"Error closing database connections: {e}")
+    
+    # Shutdown webhook manager
+    try:
+        from app.services.webhooks.manager import shutdown_webhook_manager
+        await shutdown_webhook_manager()
+        logger.info("Webhook manager shutdown complete")
+    except Exception as e:
+        logger.error(f"Error shutting down webhook manager: {e}")
+    
+    logger.info("✅ Application shutdown complete")
+</file>
+
+<file path="app/db/base.py">
+"""
+Import all models here to ensure they are registered with SQLAlchemy.
+"""
+# Import Base
+from app.models.base import Base
+
+# Import all models
+from app.models.user import User, APIKey
+from app.models.campaign import Campaign
+from app.models.message import Message, MessageEvent, MessageBatch, MessageTemplate
+from app.models.webhook import Webhook, WebhookDelivery, WebhookEvent
+
+# Metrics Models
+from app.models.metrics import UserMetrics
+
+# This allows alembic to auto-discover all models when creating migrations
 </file>
 
 <file path="app/db/repositories/campaigns.py">
@@ -7937,6 +8154,186 @@ class CampaignRepository(BaseRepository[Campaign, Dict[str, Any], Dict[str, Any]
             await self.session.commit()
         
         return added_count
+</file>
+
+<file path="app/db/repositories/templates.py">
+# app/db/repositories/templates.py
+"""
+Repository for message template operations.
+"""
+from datetime import datetime, timezone
+from typing import List, Optional, Dict, Any, Tuple
+from app.utils.ids import generate_prefixed_id, IDPrefix
+import re
+import logging
+
+from sqlalchemy import select, update, and_, or_, desc, func
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.services.event_bus.bus import get_event_bus
+from app.services.event_bus.events import EventType
+from app.db.repositories.base import BaseRepository
+from app.models.message import MessageTemplate
+from app.schemas.template import MessageTemplateCreate, MessageTemplateUpdate
+
+logger = logging.getLogger("inboxerr.templates")
+
+
+class TemplateRepository(BaseRepository[MessageTemplate, MessageTemplateCreate, MessageTemplateUpdate]):
+    """Repository for message template operations."""
+    
+    def __init__(self, session: AsyncSession):
+        """Initialize repository with session."""
+        super().__init__(session=session, model=MessageTemplate)
+    
+    async def create_template(
+        self,
+        *,
+        name: str,
+        content: str,
+        user_id: str,
+        description: Optional[str] = None,
+        variables: Optional[List[str]] = None,
+        is_active: bool = True
+    ) -> MessageTemplate:
+        """
+        Create a new message template.
+        
+        Args:
+            name: Template name
+            content: Template content with placeholders
+            user_id: User ID
+            description: Optional template description
+            variables: Optional list of variables
+            is_active: Whether the template is active
+            
+        Returns:
+            MessageTemplate: Created template
+        """
+        # Extract variables from content if not provided
+        if variables is None:
+            pattern = r"{{([a-zA-Z0-9_]+)}}"
+            variables = list(set(re.findall(pattern, content)))
+        
+        # Create template
+        template_id = generate_prefixed_id(IDPrefix.TEMPLATE)
+        template = MessageTemplate(
+            id=template_id,
+            name=name,
+            content=content,
+            description=description,
+            is_active=is_active,
+            user_id=user_id,
+            variables=variables
+        )
+        
+        self.session.add(template)
+        await self.session.commit()
+        await self.session.refresh(template)
+
+        # Publish template created event
+        try:
+            event_bus = get_event_bus()
+            await event_bus.publish(
+                EventType.TEMPLATE_CREATED, 
+                {
+                    "template_id": template.id,
+                    "user_id": user_id,
+                    "name": name
+                }
+            )
+        except Exception as e:
+            logger.warning(f"Failed to publish template created event: {e}")
+        
+        return template
+    
+    async def get_templates_for_user(
+        self,
+        *,
+        user_id: str,
+        active_only: bool = False,
+        skip: int = 0,
+        limit: int = 20
+    ) -> Tuple[List[MessageTemplate], int]:
+        """
+        Get message templates for a user.
+        
+        Args:
+            user_id: User ID
+            active_only: Whether to return only active templates
+            skip: Number of records to skip
+            limit: Maximum number of records to return
+            
+        Returns:
+            Tuple[List[MessageTemplate], int]: List of templates and total count
+        """
+        # Base query
+        query = select(MessageTemplate).where(MessageTemplate.user_id == user_id)
+        count_query = select(func.count()).select_from(MessageTemplate).where(MessageTemplate.user_id == user_id)
+        
+        # Filter active templates if requested
+        if active_only:
+            query = query.where(MessageTemplate.is_active == True)
+            count_query = count_query.where(MessageTemplate.is_active == True)
+        
+        # Order by name
+        query = query.order_by(MessageTemplate.name)
+        
+        # Apply pagination
+        query = query.offset(skip).limit(limit)
+        
+        # Execute queries
+        result = await self.session.execute(query)
+        count_result = await self.session.execute(count_query)
+        
+        templates = result.scalars().all()
+        total = count_result.scalar_one()
+        
+        return templates, total
+    
+    async def apply_template(
+        self,
+        *,
+        template_id: str,
+        variables: Dict[str, str]
+    ) -> Optional[str]:
+        """
+        Apply variables to a template.
+        
+        Args:
+            template_id: Template ID
+            variables: Dictionary of variable values
+            
+        Returns:
+            str: Processed template content or None if template not found
+        """
+        # Get template
+        template = await self.get_by_id(template_id)
+        if not template:
+            return None
+        
+        # Apply variables to template
+        content = template.content
+        
+        for key, value in variables.items():
+            # Replace {{key}} with value
+            content = content.replace(f"{{{{{key}}}}}", value)
+
+        # Publish template used event
+        try:
+            event_bus = get_event_bus()
+            await event_bus.publish(
+                EventType.TEMPLATE_USED, 
+                {
+                    "template_id": template_id,
+                    "user_id": template.user_id,
+                    "name": template.name
+                }
+            )
+        except Exception as e:
+            logger.warning(f"Failed to publish template used event: {e}")
+        
+        return content
 </file>
 
 <file path="app/db/repositories/users.py">
@@ -8422,48 +8819,6 @@ class Campaign(Base):
         if self.sent_count == 0:
             return 0
         return round((self.delivered_count / self.sent_count) * 100, 2)
-</file>
-
-<file path="app/models/user.py">
-"""
-Database models for user management.
-"""
-from datetime import datetime, timezone
-from typing import List, Optional, Dict, Any
-
-from sqlalchemy import Boolean, Column, String, DateTime, JSON, ForeignKey
-from sqlalchemy.orm import relationship
-
-from app.models.base import Base
-
-
-class User(Base):
-    """User model for authentication and authorization."""
-    
-    email = Column(String, unique=True, index=True, nullable=False)
-    hashed_password = Column(String, nullable=False)
-    full_name = Column(String, nullable=True)
-    is_active = Column(Boolean, default=True, nullable=False)
-    role = Column(String, default="user", nullable=False)
-    
-    # Relationships
-    api_keys = relationship("APIKey", back_populates="user", cascade="all, delete-orphan")
-    messages = relationship("Message", back_populates="user", cascade="all, delete-orphan")
-
-
-class APIKey(Base):
-    """API key model for API authentication."""
-    
-    key = Column(String, unique=True, index=True, nullable=False)
-    name = Column(String, nullable=False)
-    user_id = Column(String, ForeignKey("user.id"), nullable=False)
-    expires_at = Column(DateTime(timezone=True), nullable=True)
-    is_active = Column(Boolean, default=True, nullable=False)
-    last_used_at = Column(DateTime(timezone=True), nullable=True)
-    permissions = Column(JSON, default=list, nullable=False)
-    
-    # Relationships
-    user = relationship("User", back_populates="api_keys")
 </file>
 
 <file path="app/models/webhook.py">
@@ -9201,215 +9556,484 @@ async def get_campaign_processor():
     )
 </file>
 
-<file path="app/services/event_bus/events.py">
+<file path="app/services/metrics/collector.py">
+# app/services/metrics/collector.py
 """
-Event type definitions for the event bus.
+Metrics collection service.
 """
-from enum import Enum, auto
-from typing import Dict, Any, Optional
-from datetime import datetime, timezone
+import asyncio
+import logging
+from typing import Dict, Any, Optional, List
+from datetime import datetime, date, timezone, timedelta
 
+from app.services.event_bus.bus import get_event_bus
+from app.services.event_bus.events import EventType
+from app.db.session import get_repository_context
 
-class EventType(str, Enum):
-    """Event types for the event bus."""
+logger = logging.getLogger("inboxerr.metrics")
+
+async def initialize_metrics() -> None:
+    """Initialize metrics collector."""
+    logger.info("Initializing metrics collector")
     
-    # System events
-    SYSTEM_STARTUP = "system:startup"
-    SYSTEM_SHUTDOWN = "system:shutdown"
+    # Subscribe to events
+    event_bus = get_event_bus()
     
     # Message events
-    MESSAGE_CREATED = "message:created"
-    MESSAGE_UPDATED = "message:updated"
-    MESSAGE_SENT = "message:sent"
-    MESSAGE_DELIVERED = "message:delivered"
-    MESSAGE_FAILED = "message:failed"
-    MESSAGE_SCHEDULED = "message:scheduled"
-    MESSAGE_RETRIED = "message:retried"
-    MESSAGE_RETRY_FAILED = "message:retry_failed"
+    await event_bus.subscribe(
+        EventType.MESSAGE_CREATED,
+        _handle_message_created,
+        "metrics.message_created"
+    )
     
-    # Batch events
-    BATCH_CREATED = "batch:created"
-    BATCH_UPDATED = "batch:updated"
-    BATCH_COMPLETED = "batch:completed"
-
+    await event_bus.subscribe(
+        EventType.MESSAGE_SENT,
+        _handle_message_sent,
+        "metrics.message_sent"
+    )
+    
+    await event_bus.subscribe(
+        EventType.MESSAGE_DELIVERED,
+        _handle_message_delivered,
+        "metrics.message_delivered"
+    )
+    
+    await event_bus.subscribe(
+        EventType.MESSAGE_FAILED,
+        _handle_message_failed,
+        "metrics.message_failed"
+    )
+    
     # Campaign events
-    CAMPAIGN_CREATED = "campaign:created"
-    CAMPAIGN_UPDATED = "campaign:updated"
-    CAMPAIGN_STARTED = "campaign:started"
-    CAMPAIGN_PAUSED = "campaign:paused"
-    CAMPAIGN_COMPLETED = "campaign:completed"
-    CAMPAIGN_CANCELLED = "campaign:cancelled"
-    CAMPAIGN_FAILED = "campaign:failed"
+    await event_bus.subscribe(
+        EventType.CAMPAIGN_CREATED,
+        _handle_campaign_created,
+        "metrics.campaign_created"
+    )
     
-    # SMS Gateway events
-    SMS_RECEIVED = "sms:received"
-    SMS_SENT = "sms:sent"
-    SMS_DELIVERED = "sms:delivered"
-    SMS_FAILED = "sms:failed"
+    await event_bus.subscribe(
+        EventType.CAMPAIGN_COMPLETED,
+        _handle_campaign_completed,
+        "metrics.campaign_completed"
+    )
     
-    # Webhook events
-    WEBHOOK_RECEIVED = "webhook:received"
-    WEBHOOK_PROCESSED = "webhook:processed"
+    # Template events
+    await event_bus.subscribe(
+        EventType.TEMPLATE_CREATED,
+        _handle_template_created,
+        "metrics.template_created"
+    )
     
-    # User events
-    USER_CREATED = "user:created"
-    USER_UPDATED = "user:updated"
-    USER_DELETED = "user:deleted"
+    await event_bus.subscribe(
+        EventType.TEMPLATE_USED,
+        _handle_template_used,
+        "metrics.template_used"
+    )
     
-    # API events
-    API_REQUEST = "api:request"
-    API_RESPONSE = "api:response"
-    API_ERROR = "api:error"
+    logger.info("Metrics collector initialized")
 
+# Event handlers
+async def _handle_message_created(data: Dict[str, Any]) -> None:
+    """Handle message created event."""
+    user_id = data.get("user_id")
+    if not user_id:
+        return
+    
+    # Get today's date
+    today = datetime.now(timezone.utc).date()
+    
+    # Update metrics
+    from app.db.repositories.metrics import MetricsRepository
+    
+    try:
+        async with get_repository_context(MetricsRepository) as metrics_repo:
+            await metrics_repo.increment_metric(
+                user_id=user_id,
+                date=today,
+                metric_name="messages_scheduled",
+                increment=1
+            )
+    except Exception as e:
+        logger.error(f"Error updating metrics for message_created: {e}")
 
-class Event:
+async def _handle_message_sent(data: Dict[str, Any]) -> None:
+    """Handle message sent event."""
+    user_id = data.get("user_id")
+    if not user_id:
+        return
+    
+    # Get today's date
+    today = datetime.now(timezone.utc).date()
+    
+    # Update metrics
+    from app.db.repositories.metrics import MetricsRepository
+    
+    try:
+        async with get_repository_context(MetricsRepository) as metrics_repo:
+            await metrics_repo.increment_metric(
+                user_id=user_id,
+                date=today,
+                metric_name="messages_sent",
+                increment=1
+            )
+            
+            # Decrement scheduled count if it was scheduled
+            scheduled = data.get("scheduled", False)
+            if scheduled:
+                await metrics_repo.increment_metric(
+                    user_id=user_id,
+                    date=today,
+                    metric_name="messages_scheduled",
+                    increment=-1
+                )
+    except Exception as e:
+        logger.error(f"Error updating metrics for message_sent: {e}")
+
+async def _handle_message_delivered(data: Dict[str, Any]) -> None:
+    """Handle message delivered event."""
+    user_id = data.get("user_id")
+    if not user_id:
+        return
+    
+    # Get today's date
+    today = datetime.now(timezone.utc).date()
+    
+    # Update metrics
+    from app.db.repositories.metrics import MetricsRepository
+    
+    try:
+        async with get_repository_context(MetricsRepository) as metrics_repo:
+            await metrics_repo.increment_metric(
+                user_id=user_id,
+                date=today,
+                metric_name="messages_delivered",
+                increment=1
+            )
+    except Exception as e:
+        logger.error(f"Error updating metrics for message_delivered: {e}")
+
+async def _handle_message_failed(data: Dict[str, Any]) -> None:
+    """Handle message failed event."""
+    user_id = data.get("user_id")
+    if not user_id:
+        return
+    
+    # Get today's date
+    today = datetime.now(timezone.utc).date()
+    
+    # Update metrics
+    from app.db.repositories.metrics import MetricsRepository
+    
+    try:
+        async with get_repository_context(MetricsRepository) as metrics_repo:
+            await metrics_repo.increment_metric(
+                user_id=user_id,
+                date=today,
+                metric_name="messages_failed",
+                increment=1
+            )
+    except Exception as e:
+        logger.error(f"Error updating metrics for message_failed: {e}")
+
+async def _handle_campaign_created(data: Dict[str, Any]) -> None:
+    """Handle campaign created event."""
+    user_id = data.get("user_id")
+    if not user_id:
+        return
+    
+    # Get today's date
+    today = datetime.now(timezone.utc).date()
+    
+    # Update metrics
+    from app.db.repositories.metrics import MetricsRepository
+    
+    try:
+        async with get_repository_context(MetricsRepository) as metrics_repo:
+            await metrics_repo.increment_metric(
+                user_id=user_id,
+                date=today,
+                metric_name="campaigns_created",
+                increment=1
+            )
+            
+            # Increment active campaigns too
+            await metrics_repo.increment_metric(
+                user_id=user_id,
+                date=today,
+                metric_name="campaigns_active",
+                increment=1
+            )
+    except Exception as e:
+        logger.error(f"Error updating metrics for campaign_created: {e}")
+
+async def _handle_campaign_completed(data: Dict[str, Any]) -> None:
+    """Handle campaign completed event."""
+    user_id = data.get("user_id")
+    if not user_id:
+        return
+    
+    # Get today's date
+    today = datetime.now(timezone.utc).date()
+    
+    # Update metrics
+    from app.db.repositories.metrics import MetricsRepository
+    
+    try:
+        async with get_repository_context(MetricsRepository) as metrics_repo:
+            await metrics_repo.increment_metric(
+                user_id=user_id,
+                date=today,
+                metric_name="campaigns_completed",
+                increment=1
+            )
+            
+            # Decrement active campaigns
+            await metrics_repo.increment_metric(
+                user_id=user_id,
+                date=today,
+                metric_name="campaigns_active",
+                increment=-1
+            )
+    except Exception as e:
+        logger.error(f"Error updating metrics for campaign_completed: {e}")
+
+async def _handle_template_created(data: Dict[str, Any]) -> None:
+    """Handle template created event."""
+    user_id = data.get("user_id")
+    if not user_id:
+        return
+    
+    # Get today's date
+    today = datetime.now(timezone.utc).date()
+    
+    # Update metrics
+    from app.db.repositories.metrics import MetricsRepository
+    
+    try:
+        async with get_repository_context(MetricsRepository) as metrics_repo:
+            await metrics_repo.increment_metric(
+                user_id=user_id,
+                date=today,
+                metric_name="templates_created",
+                increment=1
+            )
+    except Exception as e:
+        logger.error(f"Error updating metrics for template_created: {e}")
+
+async def _handle_template_used(data: Dict[str, Any]) -> None:
+    """Handle template used event."""
+    user_id = data.get("user_id")
+    if not user_id:
+        return
+    
+    # Get today's date
+    today = datetime.now(timezone.utc).date()
+    
+    # Update metrics
+    from app.db.repositories.metrics import MetricsRepository
+    
+    try:
+        async with get_repository_context(MetricsRepository) as metrics_repo:
+            await metrics_repo.increment_metric(
+                user_id=user_id,
+                date=today,
+                metric_name="templates_used",
+                increment=1
+            )
+    except Exception as e:
+        logger.error(f"Error updating metrics for template_used: {e}")
+
+async def get_user_metrics(
+    user_id: str,
+    period: str = "week"
+) -> Dict[str, Any]:
     """
-    Base event class.
+    Get metrics for a specific user.
     
-    Contains common event data and helper methods.
+    Args:
+        user_id: User ID
+        period: Time period ("day", "week", "month", "year")
+        
+    Returns:
+        Dict[str, Any]: User metrics
     """
+    from app.db.repositories.metrics import MetricsRepository
     
-    def __init__(
-        self,
-        event_type: EventType,
-        data: Dict[str, Any],
-        timestamp: Optional[datetime] = None
-    ):
-        """
-        Initialize event.
-        
-        Args:
-            event_type: Event type
-            data: Event data
-            timestamp: Event timestamp
-        """
-        self.event_type = event_type
-        self.data = data
-        self.timestamp = timestamp or datetime.now(timezone.utc)
+    # Calculate date range based on period
+    end_date = datetime.now(timezone.utc).date()
     
-    def to_dict(self) -> Dict[str, Any]:
-        """
-        Convert event to dictionary.
+    if period == "day":
+        start_date = end_date
+    elif period == "week":
+        start_date = end_date - timedelta(days=7)
+    elif period == "month":
+        start_date = end_date - timedelta(days=30)
+    elif period == "year":
+        start_date = end_date - timedelta(days=365)
+    else:
+        # Default to week
+        start_date = end_date - timedelta(days=7)
+    
+    # Get metrics
+    async with get_repository_context(MetricsRepository) as metrics_repo:
+        # Get summary metrics
+        summary = await metrics_repo.get_summary_metrics(
+            user_id=user_id,
+            start_date=start_date,
+            end_date=end_date
+        )
         
-        Returns:
-            Dict: Event data
-        """
-        return {
-            "event_type": self.event_type,
-            "data": self.data,
-            "timestamp": self.timestamp.isoformat()
+        # Get daily metrics for charting
+        metrics_list = await metrics_repo.get_metrics_range(
+            user_id=user_id,
+            start_date=start_date,
+            end_date=end_date
+        )
+        
+        # Format for response
+        daily_data = []
+        for metric in metrics_list:
+            daily_data.append({
+                "date": metric.date.isoformat(),
+                "sent": metric.messages_sent,
+                "delivered": metric.messages_delivered,
+                "failed": metric.messages_failed
+            })
+        
+        # Combine data
+        result = {
+            "summary": summary,
+            "daily_data": daily_data,
+            "period": period
+        }
+        
+        return result
+
+async def get_system_metrics() -> Dict[str, Any]:
+    """
+    Get system-wide metrics (for admin).
+    
+    Returns:
+        Dict[str, Any]: System metrics
+    """
+    # For system metrics, we'll query the database directly
+    from app.db.repositories.messages import MessageRepository
+    from app.db.repositories.users import UserRepository
+    from app.db.repositories.campaigns import CampaignRepository
+    
+    system_metrics = {
+        "messages": {},
+        "users": {},
+        "campaigns": {}
+    }
+    
+    # Query message stats
+    async with get_repository_context(MessageRepository) as message_repo:
+        from sqlalchemy import func, select
+        from app.models.message import Message
+        
+        # Total messages
+        total_query = select(func.count(Message.id))
+        result = await message_repo.session.execute(total_query)
+        total_messages = result.scalar_one_or_none() or 0
+        
+        # Messages by status
+        from app.schemas.message import MessageStatus
+        status_counts = {}
+        for status in [MessageStatus.SENT, MessageStatus.DELIVERED, MessageStatus.FAILED]:
+            status_query = select(func.count(Message.id)).where(Message.status == status)
+            result = await message_repo.session.execute(status_query)
+            status_counts[status] = result.scalar_one_or_none() or 0
+        
+        # Last 24 hours
+        yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+        recent_query = select(func.count(Message.id)).where(Message.created_at >= yesterday)
+        result = await message_repo.session.execute(recent_query)
+        recent_messages = result.scalar_one_or_none() or 0
+        
+        system_metrics["messages"] = {
+            "total": total_messages,
+            "sent": status_counts.get(MessageStatus.SENT, 0),
+            "delivered": status_counts.get(MessageStatus.DELIVERED, 0),
+            "failed": status_counts.get(MessageStatus.FAILED, 0),
+            "last_24h": recent_messages
         }
     
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "Event":
-        """
-        Create event from dictionary.
+    # Query user stats
+    async with get_repository_context(UserRepository) as user_repo:
+        from app.models.user import User
         
-        Args:
-            data: Event data
+        # Total users
+        total_query = select(func.count(User.id))
+        result = await user_repo.session.execute(total_query)
+        total_users = result.scalar_one_or_none() or 0
+        
+        # Active users
+        active_query = select(func.count(User.id)).where(User.is_active == True)
+        result = await user_repo.session.execute(active_query)
+        active_users = result.scalar_one_or_none() or 0
+        
+        system_metrics["users"] = {
+            "total": total_users,
+            "active": active_users
+        }
+    
+    # Query campaign stats
+    async with get_repository_context(CampaignRepository) as campaign_repo:
+        from app.models.campaign import Campaign
+        
+        # Total campaigns
+        total_query = select(func.count(Campaign.id))
+        result = await campaign_repo.session.execute(total_query)
+        total_campaigns = result.scalar_one_or_none() or 0
+        
+        # Active campaigns
+        active_query = select(func.count(Campaign.id)).where(Campaign.status == "active")
+        result = await campaign_repo.session.execute(active_query)
+        active_campaigns = result.scalar_one_or_none() or 0
+        
+        system_metrics["campaigns"] = {
+            "total": total_campaigns,
+            "active": active_campaigns
+        }
+    
+    # Add timestamp
+    system_metrics["timestamp"] = datetime.now(timezone.utc).isoformat()
+    
+    return system_metrics
+
+async def schedule_metrics_update() -> None:
+    """
+    Schedule regular metrics updates.
+    This function is meant to be run as a background task.
+    """
+    from app.db.repositories.metrics import MetricsRepository
+    
+    while True:
+        try:
+            # Calculate time until the next run (midnight UTC)
+            now = datetime.now(timezone.utc)
+            tomorrow = (now + timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            seconds_until_midnight = (tomorrow - now).total_seconds()
             
-        Returns:
-            Event: Event instance
-        """
-        event_type = data.get("event_type")
-        if isinstance(event_type, str):
-            event_type = EventType(event_type)
-        
-        timestamp = data.get("timestamp")
-        if isinstance(timestamp, str):
-            timestamp = datetime.fromisoformat(timestamp)
-        
-        return cls(
-            event_type=event_type,
-            data=data.get("data", {}),
-            timestamp=timestamp
-        )
-
-
-class MessageEvent(Event):
-    """
-    Message event class.
-    
-    Contains message-specific event data.
-    """
-    
-    def __init__(
-        self,
-        event_type: EventType,
-        message_id: str,
-        user_id: str,
-        data: Dict[str, Any],
-        timestamp: Optional[datetime] = None
-    ):
-        """
-        Initialize message event.
-        
-        Args:
-            event_type: Event type
-            message_id: Message ID
-            user_id: User ID
-            data: Event data
-            timestamp: Event timestamp
-        """
-        # Add message ID and user ID to data
-        data = data.copy()
-        data["message_id"] = message_id
-        data["user_id"] = user_id
-        
-        super().__init__(event_type, data, timestamp)
-    
-    @property
-    def message_id(self) -> str:
-        """Get message ID."""
-        return self.data.get("message_id", "")
-    
-    @property
-    def user_id(self) -> str:
-        """Get user ID."""
-        return self.data.get("user_id", "")
-
-
-class WebhookEvent(Event):
-    """
-    Webhook event class.
-    
-    Contains webhook-specific event data.
-    """
-    
-    def __init__(
-        self,
-        event_type: EventType,
-        webhook_id: str,
-        payload: Dict[str, Any],
-        data: Dict[str, Any],
-        timestamp: Optional[datetime] = None
-    ):
-        """
-        Initialize webhook event.
-        
-        Args:
-            event_type: Event type
-            webhook_id: Webhook ID
-            payload: Webhook payload
-            data: Event data
-            timestamp: Event timestamp
-        """
-        # Add webhook ID and payload to data
-        data = data.copy()
-        data["webhook_id"] = webhook_id
-        data["payload"] = payload
-        
-        super().__init__(event_type, data, timestamp)
-    
-    @property
-    def webhook_id(self) -> str:
-        """Get webhook ID."""
-        return self.data.get("webhook_id", "")
-    
-    @property
-    def payload(self) -> Dict[str, Any]:
-        """Get webhook payload."""
-        return self.data.get("payload", {})
+            # Sleep until midnight
+            logger.info(f"Metrics update scheduled for {tomorrow.isoformat()}")
+            await asyncio.sleep(seconds_until_midnight)
+            
+            # Run the update for yesterday
+            yesterday = now.date() - timedelta(days=1)
+            logger.info(f"Running scheduled metrics update for {yesterday.isoformat()}")
+            
+            async with get_repository_context(MetricsRepository) as metrics_repo:
+                updated_count = await metrics_repo.update_daily_metrics(day=yesterday)
+                logger.info(f"Updated metrics for {updated_count} users")
+                
+        except Exception as e:
+            logger.error(f"Error in scheduled metrics update: {e}")
+            # Sleep for a while before retrying
+            await asyncio.sleep(3600)  # 1 hour
 </file>
 
 <file path="README.md">
@@ -9774,76 +10398,6 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 This project is licensed under the MIT License - see the LICENSE file for details.
 </file>
 
-<file path="app/core/config.py">
-"""
-Application settings and configuration management.
-"""
-from typing import List, Optional, Union
-from pydantic import AnyHttpUrl, validator, field_validator
-from pydantic_settings import BaseSettings
-
-
-class Settings(BaseSettings):
-    """Application settings."""
-    # Base
-    PROJECT_NAME: str = "Inboxerr Backend"
-    PROJECT_DESCRIPTION: str = "API backend for SMS management and delivery"
-    VERSION: str = "0.1.0"
-    API_PREFIX: str = "/api/v1"
-    DEBUG: bool = False
-    
-    # CORS
-    BACKEND_CORS_ORIGINS: List[Union[str, AnyHttpUrl]] = []
-
-    @field_validator("BACKEND_CORS_ORIGINS", mode='before')
-    def assemble_cors_origins(cls, v: Union[str, List[str]]) -> Union[List[str], str]:
-        """Parse CORS origins from string or list."""
-        if isinstance(v, str) and not v.startswith("["):
-            return [i.strip() for i in v.split(",")]
-        elif isinstance(v, (list, str)):
-            return v
-        raise ValueError(v)
-    
-    # Authentication
-    SECRET_KEY: str = "CHANGEME_IN_PRODUCTION"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 1 day
-    API_KEY_HEADER: str = "X-API-Key"
-
-    # Database
-    DATABASE_URL: str = "postgresql+asyncpg://postgres:admin@localhost:5432/inboxerr"
-    
-    # SMS Gateway
-    SMS_GATEWAY_URL: str = "https://endpointnumber1.work.gd/api/3rdparty/v1"
-    SMS_GATEWAY_LOGIN: str = ""
-    SMS_GATEWAY_PASSWORD: str = ""
-    
-    # Webhook
-    API_BASE_URL: str = "http://localhost:8000"  # Base URL for webhooks
-    WEBHOOK_SIGNATURE_KEY: Optional[str] = None
-    WEBHOOK_TIMESTAMP_TOLERANCE: int = 300  # 5 minutes
-    
-    # SMS Processing
-    BATCH_SIZE: int = 100
-    DELAY_BETWEEN_SMS: float = 0.3  # seconds
-    RETRY_ENABLED: bool = False
-    RETRY_MAX_ATTEMPTS: int = 3
-    RETRY_INTERVAL_SECONDS: int = 60
-    
-    # Logging
-    LOG_LEVEL: str = "INFO"
-    
-    class Config:
-        """Pydantic config."""
-        case_sensitive = True
-        env_file = ".env"
-
-    # Mock settings for testing purposes
-    SMS_GATEWAY_MOCK: bool = True  # For development and testing
-
-# Create singleton settings instance
-settings = Settings()
-</file>
-
 <file path="app/models/message.py">
 """
 Database models for SMS messages.
@@ -9933,6 +10487,266 @@ class MessageTemplate(Base):
     
     # Relationships
     user = relationship("User")
+</file>
+
+<file path="app/models/user.py">
+"""
+Database models for user management.
+"""
+from datetime import datetime, timezone
+from typing import List, Optional, Dict, Any
+
+from sqlalchemy import Boolean, Column, String, DateTime, JSON, ForeignKey
+from sqlalchemy.orm import relationship
+
+from app.models.base import Base
+
+
+class User(Base):
+    """User model for authentication and authorization."""
+    
+    email = Column(String, unique=True, index=True, nullable=False)
+    hashed_password = Column(String, nullable=False)
+    full_name = Column(String, nullable=True)
+    is_active = Column(Boolean, default=True, nullable=False)
+    role = Column(String, default="user", nullable=False)
+    
+    # Relationships
+    api_keys = relationship("APIKey", back_populates="user", cascade="all, delete-orphan")
+    messages = relationship("Message", back_populates="user", cascade="all, delete-orphan")
+    metrics = relationship("UserMetrics", back_populates="user", cascade="all, delete-orphan")
+
+
+
+class APIKey(Base):
+    """API key model for API authentication."""
+    
+    key = Column(String, unique=True, index=True, nullable=False)
+    name = Column(String, nullable=False)
+    user_id = Column(String, ForeignKey("user.id"), nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+    is_active = Column(Boolean, default=True, nullable=False)
+    last_used_at = Column(DateTime(timezone=True), nullable=True)
+    permissions = Column(JSON, default=list, nullable=False)
+    
+    # Relationships
+    user = relationship("User", back_populates="api_keys")
+</file>
+
+<file path="app/services/event_bus/events.py">
+"""
+Event type definitions for the event bus.
+"""
+from enum import Enum, auto
+from typing import Dict, Any, Optional
+from datetime import datetime, timezone
+
+
+class EventType(str, Enum):
+    """Event types for the event bus."""
+    
+    # System events
+    SYSTEM_STARTUP = "system:startup"
+    SYSTEM_SHUTDOWN = "system:shutdown"
+    
+    # Message events
+    MESSAGE_CREATED = "message:created"
+    MESSAGE_UPDATED = "message:updated"
+    MESSAGE_SENT = "message:sent"
+    MESSAGE_DELIVERED = "message:delivered"
+    MESSAGE_FAILED = "message:failed"
+    MESSAGE_SCHEDULED = "message:scheduled"
+    MESSAGE_RETRIED = "message:retried"
+    MESSAGE_RETRY_FAILED = "message:retry_failed"
+    
+    # Batch events
+    BATCH_CREATED = "batch:created"
+    BATCH_UPDATED = "batch:updated"
+    BATCH_COMPLETED = "batch:completed"
+
+    # Campaign events
+    CAMPAIGN_CREATED = "campaign:created"
+    CAMPAIGN_UPDATED = "campaign:updated"
+    CAMPAIGN_STARTED = "campaign:started"
+    CAMPAIGN_PAUSED = "campaign:paused"
+    CAMPAIGN_COMPLETED = "campaign:completed"
+    CAMPAIGN_CANCELLED = "campaign:cancelled"
+    CAMPAIGN_FAILED = "campaign:failed"
+    
+    # SMS Gateway events
+    SMS_RECEIVED = "sms:received"
+    SMS_SENT = "sms:sent"
+    SMS_DELIVERED = "sms:delivered"
+    SMS_FAILED = "sms:failed"
+    
+    # Webhook events
+    WEBHOOK_RECEIVED = "webhook:received"
+    WEBHOOK_PROCESSED = "webhook:processed"
+    
+    # User events
+    USER_CREATED = "user:created"
+    USER_UPDATED = "user:updated"
+    USER_DELETED = "user:deleted"
+    
+    # API events
+    API_REQUEST = "api:request"
+    API_RESPONSE = "api:response"
+    API_ERROR = "api:error"
+
+    # Template events
+    TEMPLATE_CREATED = "template:created"
+    TEMPLATE_UPDATED = "template:updated"
+    TEMPLATE_USED = "template:used"
+
+
+class Event:
+    """
+    Base event class.
+    
+    Contains common event data and helper methods.
+    """
+    
+    def __init__(
+        self,
+        event_type: EventType,
+        data: Dict[str, Any],
+        timestamp: Optional[datetime] = None
+    ):
+        """
+        Initialize event.
+        
+        Args:
+            event_type: Event type
+            data: Event data
+            timestamp: Event timestamp
+        """
+        self.event_type = event_type
+        self.data = data
+        self.timestamp = timestamp or datetime.now(timezone.utc)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Convert event to dictionary.
+        
+        Returns:
+            Dict: Event data
+        """
+        return {
+            "event_type": self.event_type,
+            "data": self.data,
+            "timestamp": self.timestamp.isoformat()
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Event":
+        """
+        Create event from dictionary.
+        
+        Args:
+            data: Event data
+            
+        Returns:
+            Event: Event instance
+        """
+        event_type = data.get("event_type")
+        if isinstance(event_type, str):
+            event_type = EventType(event_type)
+        
+        timestamp = data.get("timestamp")
+        if isinstance(timestamp, str):
+            timestamp = datetime.fromisoformat(timestamp)
+        
+        return cls(
+            event_type=event_type,
+            data=data.get("data", {}),
+            timestamp=timestamp
+        )
+
+
+class MessageEvent(Event):
+    """
+    Message event class.
+    
+    Contains message-specific event data.
+    """
+    
+    def __init__(
+        self,
+        event_type: EventType,
+        message_id: str,
+        user_id: str,
+        data: Dict[str, Any],
+        timestamp: Optional[datetime] = None
+    ):
+        """
+        Initialize message event.
+        
+        Args:
+            event_type: Event type
+            message_id: Message ID
+            user_id: User ID
+            data: Event data
+            timestamp: Event timestamp
+        """
+        # Add message ID and user ID to data
+        data = data.copy()
+        data["message_id"] = message_id
+        data["user_id"] = user_id
+        
+        super().__init__(event_type, data, timestamp)
+    
+    @property
+    def message_id(self) -> str:
+        """Get message ID."""
+        return self.data.get("message_id", "")
+    
+    @property
+    def user_id(self) -> str:
+        """Get user ID."""
+        return self.data.get("user_id", "")
+
+
+class WebhookEvent(Event):
+    """
+    Webhook event class.
+    
+    Contains webhook-specific event data.
+    """
+    
+    def __init__(
+        self,
+        event_type: EventType,
+        webhook_id: str,
+        payload: Dict[str, Any],
+        data: Dict[str, Any],
+        timestamp: Optional[datetime] = None
+    ):
+        """
+        Initialize webhook event.
+        
+        Args:
+            event_type: Event type
+            webhook_id: Webhook ID
+            payload: Webhook payload
+            data: Event data
+            timestamp: Event timestamp
+        """
+        # Add webhook ID and payload to data
+        data = data.copy()
+        data["webhook_id"] = webhook_id
+        data["payload"] = payload
+        
+        super().__init__(event_type, data, timestamp)
+    
+    @property
+    def webhook_id(self) -> str:
+        """Get webhook ID."""
+        return self.data.get("webhook_id", "")
+    
+    @property
+    def payload(self) -> Dict[str, Any]:
+        """Get webhook payload."""
+        return self.data.get("payload", {})
 </file>
 
 <file path="app/services/sms/retry_engine.py">
@@ -10445,6 +11259,79 @@ async def async_client() -> AsyncGenerator[AsyncClient, None]:
 async def db_session() -> AsyncGenerator[AsyncSession, None]:
     async with async_session_factory() as session:
         yield session
+</file>
+
+<file path="app/core/config.py">
+"""
+Application settings and configuration management.
+"""
+from typing import List, Optional, Union
+from pydantic import AnyHttpUrl, validator, field_validator
+from pydantic_settings import BaseSettings
+
+
+class Settings(BaseSettings):
+    """Application settings."""
+    # Base
+    PROJECT_NAME: str = "Inboxerr Backend"
+    PROJECT_DESCRIPTION: str = "API backend for SMS management and delivery"
+    VERSION: str = "0.1.0"
+    API_PREFIX: str = "/api/v1"
+    DEBUG: bool = False
+    
+    # CORS
+    BACKEND_CORS_ORIGINS: List[Union[str, AnyHttpUrl]] = []
+
+    @field_validator("BACKEND_CORS_ORIGINS", mode='before')
+    def assemble_cors_origins(cls, v: Union[str, List[str]]) -> Union[List[str], str]:
+        """Parse CORS origins from string or list."""
+        if isinstance(v, str) and not v.startswith("["):
+            return [i.strip() for i in v.split(",")]
+        elif isinstance(v, (list, str)):
+            return v
+        raise ValueError(v)
+    
+    # Authentication
+    SECRET_KEY: str = "CHANGEME_IN_PRODUCTION"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 1 day
+    API_KEY_HEADER: str = "X-API-Key"
+
+    # Database
+    DATABASE_URL: str = "postgresql+asyncpg://postgres:admin@localhost:5432/inboxerr"
+    
+    # SMS Gateway
+    SMS_GATEWAY_URL: str = "https://endpointnumber1.work.gd/api/3rdparty/v1"
+    SMS_GATEWAY_LOGIN: str = ""
+    SMS_GATEWAY_PASSWORD: str = ""
+    
+    # Webhook
+    API_BASE_URL: str = "http://localhost:8000"  # Base URL for webhooks
+    WEBHOOK_SIGNATURE_KEY: Optional[str] = None
+    WEBHOOK_TIMESTAMP_TOLERANCE: int = 300  # 5 minutes
+    
+    # SMS Processing
+    BATCH_SIZE: int = 100
+    DELAY_BETWEEN_SMS: float = 0.3  # seconds
+    RETRY_ENABLED: bool = False
+    RETRY_MAX_ATTEMPTS: int = 3
+    RETRY_INTERVAL_SECONDS: int = 60
+    
+    # Metrics
+    METRICS_ENABLED: bool = True
+
+    # Logging
+    LOG_LEVEL: str = "INFO"
+    
+    class Config:
+        """Pydantic config."""
+        case_sensitive = True
+        env_file = ".env"
+
+    # Mock settings for testing purposes
+    SMS_GATEWAY_MOCK: bool = True  # For development and testing
+
+# Create singleton settings instance
+settings = Settings()
 </file>
 
 <file path="app/services/webhooks/manager.py">
