@@ -37,7 +37,7 @@ class UserMetrics(Base):
     quota_used = Column(Integer, default=0, nullable=False)
     
     # Additional stats
-    metadata = Column(JSON, nullable=True)
+    meta_data = Column(JSON, nullable=True)
     
     # Relationships
     user = relationship("User", back_populates="metrics")
