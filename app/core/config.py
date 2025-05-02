@@ -52,6 +52,9 @@ class Settings(BaseSettings):
     RETRY_MAX_ATTEMPTS: int = 3
     RETRY_INTERVAL_SECONDS: int = 60
     
+    # Metrics
+    METRICS_ENABLED: bool = True
+
     # Logging
     LOG_LEVEL: str = "INFO"
     

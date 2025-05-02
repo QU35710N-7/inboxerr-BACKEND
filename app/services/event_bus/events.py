@@ -57,6 +57,11 @@ class EventType(str, Enum):
     API_RESPONSE = "api:response"
     API_ERROR = "api:error"
 
+    # Template events
+    TEMPLATE_CREATED = "template:created"
+    TEMPLATE_UPDATED = "template:updated"
+    TEMPLATE_USED = "template:used"
+
 
 class Event:
     """

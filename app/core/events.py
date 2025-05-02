@@ -65,6 +65,16 @@ async def startup_event_handler() -> None:
         from app.services.metrics.collector import initialize_metrics
         await initialize_metrics()
         logger.info("Metrics collector initialized successfully")
+        # Start metrics background task
+        if settings.METRICS_ENABLED:
+            try:
+                from app.services.metrics.collector import schedule_metrics_update
+                metrics_task = asyncio.create_task(schedule_metrics_update())
+                metrics_task.set_name("metrics_updater")
+                background_tasks.append(metrics_task)
+                logger.info("Metrics background task started")
+            except Exception as e:
+                logger.error(f"Error starting metrics task: {e}")
     except Exception as e:
         logger.error(f"Error initializing metrics: {e}")
     

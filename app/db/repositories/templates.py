@@ -6,13 +6,18 @@ from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any, Tuple
 from app.utils.ids import generate_prefixed_id, IDPrefix
 import re
+import logging
 
 from sqlalchemy import select, update, and_, or_, desc, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.services.event_bus.bus import get_event_bus
+from app.services.event_bus.events import EventType
 from app.db.repositories.base import BaseRepository
 from app.models.message import MessageTemplate
 from app.schemas.template import MessageTemplateCreate, MessageTemplateUpdate
+
+logger = logging.getLogger("inboxerr.templates")
 
 
 class TemplateRepository(BaseRepository[MessageTemplate, MessageTemplateCreate, MessageTemplateUpdate]):
@@ -66,6 +71,20 @@ class TemplateRepository(BaseRepository[MessageTemplate, MessageTemplateCreate, 
         self.session.add(template)
         await self.session.commit()
         await self.session.refresh(template)
+
+        # Publish template created event
+        try:
+            event_bus = get_event_bus()
+            await event_bus.publish(
+                EventType.TEMPLATE_CREATED, 
+                {
+                    "template_id": template.id,
+                    "user_id": user_id,
+                    "name": name
+                }
+            )
+        except Exception as e:
+            logger.warning(f"Failed to publish template created event: {e}")
         
         return template
     
@@ -140,5 +159,19 @@ class TemplateRepository(BaseRepository[MessageTemplate, MessageTemplateCreate, 
         for key, value in variables.items():
             # Replace {{key}} with value
             content = content.replace(f"{{{{{key}}}}}", value)
+
+        # Publish template used event
+        try:
+            event_bus = get_event_bus()
+            await event_bus.publish(
+                EventType.TEMPLATE_USED, 
+                {
+                    "template_id": template_id,
+                    "user_id": template.user_id,
+                    "name": template.name
+                }
+            )
+        except Exception as e:
+            logger.warning(f"Failed to publish template used event: {e}")
         
         return content

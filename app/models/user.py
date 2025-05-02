@@ -22,6 +22,8 @@ class User(Base):
     # Relationships
     api_keys = relationship("APIKey", back_populates="user", cascade="all, delete-orphan")
     messages = relationship("Message", back_populates="user", cascade="all, delete-orphan")
+    metrics = relationship("UserMetrics", back_populates="user", cascade="all, delete-orphan")
+
 
 
 class APIKey(Base):
