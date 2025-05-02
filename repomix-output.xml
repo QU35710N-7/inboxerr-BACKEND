@@ -574,1034 +574,6 @@ def downgrade() -> None:
     # ### end Alembic commands ###
 </file>
 
-<file path="app/api/v1/endpoints/campaigns.py">
-# app/api/v1/endpoints/campaigns.py
-import csv
-import io
-from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, UploadFile, File, Query, Path, status
-from fastapi.responses import JSONResponse
-
-from app.api.v1.dependencies import get_current_user, get_rate_limiter
-from app.core.exceptions import ValidationError, NotFoundError
-from app.schemas.campaign import (
-    CampaignCreate,
-    CampaignCreateFromCSV,
-    CampaignUpdate,
-    CampaignResponse,
-    CampaignStatus,
-    CampaignListResponse
-)
-from app.schemas.user import User
-from app.utils.pagination import PaginationParams, paginate_response
-from app.services.campaigns.processor import get_campaign_processor
-from app.db.session import get_repository_context
-
-router = APIRouter()
-
-
-@router.post("/", response_model=CampaignResponse, status_code=status.HTTP_201_CREATED)
-async def create_campaign(
-    campaign: CampaignCreate,
-    current_user: User = Depends(get_current_user),
-    rate_limiter = Depends(get_rate_limiter),
-):
-    """
-    Create a new campaign.
-    
-    This creates a campaign in draft status. Messages can be added later.
-    """
-    # Check rate limits
-    await rate_limiter.check_rate_limit(current_user.id, "create_campaign")
-    
-    try:
-        # Use repository context for proper connection management
-        from app.db.repositories.campaigns import CampaignRepository
-        
-        async with get_repository_context(CampaignRepository) as campaign_repo:
-            # Create campaign
-            result = await campaign_repo.create_campaign(
-                name=campaign.name,
-                description=campaign.description,
-                user_id=current_user.id,
-                scheduled_start_at=campaign.scheduled_start_at,
-                scheduled_end_at=campaign.scheduled_end_at,
-                settings=campaign.settings
-            )
-            
-            return result
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error creating campaign: {str(e)}")
-
-
-@router.post("/from-csv", response_model=CampaignResponse, status_code=status.HTTP_201_CREATED)
-async def create_campaign_from_csv(
-    file: UploadFile = File(...),
-    campaign_data: str = Query(..., description="Campaign data as JSON string"),
-    delimiter: str = Query(",", description="CSV delimiter"),
-    has_header: bool = Query(True, description="Whether CSV has a header row"),
-    phone_column: str = Query("phone", description="Column name containing phone numbers"),
-    current_user: User = Depends(get_current_user),
-    rate_limiter = Depends(get_rate_limiter),
-):
-    """
-    Create a campaign and add phone numbers from CSV.
-    
-    This creates a campaign and immediately adds all phone numbers from the CSV.
-    The campaign will remain in draft status until explicitly started.
-    """
-    import json
-    
-    # Check rate limits
-    await rate_limiter.check_rate_limit(current_user.id, "create_campaign")
-    
-    try:
-        # Parse campaign data
-        campaign_dict = json.loads(campaign_data)
-        campaign_data = CampaignCreateFromCSV(**campaign_dict)
-        
-        # Use repository context for proper connection management
-        from app.db.repositories.campaigns import CampaignRepository
-        
-        async with get_repository_context(CampaignRepository) as campaign_repo:
-            # Create campaign
-            campaign = await campaign_repo.create_campaign(
-                name=campaign_data.name,
-                description=campaign_data.description,
-                user_id=current_user.id,
-                scheduled_start_at=campaign_data.scheduled_start_at,
-                scheduled_end_at=campaign_data.scheduled_end_at,
-                settings=campaign_data.settings
-            )
-            
-            # Read CSV file
-            contents = await file.read()
-            csv_file = io.StringIO(contents.decode('utf-8'))
-            
-            # Parse CSV
-            csv_reader = csv.reader(csv_file, delimiter=delimiter)
-            
-            # Skip header if present
-            if has_header:
-                header = next(csv_reader)
-                try:
-                    phone_index = header.index(phone_column)
-                except ValueError:
-                    raise ValidationError(
-                        message=f"Column '{phone_column}' not found in CSV header",
-                        details={"available_columns": header}
-                    )
-            else:
-                phone_index = 0  # Assume first column has phone numbers
-            
-            # Extract phone numbers
-            phone_numbers = []
-            for row in csv_reader:
-                if row and len(row) > phone_index:
-                    phone = row[phone_index].strip()
-                    if phone:
-                        phone_numbers.append(phone)
-            
-            if not phone_numbers:
-                raise ValidationError(message="No valid phone numbers found in CSV")
-            
-            # Add phone numbers to campaign
-            added_count = await campaign_repo.add_messages_to_campaign(
-                campaign_id=campaign.id,
-                phone_numbers=phone_numbers,
-                message_text=campaign_data.message_template,
-                user_id=current_user.id
-            )
-            
-            # Refresh campaign
-            campaign = await campaign_repo.get_by_id(campaign.id)
-            
-            return campaign
-        
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Invalid campaign data JSON")
-    except ValidationError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error creating campaign: {str(e)}")
-
-
-@router.get("/", response_model=CampaignListResponse)
-async def list_campaigns(
-    pagination: PaginationParams = Depends(),
-    status: Optional[str] = Query(None, description="Filter by campaign status"),
-    current_user: User = Depends(get_current_user),
-):
-    """
-    List campaigns for the current user.
-    
-    Returns a paginated list of campaigns.
-    """
-    try:
-        # Use repository context for proper connection management
-        from app.db.repositories.campaigns import CampaignRepository
-        
-        async with get_repository_context(CampaignRepository) as campaign_repo:
-            # Get campaigns with pagination
-            campaigns, total = await campaign_repo.get_campaigns_for_user(
-                user_id=current_user.id,
-                status=status,
-                skip=pagination.skip,
-                limit=pagination.limit
-            )
-            
-            # Calculate pagination info
-            total_pages = (total + pagination.limit - 1) // pagination.limit
-            
-            # Return paginated response
-            return {
-                "items": campaigns,
-                "total": total,
-                "page": pagination.page,
-                "size": pagination.limit,
-                "pages": total_pages
-            }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error listing campaigns: {str(e)}")
-
-
-@router.get("/{campaign_id}", response_model=CampaignResponse)
-async def get_campaign(
-   campaign_id: str = Path(..., description="Campaign ID"),
-   current_user: User = Depends(get_current_user),
-):
-   """
-   Get details of a specific campaign.
-   """
-   try:
-       from app.db.repositories.campaigns import CampaignRepository
-       
-       async with get_repository_context(CampaignRepository) as campaign_repo:
-           # Get campaign
-           campaign = await campaign_repo.get_by_id(campaign_id)
-           if not campaign:
-               raise NotFoundError(message=f"Campaign {campaign_id} not found")
-           
-           # Check authorization
-           if campaign.user_id != current_user.id:
-               raise HTTPException(status_code=403, detail="Not authorized to access this campaign")
-           
-           return campaign
-       
-   except NotFoundError as e:
-       raise HTTPException(status_code=404, detail=str(e))
-   except Exception as e:
-       raise HTTPException(status_code=500, detail=f"Error retrieving campaign: {str(e)}")
-
-
-@router.put("/{campaign_id}", response_model=CampaignResponse)
-async def update_campaign(
-   campaign_update: CampaignUpdate,
-   campaign_id: str = Path(..., description="Campaign ID"),
-   current_user: User = Depends(get_current_user),
-):
-   """
-   Update campaign details.
-   
-   Only draft campaigns can be fully updated. Active campaigns can only have their description updated.
-   """
-   try:
-       from app.db.repositories.campaigns import CampaignRepository
-       
-       async with get_repository_context(CampaignRepository) as campaign_repo:
-           # Get campaign
-           campaign = await campaign_repo.get_by_id(campaign_id)
-           if not campaign:
-               raise NotFoundError(message=f"Campaign {campaign_id} not found")
-           
-           # Check authorization
-           if campaign.user_id != current_user.id:
-               raise HTTPException(status_code=403, detail="Not authorized to update this campaign")
-           
-           # Check if campaign can be updated
-           if campaign.status != "draft" and any([
-               campaign_update.scheduled_start_at is not None,
-               campaign_update.scheduled_end_at is not None,
-               campaign_update.name is not None
-           ]):
-               raise HTTPException(
-                   status_code=400, 
-                   detail="Only draft campaigns can have name or schedule updated"
-               )
-           
-           # Convert to dict and remove None values
-           update_data = {k: v for k, v in campaign_update.dict().items() if v is not None}
-           
-           # Update campaign
-           updated = await campaign_repo.update(id=campaign_id, obj_in=update_data)
-           if not updated:
-               raise HTTPException(status_code=500, detail="Failed to update campaign")
-           
-           return updated
-       
-   except NotFoundError as e:
-       raise HTTPException(status_code=404, detail=str(e))
-   except Exception as e:
-       raise HTTPException(status_code=500, detail=f"Error updating campaign: {str(e)}")
-
-
-@router.post("/{campaign_id}/start", response_model=CampaignResponse)
-async def start_campaign(
-   campaign_id: str = Path(..., description="Campaign ID"),
-   current_user: User = Depends(get_current_user),
-   campaign_processor = Depends(get_campaign_processor),
-):
-   """
-   Start a campaign.
-   
-   This will change the campaign status to active and begin sending messages.
-   """
-   try:
-       # Start campaign - campaign_processor already uses context managers internally
-       success = await campaign_processor.start_campaign(
-           campaign_id=campaign_id,
-           user_id=current_user.id
-       )
-       
-       if not success:
-           raise HTTPException(status_code=400, detail="Failed to start campaign")
-       
-       # Get updated campaign - use context manager for this separate operation
-       from app.db.repositories.campaigns import CampaignRepository
-       
-       async with get_repository_context(CampaignRepository) as campaign_repo:
-           campaign = await campaign_repo.get_by_id(campaign_id)
-           return campaign
-       
-   except Exception as e:
-       raise HTTPException(status_code=500, detail=f"Error starting campaign: {str(e)}")
-
-
-@router.post("/{campaign_id}/pause", response_model=CampaignResponse)
-async def pause_campaign(
-   campaign_id: str = Path(..., description="Campaign ID"),
-   current_user: User = Depends(get_current_user),
-   campaign_processor = Depends(get_campaign_processor),
-):
-   """
-   Pause a campaign.
-   
-   This will change the campaign status to paused and stop sending messages.
-   The campaign can be resumed later.
-   """
-   try:
-       # Pause campaign - campaign_processor already uses context managers internally
-       success = await campaign_processor.pause_campaign(
-           campaign_id=campaign_id,
-           user_id=current_user.id
-       )
-       
-       if not success:
-           raise HTTPException(status_code=400, detail="Failed to pause campaign")
-       
-       # Get updated campaign - use context manager for this separate operation
-       from app.db.repositories.campaigns import CampaignRepository
-       
-       async with get_repository_context(CampaignRepository) as campaign_repo:
-           campaign = await campaign_repo.get_by_id(campaign_id)
-           return campaign
-       
-   except Exception as e:
-       raise HTTPException(status_code=500, detail=f"Error pausing campaign: {str(e)}")
-
-
-@router.post("/{campaign_id}/cancel", response_model=CampaignResponse)
-async def cancel_campaign(
-   campaign_id: str = Path(..., description="Campaign ID"),
-   current_user: User = Depends(get_current_user),
-   campaign_processor = Depends(get_campaign_processor),
-):
-   """
-   Cancel a campaign.
-   
-   This will change the campaign status to cancelled and stop sending messages.
-   The campaign cannot be resumed after cancellation.
-   """
-   try:
-       # Cancel campaign - campaign_processor already uses context managers internally
-       success = await campaign_processor.cancel_campaign(
-           campaign_id=campaign_id,
-           user_id=current_user.id
-       )
-       
-       if not success:
-           raise HTTPException(status_code=400, detail="Failed to cancel campaign")
-       
-       # Get updated campaign - use context manager for this separate operation
-       from app.db.repositories.campaigns import CampaignRepository
-       
-       async with get_repository_context(CampaignRepository) as campaign_repo:
-           campaign = await campaign_repo.get_by_id(campaign_id)
-           return campaign
-       
-   except Exception as e:
-       raise HTTPException(status_code=500, detail=f"Error cancelling campaign: {str(e)}")
-
-
-@router.get("/{campaign_id}/messages", response_model=dict)
-async def get_campaign_messages(
-   campaign_id: str = Path(..., description="Campaign ID"),
-   pagination: PaginationParams = Depends(),
-   status: Optional[str] = Query(None, description="Filter by message status"),
-   current_user: User = Depends(get_current_user),
-):
-   """
-   Get messages for a campaign.
-   
-   Returns a paginated list of messages for the specified campaign.
-   """
-   try:
-       # Use repository context for proper connection management
-       from app.db.repositories.campaigns import CampaignRepository
-       from app.db.repositories.messages import MessageRepository
-       
-       # First check if campaign exists and belongs to user
-       async with get_repository_context(CampaignRepository) as campaign_repo:
-           campaign = await campaign_repo.get_by_id(campaign_id)
-           
-           if not campaign:
-               raise NotFoundError(message=f"Campaign {campaign_id} not found")
-           
-           if campaign.user_id != current_user.id:
-               raise HTTPException(status_code=403, detail="Not authorized to access this campaign")
-       
-       # Get messages for campaign - in a separate context to avoid long transactions
-       async with get_repository_context(MessageRepository) as message_repo:
-           messages, total = await message_repo.get_messages_for_campaign(
-               campaign_id=campaign_id,
-               status=status,
-               skip=pagination.skip,
-               limit=pagination.limit
-           )
-           
-           # Return paginated response
-           return paginate_response(
-               items=[message.dict() for message in messages],
-               total=total,
-               pagination=pagination
-           )
-       
-   except NotFoundError as e:
-       raise HTTPException(status_code=404, detail=str(e))
-   except Exception as e:
-       raise HTTPException(status_code=500, detail=f"Error retrieving campaign messages: {str(e)}")
-
-
-@router.delete("/{campaign_id}", status_code=204)
-async def delete_campaign(
-   campaign_id: str = Path(..., description="Campaign ID"),
-   current_user: User = Depends(get_current_user),
-):
-   """
-   Delete a campaign.
-   
-   Only draft campaigns can be deleted. Active, paused, or completed campaigns cannot be deleted.
-   """
-   try:
-       from app.db.repositories.campaigns import CampaignRepository
-       
-       async with get_repository_context(CampaignRepository) as campaign_repo:
-           # Get campaign
-           campaign = await campaign_repo.get_by_id(campaign_id)
-           if not campaign:
-               raise NotFoundError(message=f"Campaign {campaign_id} not found")
-           
-           # Check authorization
-           if campaign.user_id != current_user.id:
-               raise HTTPException(status_code=403, detail="Not authorized to delete this campaign")
-           
-           # Check if campaign can be deleted
-           if campaign.status != "draft":
-               raise HTTPException(
-                   status_code=400, 
-                   detail="Only draft campaigns can be deleted"
-               )
-           
-           # Delete campaign
-           success = await campaign_repo.delete(id=campaign_id)
-           if not success:
-               raise HTTPException(status_code=500, detail="Failed to delete campaign")
-           
-           return JSONResponse(status_code=204, content=None)
-       
-   except NotFoundError as e:
-       raise HTTPException(status_code=404, detail=str(e))
-   except Exception as e:
-       raise HTTPException(status_code=500, detail=f"Error deleting campaign: {str(e)}")
-</file>
-
-<file path="app/api/v1/endpoints/templates.py">
-# app/api/v1/endpoints/templates.py
-"""
-API endpoints for message templates.
-"""
-from typing import List, Optional, Dict, Any
-from fastapi import APIRouter, Depends, HTTPException, Path, Query, status, Body
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-
-from app.api.v1.dependencies import get_current_user
-from app.core.exceptions import ValidationError, NotFoundError
-from app.schemas.template import (
-    MessageTemplateCreate,
-    MessageTemplateUpdate,
-    MessageTemplateResponse,
-    MessageWithTemplate
-)
-from app.schemas.user import User
-from app.utils.pagination import PaginationParams, paginate_response
-from app.services.sms.sender import get_sms_sender
-from app.db.session import get_repository_context
-
-router = APIRouter()
-
-
-@router.post("/", response_model=MessageTemplateResponse, status_code=status.HTTP_201_CREATED)
-async def create_template(
-    template: MessageTemplateCreate,
-    current_user: User = Depends(get_current_user)
-):
-    """
-    Create a new message template.
-    
-    Templates can include variables in the format {{variable_name}} which will
-    be replaced when sending messages.
-    """
-    try:
-        # Use repository context for proper connection management
-        from app.db.repositories.templates import TemplateRepository
-        
-        async with get_repository_context(TemplateRepository) as template_repo:
-            # Create template
-            result = await template_repo.create_template(
-                name=template.name,
-                content=template.content,
-                description=template.description,
-                variables=template.variables,
-                is_active=template.is_active,
-                user_id=current_user.id
-            )
-            
-            return result
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error creating template: {str(e)}")
-
-
-@router.get("/", response_model=Dict[str, Any])
-async def list_templates(
-    pagination: PaginationParams = Depends(),
-    active_only: bool = Query(False, description="Return only active templates"),
-    current_user: User = Depends(get_current_user)
-):
-    """
-    List message templates for the current user.
-    
-    Returns a paginated list of templates.
-    """
-    try:
-        # Use repository context for proper connection management
-        from app.db.repositories.templates import TemplateRepository
-        
-        async with get_repository_context(TemplateRepository) as template_repo:
-            # Get templates
-            templates, total = await template_repo.get_templates_for_user(
-                user_id=current_user.id,
-                active_only=active_only,
-                skip=pagination.skip,
-                limit=pagination.limit
-            )
-            
-            # Return paginated response
-            return paginate_response(
-                items=[template.dict() for template in templates],
-                total=total,
-                pagination=pagination
-            )
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error listing templates: {str(e)}")
-
-
-@router.get("/{template_id}", response_model=MessageTemplateResponse)
-async def get_template(
-    template_id: str = Path(..., description="Template ID"),
-    current_user: User = Depends(get_current_user)
-):
-    """
-    Get a specific message template.
-    """
-    try:
-        # Use repository context for proper connection management
-        from app.db.repositories.templates import TemplateRepository
-        
-        async with get_repository_context(TemplateRepository) as template_repo:
-            # Get template
-            template = await template_repo.get_by_id(template_id)
-            
-            # Check if template exists
-            if not template:
-                raise NotFoundError(message=f"Template {template_id} not found")
-            
-            # Check authorization
-            if template.user_id != current_user.id:
-                raise HTTPException(status_code=403, detail="Not authorized to access this template")
-            
-            return template
-        
-    except NotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error getting template: {str(e)}")
-
-
-@router.put("/{template_id}", response_model=MessageTemplateResponse)
-async def update_template(
-    template_update: MessageTemplateUpdate,
-    template_id: str = Path(..., description="Template ID"),
-    current_user: User = Depends(get_current_user)
-):
-    """
-    Update a message template.
-    """
-    try:
-        # Use repository context for proper connection management
-        from app.db.repositories.templates import TemplateRepository
-        
-        async with get_repository_context(TemplateRepository) as template_repo:
-            # Get template
-            template = await template_repo.get_by_id(template_id)
-            
-            # Check if template exists
-            if not template:
-                raise NotFoundError(message=f"Template {template_id} not found")
-            
-            # Check authorization
-            if template.user_id != current_user.id:
-                raise HTTPException(status_code=403, detail="Not authorized to update this template")
-            
-            # Extract variables from content if content was updated
-            update_data = template_update.dict(exclude_unset=True)
-            if "content" in update_data:
-                import re
-                pattern = r"{{([a-zA-Z0-9_]+)}}"
-                update_data["variables"] = list(set(re.findall(pattern, update_data["content"])))
-            
-            # Update template
-            updated_template = await template_repo.update(id=template_id, obj_in=update_data)
-            
-            return updated_template
-        
-    except NotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error updating template: {str(e)}")
-
-
-@router.delete("/{template_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_template(
-    template_id: str = Path(..., description="Template ID"),
-    current_user: User = Depends(get_current_user)
-):
-    """
-    Delete a message template.
-    """
-    try:
-        # Use repository context for proper connection management
-        from app.db.repositories.templates import TemplateRepository
-        
-        async with get_repository_context(TemplateRepository) as template_repo:
-            # Get template
-            template = await template_repo.get_by_id(template_id)
-            
-            # Check if template exists
-            if not template:
-                raise NotFoundError(message=f"Template {template_id} not found")
-            
-            # Check authorization
-            if template.user_id != current_user.id:
-                raise HTTPException(status_code=403, detail="Not authorized to delete this template")
-            
-            # Delete template
-            success = await template_repo.delete(id=template_id)
-            
-            if not success:
-                raise HTTPException(status_code=500, detail="Failed to delete template")
-            
-            # Return no content
-            return None
-        
-    except NotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error deleting template: {str(e)}")
-
-
-# Create a Pydantic model for the apply request
-class TemplateApplyRequest(BaseModel):
-    """Request model for applying a template."""
-    template_id: str
-    variables: Dict[str, str]
-
-
-@router.post("/apply")
-async def apply_template(
-    request: TemplateApplyRequest = Body(...),
-    current_user: User = Depends(get_current_user)
-):
-    """
-    Apply variables to a template and return the result.
-    
-    This endpoint is useful for previewing how a template will look with specific variables.
-    """
-    try:
-        # Use repository context for proper connection management
-        from app.db.repositories.templates import TemplateRepository
-        
-        async with get_repository_context(TemplateRepository) as template_repo:
-            # Get template
-            template = await template_repo.get_by_id(request.template_id)
-            
-            # Check if template exists
-            if not template:
-                raise NotFoundError(message=f"Template {request.template_id} not found")
-            
-            # Check authorization
-            if template.user_id != current_user.id:
-                raise HTTPException(status_code=403, detail="Not authorized to access this template")
-            
-            # Apply template
-            result = await template_repo.apply_template(
-                template_id=request.template_id,
-                variables=request.variables
-            )
-            
-            # Check for missing variables
-            import re
-            missing_vars = re.findall(r"{{([a-zA-Z0-9_]+)}}", result)
-            
-            return {
-                "result": result,
-                "missing_variables": missing_vars
-            }
-        
-    except NotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error applying template: {str(e)}")
-
-
-@router.post("/send", status_code=status.HTTP_202_ACCEPTED)
-async def send_with_template(
-    message: MessageWithTemplate,
-    current_user: User = Depends(get_current_user),
-    sms_sender = Depends(get_sms_sender)
-):
-    """
-    Send a message using a template.
-    
-    Applies the provided variables to the template and sends the resulting message.
-    """
-    try:
-        # Use repository context for proper connection management
-        from app.db.repositories.templates import TemplateRepository
-        
-        async with get_repository_context(TemplateRepository) as template_repo:
-            # Get template
-            template = await template_repo.get_by_id(message.template_id)
-            
-            # Check if template exists
-            if not template:
-                raise NotFoundError(message=f"Template {message.template_id} not found")
-            
-            # Check authorization
-            if template.user_id != current_user.id:
-                raise HTTPException(status_code=403, detail="Not authorized to use this template")
-            
-            # Apply template
-            message_text = await template_repo.apply_template(
-                template_id=message.template_id,
-                variables=message.variables
-            )
-            
-            # Check for missing variables
-            import re
-            missing_vars = re.findall(r"{{([a-zA-Z0-9_]+)}}", message_text)
-            if missing_vars:
-                raise ValidationError(
-                    message="Missing template variables", 
-                    details={"missing_variables": missing_vars}
-                )
-        
-        # Send message using sms_sender which already uses context managers internally
-        result = await sms_sender.send_message(
-            phone_number=message.phone_number,
-            message_text=message_text,
-            user_id=current_user.id,
-            scheduled_at=message.scheduled_at,
-            custom_id=message.custom_id,
-            metadata={"template_id": message.template_id, "template_variables": message.variables}
-        )
-        
-        return result
-        
-    except NotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except ValidationError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error sending message: {str(e)}")
-</file>
-
-<file path="app/db/repositories/base.py">
-"""
-Base repository with common database operations.
-"""
-from typing import Any, Dict, Generic, List, Optional, Type, TypeVar, Union
-from uuid import uuid4
-
-from fastapi.encoders import jsonable_encoder
-from pydantic import BaseModel
-from sqlalchemy import select, update, delete
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.models.base import Base
-
-# Define generic types for models
-ModelType = TypeVar("ModelType", bound=Base)
-CreateSchemaType = TypeVar("CreateSchemaType", bound=BaseModel)
-UpdateSchemaType = TypeVar("UpdateSchemaType", bound=BaseModel)
-
-
-class BaseRepository(Generic[ModelType, CreateSchemaType, UpdateSchemaType]):
-    """
-    Base repository with common CRUD operations.
-    
-    Generic repository pattern implementation for database access.
-    """
-    
-    def __init__(self, session: AsyncSession, model: Type[ModelType]):
-        """
-        Initialize repository with session and model.
-        
-        Args:
-            session: Database session
-            model: SQLAlchemy model class
-        """
-        self.session = session
-        self.model = model
-        self.session_is_owned = False
-    
-    async def __aenter__(self):
-        """Support async context manager protocol."""
-        return self
-    
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Clean up resources when exiting context."""
-        if self._session_is_owned:
-            await self.close()
-    
-    async def close(self):
-        """Close the session if we own it."""
-        if self.session:
-            await self.session.close()
-            self.session = None
-    
-    async def get_by_id(self, id: str) -> Optional[ModelType]:
-        """
-        Get a record by ID.
-        
-        Args:
-            id: Record ID
-            
-        Returns:
-            ModelType: Found record or None
-        """
-        query = select(self.model).where(self.model.id == id)
-        result = await self.session.execute(query)
-        return result.scalar_one_or_none()
-    
-    async def get_by_attribute(self, attr_name: str, attr_value: Any) -> Optional[ModelType]:
-        """
-        Get a record by a specific attribute.
-        
-        Args:
-            attr_name: Attribute name
-            attr_value: Attribute value
-            
-        Returns:
-            ModelType: Found record or None
-        """
-        query = select(self.model).where(getattr(self.model, attr_name) == attr_value)
-        result = await self.session.execute(query)
-        return result.scalar_one_or_none()
-    
-    async def list(
-        self, 
-        *,
-        filters: Optional[Dict[str, Any]] = None,
-        skip: int = 0, 
-        limit: int = 100
-    ) -> List[ModelType]:
-        """
-        Get a list of records with optional filtering.
-        
-        Args:
-            filters: Optional filters as dict
-            skip: Number of records to skip
-            limit: Maximum number of records to return
-            
-        Returns:
-            List[ModelType]: List of records
-        """
-        query = select(self.model)
-        
-        # Apply filters if provided
-        if filters:
-            for attr_name, attr_value in filters.items():
-                if hasattr(self.model, attr_name) and attr_value is not None:
-                    query = query.where(getattr(self.model, attr_name) == attr_value)
-        
-        # Apply pagination
-        query = query.offset(skip).limit(limit)
-        
-        result = await self.session.execute(query)
-        return result.scalars().all()
-    
-    async def create(self, *, obj_in: Union[CreateSchemaType, Dict[str, Any]]) -> ModelType:
-        """
-        Create a new record.
-        
-        Args:
-            obj_in: Data to create record with
-            
-        Returns:
-            ModelType: Created record
-        """
-        # Convert to dict if it's a Pydantic model
-        obj_in_data = obj_in if isinstance(obj_in, dict) else obj_in.dict(exclude_unset=True)
-        
-        # Create model instance
-        db_obj = self.model(**obj_in_data)
-        
-        # Generate ID if not provided
-        if not db_obj.id:
-            db_obj.id = str(uuid4())
-        
-        # Add to session
-        self.session.add(db_obj)
-        await self.session.commit()
-        await self.session.refresh(db_obj)
-        
-        return db_obj
-    
-    async def update(
-        self, 
-        *,
-        id: str,
-        obj_in: Union[UpdateSchemaType, Dict[str, Any]]
-    ) -> Optional[ModelType]:
-        """
-        Update a record.
-        
-        Args:
-            id: Record ID
-            obj_in: Data to update record with
-            
-        Returns:
-            ModelType: Updated record or None
-        """
-        # Get current record
-        db_obj = await self.get_by_id(id)
-        if not db_obj:
-            return None
-        
-        # Convert to dict if it's a Pydantic model
-        update_data = obj_in if isinstance(obj_in, dict) else obj_in.dict(exclude_unset=True)
-        
-        # Remove None values
-        update_data = {k: v for k, v in update_data.items() if v is not None}
-        
-        # Update record
-        for field, value in update_data.items():
-            if hasattr(db_obj, field):
-                setattr(db_obj, field, value)
-        
-        # Save changes
-        self.session.add(db_obj)
-        await self.session.commit()
-        await self.session.refresh(db_obj)
-        
-        return db_obj
-    
-    async def delete(self, *, id: str) -> bool:
-        """
-        Delete a record.
-        
-        Args:
-            id: Record ID
-            
-        Returns:
-            bool: True if deleted, False if not found
-        """
-        # Check if record exists
-        db_obj = await self.get_by_id(id)
-        if not db_obj:
-            return False
-        
-        # Delete record
-        await self.session.delete(db_obj)
-        await self.session.commit()
-        
-        return True
-    
-    async def count(self, *, filters: Optional[Dict[str, Any]] = None) -> int:
-        """
-        Count records with optional filtering.
-        
-        Args:
-            filters: Optional filters as dict
-            
-        Returns:
-            int: Number of records
-        """
-        from sqlalchemy import func
-        
-        query = select(func.count()).select_from(self.model)
-        
-        # Apply filters if provided
-        if filters:
-            for attr_name, attr_value in filters.items():
-                if hasattr(self.model, attr_name) and attr_value is not None:
-                    query = query.where(getattr(self.model, attr_name) == attr_value)
-        
-        result = await self.session.execute(query)
-        return result.scalar_one()
-    
-
-    async def execute_in_transaction(self, func, *args, **kwargs):
-        """
-        Execute a function within a transaction.
-        
-        Args:
-            func: Async function to execute
-            args: Function positional arguments
-            kwargs: Function keyword arguments
-            
-        Returns:
-            The result of the function
-        """
-        async with self.session.begin():
-            return await func(*args, **kwargs)
-</file>
-
 <file path="app/main.py">
 """
 Main FastAPI application entry point for Inboxerr Backend.
@@ -4575,177 +3547,6 @@ def downgrade() -> None:
     ${downgrades if downgrades else "pass"}
 </file>
 
-<file path="app/api/v1/dependencies.py">
-"""
-Dependencies for API endpoints.
-"""
-from fastapi import Depends, HTTPException, status, Header
-from fastapi.security import OAuth2PasswordBearer
-from typing import Optional, List
-import jwt
-from datetime import datetime, timedelta, timezone
-
-from app.core.config import settings
-from app.core.exceptions import AuthenticationError, AuthorizationError
-from app.schemas.user import User, TokenData, UserRole
-from app.db.repositories.users import UserRepository
-from app.services.rate_limiter import RateLimiter
-
-# OAuth2 scheme for token authentication
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"{settings.API_PREFIX}/auth/token")
-
-
-async def get_user_repository():
-    """Get user repository."""
-    from app.db.session import get_repository
-    return await get_repository(UserRepository)
-
-
-async def get_rate_limiter():
-    """Get rate limiter service."""
-    return RateLimiter()
-
-
-async def get_current_user(
-    token: str = Depends(oauth2_scheme),
-    user_repository = Depends(get_user_repository)
-) -> User:
-    """
-    Get the current authenticated user from the JWT token.
-    
-    Args:
-        token: JWT token from Authorization header
-        user_repository: User repository for database access
-        
-    Returns:
-        User: The authenticated user
-        
-    Raises:
-        AuthenticationError: If the token is invalid or expired
-    """
-    try:
-        # Decode JWT token
-        payload = jwt.decode(
-            token, 
-            settings.SECRET_KEY, 
-            algorithms=["HS256"]
-        )
-        token_data = TokenData(**payload)
-        
-        # Check if token is expired
-        if token_data.exp and datetime.now(timezone.utc) > token_data.exp:
-            raise AuthenticationError("Token has expired")
-        
-        # Get user from database
-        user = await user_repository.get_by_id(token_data.sub)
-        if not user:
-            raise AuthenticationError("User not found")
-        
-        # Check if user is active
-        if not user.is_active:
-            raise AuthenticationError("User is inactive")
-        
-        return user
-        
-    except jwt.PyJWTError:
-        raise AuthenticationError("Invalid token")
-
-
-async def verify_api_key(
-    api_key: str = Header(..., alias=settings.API_KEY_HEADER),
-    user_repository = Depends(get_user_repository)
-) -> User:
-    """
-    Verify API key and return the associated user.
-    
-    Args:
-        api_key: API key from header
-        user_repository: User repository for database access
-        
-    Returns:
-        User: The authenticated user
-        
-    Raises:
-        AuthenticationError: If the API key is invalid
-    """
-    try:
-        # Get API key from database
-        api_key_record = await user_repository.get_api_key(api_key)
-        if not api_key_record:
-            raise AuthenticationError("Invalid API key")
-        
-        # Check if API key is active
-        if not api_key_record.is_active:
-            raise AuthenticationError("API key is inactive")
-        
-        # Check if API key is expired
-        if api_key_record.expires_at and datetime.now(timezone.utc) > api_key_record.expires_at:
-            raise AuthenticationError("API key has expired")
-        
-        # Get user associated with API key
-        user = await user_repository.get_by_id(api_key_record.user_id)
-        if not user:
-            raise AuthenticationError("User not found")
-        
-        # Check if user is active
-        if not user.is_active:
-            raise AuthenticationError("User is inactive")
-        
-        # Update last used timestamp
-        await user_repository.update_api_key_usage(api_key)
-        
-        return user
-        
-    except Exception as e:
-        if isinstance(e, AuthenticationError):
-            raise
-        raise AuthenticationError("API key verification failed")
-
-
-async def get_current_active_user(
-    current_user: User = Depends(get_current_user)
-) -> User:
-    """
-    Get the current active user.
-    
-    Args:
-        current_user: Current authenticated user
-        
-    Returns:
-        User: The authenticated active user
-        
-    Raises:
-        AuthenticationError: If the user is inactive
-    """
-    if not current_user.is_active:
-        raise AuthenticationError("Inactive user")
-    return current_user
-
-
-async def validate_permissions(
-    required_permissions: List[str],
-    current_user: User = Depends(get_current_user)
-) -> None:
-    """
-    Validate that the current user has the required permissions.
-    
-    Args:
-        required_permissions: List of required permissions
-        current_user: Current authenticated user
-        
-    Raises:
-        AuthorizationError: If the user doesn't have the required permissions
-    """
-    # Admin role has all permissions
-    if current_user.role == UserRole.ADMIN:
-        return
-    
-    # TODO: Implement proper permission checking
-    # For now, just verify role-based access
-    if current_user.role != UserRole.API and "api" in required_permissions:
-        raise AuthorizationError("Insufficient permissions")
-</file>
-
 <file path="app/api/v1/endpoints/auth.py">
 """
 API endpoints for authentication.
@@ -4937,6 +3738,469 @@ async def delete_api_key(
         )
     
     return None
+</file>
+
+<file path="app/api/v1/endpoints/campaigns.py">
+# app/api/v1/endpoints/campaigns.py
+import csv
+import io
+from typing import List, Optional
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, UploadFile, File, Query, Path, status
+from fastapi.responses import JSONResponse
+
+from app.api.v1.dependencies import get_current_user, get_rate_limiter
+from app.core.exceptions import ValidationError, NotFoundError
+from app.schemas.campaign import (
+    CampaignCreate,
+    CampaignCreateFromCSV,
+    CampaignUpdate,
+    CampaignResponse,
+    CampaignStatus,
+    CampaignListResponse
+)
+from app.schemas.user import User
+from app.utils.pagination import PaginationParams, paginate_response
+from app.services.campaigns.processor import get_campaign_processor
+from app.db.session import get_repository_context
+
+router = APIRouter()
+
+
+@router.post("/", response_model=CampaignResponse, status_code=status.HTTP_201_CREATED)
+async def create_campaign(
+    campaign: CampaignCreate,
+    current_user: User = Depends(get_current_user),
+    rate_limiter = Depends(get_rate_limiter),
+):
+    """
+    Create a new campaign.
+    
+    This creates a campaign in draft status. Messages can be added later.
+    """
+    # Check rate limits
+    await rate_limiter.check_rate_limit(current_user.id, "create_campaign")
+    
+    try:
+        # Use repository context for proper connection management
+        from app.db.repositories.campaigns import CampaignRepository
+        
+        async with get_repository_context(CampaignRepository) as campaign_repo:
+            # Create campaign
+            result = await campaign_repo.create_campaign(
+                name=campaign.name,
+                description=campaign.description,
+                user_id=current_user.id,
+                scheduled_start_at=campaign.scheduled_start_at,
+                scheduled_end_at=campaign.scheduled_end_at,
+                settings=campaign.settings
+            )
+            
+            return result
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error creating campaign: {str(e)}")
+
+
+@router.post("/from-csv", response_model=CampaignResponse, status_code=status.HTTP_201_CREATED)
+async def create_campaign_from_csv(
+    file: UploadFile = File(...),
+    campaign_data: str = Query(..., description="Campaign data as JSON string"),
+    delimiter: str = Query(",", description="CSV delimiter"),
+    has_header: bool = Query(True, description="Whether CSV has a header row"),
+    phone_column: str = Query("phone", description="Column name containing phone numbers"),
+    current_user: User = Depends(get_current_user),
+    rate_limiter = Depends(get_rate_limiter),
+):
+    """
+    Create a campaign and add phone numbers from CSV.
+    
+    This creates a campaign and immediately adds all phone numbers from the CSV.
+    The campaign will remain in draft status until explicitly started.
+    """
+    import json
+    
+    # Check rate limits
+    await rate_limiter.check_rate_limit(current_user.id, "create_campaign")
+    
+    try:
+        # Parse campaign data
+        campaign_dict = json.loads(campaign_data)
+        campaign_data = CampaignCreateFromCSV(**campaign_dict)
+        
+        # Use repository context for proper connection management
+        from app.db.repositories.campaigns import CampaignRepository
+        
+        async with get_repository_context(CampaignRepository) as campaign_repo:
+            # Create campaign
+            campaign = await campaign_repo.create_campaign(
+                name=campaign_data.name,
+                description=campaign_data.description,
+                user_id=current_user.id,
+                scheduled_start_at=campaign_data.scheduled_start_at,
+                scheduled_end_at=campaign_data.scheduled_end_at,
+                settings=campaign_data.settings
+            )
+            
+            # Read CSV file
+            contents = await file.read()
+            csv_file = io.StringIO(contents.decode('utf-8'))
+            
+            # Parse CSV
+            csv_reader = csv.reader(csv_file, delimiter=delimiter)
+            
+            # Skip header if present
+            if has_header:
+                header = next(csv_reader)
+                try:
+                    phone_index = header.index(phone_column)
+                except ValueError:
+                    raise ValidationError(
+                        message=f"Column '{phone_column}' not found in CSV header",
+                        details={"available_columns": header}
+                    )
+            else:
+                phone_index = 0  # Assume first column has phone numbers
+            
+            # Extract phone numbers
+            phone_numbers = []
+            for row in csv_reader:
+                if row and len(row) > phone_index:
+                    phone = row[phone_index].strip()
+                    if phone:
+                        phone_numbers.append(phone)
+            
+            if not phone_numbers:
+                raise ValidationError(message="No valid phone numbers found in CSV")
+            
+            # Add phone numbers to campaign
+            added_count = await campaign_repo.add_messages_to_campaign(
+                campaign_id=campaign.id,
+                phone_numbers=phone_numbers,
+                message_text=campaign_data.message_template,
+                user_id=current_user.id
+            )
+            
+            # Refresh campaign
+            campaign = await campaign_repo.get_by_id(campaign.id)
+            
+            return campaign
+        
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid campaign data JSON")
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error creating campaign: {str(e)}")
+
+
+@router.get("/", response_model=CampaignListResponse)
+async def list_campaigns(
+    pagination: PaginationParams = Depends(),
+    status: Optional[str] = Query(None, description="Filter by campaign status"),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    List campaigns for the current user.
+    
+    Returns a paginated list of campaigns.
+    """
+    try:
+        # Use repository context for proper connection management
+        from app.db.repositories.campaigns import CampaignRepository
+        
+        async with get_repository_context(CampaignRepository) as campaign_repo:
+            # Get campaigns with pagination
+            campaigns, total = await campaign_repo.get_campaigns_for_user(
+                user_id=current_user.id,
+                status=status,
+                skip=pagination.skip,
+                limit=pagination.limit
+            )
+            
+            # Calculate pagination info
+            total_pages = (total + pagination.limit - 1) // pagination.limit
+            
+            # Return paginated response
+            return {
+                "items": campaigns,
+                "total": total,
+                "page": pagination.page,
+                "size": pagination.limit,
+                "pages": total_pages
+            }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error listing campaigns: {str(e)}")
+
+
+@router.get("/{campaign_id}", response_model=CampaignResponse)
+async def get_campaign(
+   campaign_id: str = Path(..., description="Campaign ID"),
+   current_user: User = Depends(get_current_user),
+):
+   """
+   Get details of a specific campaign.
+   """
+   try:
+       from app.db.repositories.campaigns import CampaignRepository
+       
+       async with get_repository_context(CampaignRepository) as campaign_repo:
+           # Get campaign
+           campaign = await campaign_repo.get_by_id(campaign_id)
+           if not campaign:
+               raise NotFoundError(message=f"Campaign {campaign_id} not found")
+           
+           # Check authorization
+           if campaign.user_id != current_user.id:
+               raise HTTPException(status_code=403, detail="Not authorized to access this campaign")
+           
+           return campaign
+       
+   except NotFoundError as e:
+       raise HTTPException(status_code=404, detail=str(e))
+   except Exception as e:
+       raise HTTPException(status_code=500, detail=f"Error retrieving campaign: {str(e)}")
+
+
+@router.put("/{campaign_id}", response_model=CampaignResponse)
+async def update_campaign(
+   campaign_update: CampaignUpdate,
+   campaign_id: str = Path(..., description="Campaign ID"),
+   current_user: User = Depends(get_current_user),
+):
+   """
+   Update campaign details.
+   
+   Only draft campaigns can be fully updated. Active campaigns can only have their description updated.
+   """
+   try:
+       from app.db.repositories.campaigns import CampaignRepository
+       
+       async with get_repository_context(CampaignRepository) as campaign_repo:
+           # Get campaign
+           campaign = await campaign_repo.get_by_id(campaign_id)
+           if not campaign:
+               raise NotFoundError(message=f"Campaign {campaign_id} not found")
+           
+           # Check authorization
+           if campaign.user_id != current_user.id:
+               raise HTTPException(status_code=403, detail="Not authorized to update this campaign")
+           
+           # Check if campaign can be updated
+           if campaign.status != "draft" and any([
+               campaign_update.scheduled_start_at is not None,
+               campaign_update.scheduled_end_at is not None,
+               campaign_update.name is not None
+           ]):
+               raise HTTPException(
+                   status_code=400, 
+                   detail="Only draft campaigns can have name or schedule updated"
+               )
+           
+           # Convert to dict and remove None values
+           update_data = {k: v for k, v in campaign_update.dict().items() if v is not None}
+           
+           # Update campaign
+           updated = await campaign_repo.update(id=campaign_id, obj_in=update_data)
+           if not updated:
+               raise HTTPException(status_code=500, detail="Failed to update campaign")
+           
+           return updated
+       
+   except NotFoundError as e:
+       raise HTTPException(status_code=404, detail=str(e))
+   except Exception as e:
+       raise HTTPException(status_code=500, detail=f"Error updating campaign: {str(e)}")
+
+
+@router.post("/{campaign_id}/start", response_model=CampaignResponse)
+async def start_campaign(
+   campaign_id: str = Path(..., description="Campaign ID"),
+   current_user: User = Depends(get_current_user),
+   campaign_processor = Depends(get_campaign_processor),
+):
+   """
+   Start a campaign.
+   
+   This will change the campaign status to active and begin sending messages.
+   """
+   try:
+       # Start campaign - campaign_processor already uses context managers internally
+       success = await campaign_processor.start_campaign(
+           campaign_id=campaign_id,
+           user_id=current_user.id
+       )
+       
+       if not success:
+           raise HTTPException(status_code=400, detail="Failed to start campaign")
+       
+       # Get updated campaign - use context manager for this separate operation
+       from app.db.repositories.campaigns import CampaignRepository
+       
+       async with get_repository_context(CampaignRepository) as campaign_repo:
+           campaign = await campaign_repo.get_by_id(campaign_id)
+           return campaign
+       
+   except Exception as e:
+       raise HTTPException(status_code=500, detail=f"Error starting campaign: {str(e)}")
+
+
+@router.post("/{campaign_id}/pause", response_model=CampaignResponse)
+async def pause_campaign(
+   campaign_id: str = Path(..., description="Campaign ID"),
+   current_user: User = Depends(get_current_user),
+   campaign_processor = Depends(get_campaign_processor),
+):
+   """
+   Pause a campaign.
+   
+   This will change the campaign status to paused and stop sending messages.
+   The campaign can be resumed later.
+   """
+   try:
+       # Pause campaign - campaign_processor already uses context managers internally
+       success = await campaign_processor.pause_campaign(
+           campaign_id=campaign_id,
+           user_id=current_user.id
+       )
+       
+       if not success:
+           raise HTTPException(status_code=400, detail="Failed to pause campaign")
+       
+       # Get updated campaign - use context manager for this separate operation
+       from app.db.repositories.campaigns import CampaignRepository
+       
+       async with get_repository_context(CampaignRepository) as campaign_repo:
+           campaign = await campaign_repo.get_by_id(campaign_id)
+           return campaign
+       
+   except Exception as e:
+       raise HTTPException(status_code=500, detail=f"Error pausing campaign: {str(e)}")
+
+
+@router.post("/{campaign_id}/cancel", response_model=CampaignResponse)
+async def cancel_campaign(
+   campaign_id: str = Path(..., description="Campaign ID"),
+   current_user: User = Depends(get_current_user),
+   campaign_processor = Depends(get_campaign_processor),
+):
+   """
+   Cancel a campaign.
+   
+   This will change the campaign status to cancelled and stop sending messages.
+   The campaign cannot be resumed after cancellation.
+   """
+   try:
+       # Cancel campaign - campaign_processor already uses context managers internally
+       success = await campaign_processor.cancel_campaign(
+           campaign_id=campaign_id,
+           user_id=current_user.id
+       )
+       
+       if not success:
+           raise HTTPException(status_code=400, detail="Failed to cancel campaign")
+       
+       # Get updated campaign - use context manager for this separate operation
+       from app.db.repositories.campaigns import CampaignRepository
+       
+       async with get_repository_context(CampaignRepository) as campaign_repo:
+           campaign = await campaign_repo.get_by_id(campaign_id)
+           return campaign
+       
+   except Exception as e:
+       raise HTTPException(status_code=500, detail=f"Error cancelling campaign: {str(e)}")
+
+
+@router.get("/{campaign_id}/messages", response_model=dict)
+async def get_campaign_messages(
+   campaign_id: str = Path(..., description="Campaign ID"),
+   pagination: PaginationParams = Depends(),
+   status: Optional[str] = Query(None, description="Filter by message status"),
+   current_user: User = Depends(get_current_user),
+):
+   """
+   Get messages for a campaign.
+   
+   Returns a paginated list of messages for the specified campaign.
+   """
+   try:
+       # Use repository context for proper connection management
+       from app.db.repositories.campaigns import CampaignRepository
+       from app.db.repositories.messages import MessageRepository
+       
+       # First check if campaign exists and belongs to user
+       async with get_repository_context(CampaignRepository) as campaign_repo:
+           campaign = await campaign_repo.get_by_id(campaign_id)
+           
+           if not campaign:
+               raise NotFoundError(message=f"Campaign {campaign_id} not found")
+           
+           if campaign.user_id != current_user.id:
+               raise HTTPException(status_code=403, detail="Not authorized to access this campaign")
+       
+       # Get messages for campaign - in a separate context to avoid long transactions
+       async with get_repository_context(MessageRepository) as message_repo:
+           messages, total = await message_repo.get_messages_for_campaign(
+               campaign_id=campaign_id,
+               status=status,
+               skip=pagination.skip,
+               limit=pagination.limit
+           )
+           
+           # Return paginated response
+           return paginate_response(
+               items=[message.dict() for message in messages],
+               total=total,
+               pagination=pagination
+           )
+       
+   except NotFoundError as e:
+       raise HTTPException(status_code=404, detail=str(e))
+   except Exception as e:
+       raise HTTPException(status_code=500, detail=f"Error retrieving campaign messages: {str(e)}")
+
+
+@router.delete("/{campaign_id}", status_code=204)
+async def delete_campaign(
+   campaign_id: str = Path(..., description="Campaign ID"),
+   current_user: User = Depends(get_current_user),
+):
+   """
+   Delete a campaign.
+   
+   Only draft campaigns can be deleted. Active, paused, or completed campaigns cannot be deleted.
+   """
+   try:
+       from app.db.repositories.campaigns import CampaignRepository
+       
+       async with get_repository_context(CampaignRepository) as campaign_repo:
+           # Get campaign
+           campaign = await campaign_repo.get_by_id(campaign_id)
+           if not campaign:
+               raise NotFoundError(message=f"Campaign {campaign_id} not found")
+           
+           # Check authorization
+           if campaign.user_id != current_user.id:
+               raise HTTPException(status_code=403, detail="Not authorized to delete this campaign")
+           
+           # Check if campaign can be deleted
+           if campaign.status != "draft":
+               raise HTTPException(
+                   status_code=400, 
+                   detail="Only draft campaigns can be deleted"
+               )
+           
+           # Delete campaign
+           success = await campaign_repo.delete(id=campaign_id)
+           if not success:
+               raise HTTPException(status_code=500, detail="Failed to delete campaign")
+           
+           return JSONResponse(status_code=204, content=None)
+       
+   except NotFoundError as e:
+       raise HTTPException(status_code=404, detail=str(e))
+   except Exception as e:
+       raise HTTPException(status_code=500, detail=f"Error deleting campaign: {str(e)}")
 </file>
 
 <file path="app/api/v1/endpoints/messages.py">
@@ -5315,6 +4579,329 @@ async def get_usage_metrics(
             "total": 1000
         }
     }
+</file>
+
+<file path="app/api/v1/endpoints/templates.py">
+# app/api/v1/endpoints/templates.py
+"""
+API endpoints for message templates.
+"""
+from typing import List, Optional, Dict, Any
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, status, Body
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+from app.api.v1.dependencies import get_current_user
+from app.core.exceptions import ValidationError, NotFoundError
+from app.schemas.template import (
+    MessageTemplateCreate,
+    MessageTemplateUpdate,
+    MessageTemplateResponse,
+    MessageWithTemplate
+)
+from app.schemas.user import User
+from app.utils.pagination import PaginationParams, paginate_response
+from app.services.sms.sender import get_sms_sender
+from app.db.session import get_repository_context
+
+router = APIRouter()
+
+
+@router.post("/", response_model=MessageTemplateResponse, status_code=status.HTTP_201_CREATED)
+async def create_template(
+    template: MessageTemplateCreate,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Create a new message template.
+    
+    Templates can include variables in the format {{variable_name}} which will
+    be replaced when sending messages.
+    """
+    try:
+        # Use repository context for proper connection management
+        from app.db.repositories.templates import TemplateRepository
+        
+        async with get_repository_context(TemplateRepository) as template_repo:
+            # Create template
+            result = await template_repo.create_template(
+                name=template.name,
+                content=template.content,
+                description=template.description,
+                variables=template.variables,
+                is_active=template.is_active,
+                user_id=current_user.id
+            )
+            
+            return result
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error creating template: {str(e)}")
+
+
+@router.get("/", response_model=Dict[str, Any])
+async def list_templates(
+    pagination: PaginationParams = Depends(),
+    active_only: bool = Query(False, description="Return only active templates"),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    List message templates for the current user.
+    
+    Returns a paginated list of templates.
+    """
+    try:
+        # Use repository context for proper connection management
+        from app.db.repositories.templates import TemplateRepository
+        
+        async with get_repository_context(TemplateRepository) as template_repo:
+            # Get templates
+            templates, total = await template_repo.get_templates_for_user(
+                user_id=current_user.id,
+                active_only=active_only,
+                skip=pagination.skip,
+                limit=pagination.limit
+            )
+            
+            # Return paginated response
+            return paginate_response(
+                items=[template.dict() for template in templates],
+                total=total,
+                pagination=pagination
+            )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error listing templates: {str(e)}")
+
+
+@router.get("/{template_id}", response_model=MessageTemplateResponse)
+async def get_template(
+    template_id: str = Path(..., description="Template ID"),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Get a specific message template.
+    """
+    try:
+        # Use repository context for proper connection management
+        from app.db.repositories.templates import TemplateRepository
+        
+        async with get_repository_context(TemplateRepository) as template_repo:
+            # Get template
+            template = await template_repo.get_by_id(template_id)
+            
+            # Check if template exists
+            if not template:
+                raise NotFoundError(message=f"Template {template_id} not found")
+            
+            # Check authorization
+            if template.user_id != current_user.id:
+                raise HTTPException(status_code=403, detail="Not authorized to access this template")
+            
+            return template
+        
+    except NotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error getting template: {str(e)}")
+
+
+@router.put("/{template_id}", response_model=MessageTemplateResponse)
+async def update_template(
+    template_update: MessageTemplateUpdate,
+    template_id: str = Path(..., description="Template ID"),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Update a message template.
+    """
+    try:
+        # Use repository context for proper connection management
+        from app.db.repositories.templates import TemplateRepository
+        
+        async with get_repository_context(TemplateRepository) as template_repo:
+            # Get template
+            template = await template_repo.get_by_id(template_id)
+            
+            # Check if template exists
+            if not template:
+                raise NotFoundError(message=f"Template {template_id} not found")
+            
+            # Check authorization
+            if template.user_id != current_user.id:
+                raise HTTPException(status_code=403, detail="Not authorized to update this template")
+            
+            # Extract variables from content if content was updated
+            update_data = template_update.dict(exclude_unset=True)
+            if "content" in update_data:
+                import re
+                pattern = r"{{([a-zA-Z0-9_]+)}}"
+                update_data["variables"] = list(set(re.findall(pattern, update_data["content"])))
+            
+            # Update template
+            updated_template = await template_repo.update(id=template_id, obj_in=update_data)
+            
+            return updated_template
+        
+    except NotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error updating template: {str(e)}")
+
+
+@router.delete("/{template_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_template(
+    template_id: str = Path(..., description="Template ID"),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Delete a message template.
+    """
+    try:
+        # Use repository context for proper connection management
+        from app.db.repositories.templates import TemplateRepository
+        
+        async with get_repository_context(TemplateRepository) as template_repo:
+            # Get template
+            template = await template_repo.get_by_id(template_id)
+            
+            # Check if template exists
+            if not template:
+                raise NotFoundError(message=f"Template {template_id} not found")
+            
+            # Check authorization
+            if template.user_id != current_user.id:
+                raise HTTPException(status_code=403, detail="Not authorized to delete this template")
+            
+            # Delete template
+            success = await template_repo.delete(id=template_id)
+            
+            if not success:
+                raise HTTPException(status_code=500, detail="Failed to delete template")
+            
+            # Return no content
+            return None
+        
+    except NotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error deleting template: {str(e)}")
+
+
+# Create a Pydantic model for the apply request
+class TemplateApplyRequest(BaseModel):
+    """Request model for applying a template."""
+    template_id: str
+    variables: Dict[str, str]
+
+
+@router.post("/apply")
+async def apply_template(
+    request: TemplateApplyRequest = Body(...),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Apply variables to a template and return the result.
+    
+    This endpoint is useful for previewing how a template will look with specific variables.
+    """
+    try:
+        # Use repository context for proper connection management
+        from app.db.repositories.templates import TemplateRepository
+        
+        async with get_repository_context(TemplateRepository) as template_repo:
+            # Get template
+            template = await template_repo.get_by_id(request.template_id)
+            
+            # Check if template exists
+            if not template:
+                raise NotFoundError(message=f"Template {request.template_id} not found")
+            
+            # Check authorization
+            if template.user_id != current_user.id:
+                raise HTTPException(status_code=403, detail="Not authorized to access this template")
+            
+            # Apply template
+            result = await template_repo.apply_template(
+                template_id=request.template_id,
+                variables=request.variables
+            )
+            
+            # Check for missing variables
+            import re
+            missing_vars = re.findall(r"{{([a-zA-Z0-9_]+)}}", result)
+            
+            return {
+                "result": result,
+                "missing_variables": missing_vars
+            }
+        
+    except NotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error applying template: {str(e)}")
+
+
+@router.post("/send", status_code=status.HTTP_202_ACCEPTED)
+async def send_with_template(
+    message: MessageWithTemplate,
+    current_user: User = Depends(get_current_user),
+    sms_sender = Depends(get_sms_sender)
+):
+    """
+    Send a message using a template.
+    
+    Applies the provided variables to the template and sends the resulting message.
+    """
+    try:
+        # Use repository context for proper connection management
+        from app.db.repositories.templates import TemplateRepository
+        
+        async with get_repository_context(TemplateRepository) as template_repo:
+            # Get template
+            template = await template_repo.get_by_id(message.template_id)
+            
+            # Check if template exists
+            if not template:
+                raise NotFoundError(message=f"Template {message.template_id} not found")
+            
+            # Check authorization
+            if template.user_id != current_user.id:
+                raise HTTPException(status_code=403, detail="Not authorized to use this template")
+            
+            # Apply template
+            message_text = await template_repo.apply_template(
+                template_id=message.template_id,
+                variables=message.variables
+            )
+            
+            # Check for missing variables
+            import re
+            missing_vars = re.findall(r"{{([a-zA-Z0-9_]+)}}", message_text)
+            if missing_vars:
+                raise ValidationError(
+                    message="Missing template variables", 
+                    details={"missing_variables": missing_vars}
+                )
+        
+        # Send message using sms_sender which already uses context managers internally
+        result = await sms_sender.send_message(
+            phone_number=message.phone_number,
+            message_text=message_text,
+            user_id=current_user.id,
+            scheduled_at=message.scheduled_at,
+            custom_id=message.custom_id,
+            metadata={"template_id": message.template_id, "template_variables": message.variables}
+        )
+        
+        return result
+        
+    except NotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error sending message: {str(e)}")
 </file>
 
 <file path="app/core/events.py">
@@ -5783,6 +5370,248 @@ from app.models.message import Message, MessageEvent, MessageBatch, MessageTempl
 from app.models.webhook import Webhook, WebhookDelivery, WebhookEvent
 
 # This allows alembic to auto-discover all models when creating migrations
+</file>
+
+<file path="app/db/repositories/base.py">
+"""
+Base repository with common database operations.
+"""
+from typing import Any, Dict, Generic, List, Optional, Type, TypeVar, Union
+from uuid import uuid4
+
+from fastapi.encoders import jsonable_encoder
+from pydantic import BaseModel
+from sqlalchemy import select, update, delete
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.base import Base
+
+# Define generic types for models
+ModelType = TypeVar("ModelType", bound=Base)
+CreateSchemaType = TypeVar("CreateSchemaType", bound=BaseModel)
+UpdateSchemaType = TypeVar("UpdateSchemaType", bound=BaseModel)
+
+
+class BaseRepository(Generic[ModelType, CreateSchemaType, UpdateSchemaType]):
+    """
+    Base repository with common CRUD operations.
+    
+    Generic repository pattern implementation for database access.
+    """
+    
+    def __init__(self, session: AsyncSession, model: Type[ModelType]):
+        """
+        Initialize repository with session and model.
+        
+        Args:
+            session: Database session
+            model: SQLAlchemy model class
+        """
+        self.session = session
+        self.model = model
+        self.session_is_owned = False
+    
+    async def __aenter__(self):
+        """Support async context manager protocol."""
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Clean up resources when exiting context."""
+        if self._session_is_owned:
+            await self.close()
+    
+    async def close(self):
+        """Close the session if we own it."""
+        if self.session:
+            await self.session.close()
+            self.session = None
+    
+    async def get_by_id(self, id: str) -> Optional[ModelType]:
+        """
+        Get a record by ID.
+        
+        Args:
+            id: Record ID
+            
+        Returns:
+            ModelType: Found record or None
+        """
+        query = select(self.model).where(self.model.id == id)
+        result = await self.session.execute(query)
+        return result.scalar_one_or_none()
+    
+    async def get_by_attribute(self, attr_name: str, attr_value: Any) -> Optional[ModelType]:
+        """
+        Get a record by a specific attribute.
+        
+        Args:
+            attr_name: Attribute name
+            attr_value: Attribute value
+            
+        Returns:
+            ModelType: Found record or None
+        """
+        query = select(self.model).where(getattr(self.model, attr_name) == attr_value)
+        result = await self.session.execute(query)
+        return result.scalar_one_or_none()
+    
+    async def list(
+        self, 
+        *,
+        filters: Optional[Dict[str, Any]] = None,
+        skip: int = 0, 
+        limit: int = 100
+    ) -> List[ModelType]:
+        """
+        Get a list of records with optional filtering.
+        
+        Args:
+            filters: Optional filters as dict
+            skip: Number of records to skip
+            limit: Maximum number of records to return
+            
+        Returns:
+            List[ModelType]: List of records
+        """
+        query = select(self.model)
+        
+        # Apply filters if provided
+        if filters:
+            for attr_name, attr_value in filters.items():
+                if hasattr(self.model, attr_name) and attr_value is not None:
+                    query = query.where(getattr(self.model, attr_name) == attr_value)
+        
+        # Apply pagination
+        query = query.offset(skip).limit(limit)
+        
+        result = await self.session.execute(query)
+        return result.scalars().all()
+    
+    async def create(self, *, obj_in: Union[CreateSchemaType, Dict[str, Any]]) -> ModelType:
+        """
+        Create a new record.
+        
+        Args:
+            obj_in: Data to create record with
+            
+        Returns:
+            ModelType: Created record
+        """
+        # Convert to dict if it's a Pydantic model
+        obj_in_data = obj_in if isinstance(obj_in, dict) else obj_in.dict(exclude_unset=True)
+        
+        # Create model instance
+        db_obj = self.model(**obj_in_data)
+        
+        # Generate ID if not provided
+        if not db_obj.id:
+            db_obj.id = str(uuid4())
+        
+        # Add to session
+        self.session.add(db_obj)
+        await self.session.commit()
+        await self.session.refresh(db_obj)
+        
+        return db_obj
+    
+    async def update(
+        self, 
+        *,
+        id: str,
+        obj_in: Union[UpdateSchemaType, Dict[str, Any]]
+    ) -> Optional[ModelType]:
+        """
+        Update a record.
+        
+        Args:
+            id: Record ID
+            obj_in: Data to update record with
+            
+        Returns:
+            ModelType: Updated record or None
+        """
+        # Get current record
+        db_obj = await self.get_by_id(id)
+        if not db_obj:
+            return None
+        
+        # Convert to dict if it's a Pydantic model
+        update_data = obj_in if isinstance(obj_in, dict) else obj_in.dict(exclude_unset=True)
+        
+        # Remove None values
+        update_data = {k: v for k, v in update_data.items() if v is not None}
+        
+        # Update record
+        for field, value in update_data.items():
+            if hasattr(db_obj, field):
+                setattr(db_obj, field, value)
+        
+        # Save changes
+        self.session.add(db_obj)
+        await self.session.commit()
+        await self.session.refresh(db_obj)
+        
+        return db_obj
+    
+    async def delete(self, *, id: str) -> bool:
+        """
+        Delete a record.
+        
+        Args:
+            id: Record ID
+            
+        Returns:
+            bool: True if deleted, False if not found
+        """
+        # Check if record exists
+        db_obj = await self.get_by_id(id)
+        if not db_obj:
+            return False
+        
+        # Delete record
+        await self.session.delete(db_obj)
+        await self.session.commit()
+        
+        return True
+    
+    async def count(self, *, filters: Optional[Dict[str, Any]] = None) -> int:
+        """
+        Count records with optional filtering.
+        
+        Args:
+            filters: Optional filters as dict
+            
+        Returns:
+            int: Number of records
+        """
+        from sqlalchemy import func
+        
+        query = select(func.count()).select_from(self.model)
+        
+        # Apply filters if provided
+        if filters:
+            for attr_name, attr_value in filters.items():
+                if hasattr(self.model, attr_name) and attr_value is not None:
+                    query = query.where(getattr(self.model, attr_name) == attr_value)
+        
+        result = await self.session.execute(query)
+        return result.scalar_one()
+    
+
+    async def execute_in_transaction(self, func, *args, **kwargs):
+        """
+        Execute a function within a transaction.
+        
+        Args:
+            func: Async function to execute
+            args: Function positional arguments
+            kwargs: Function keyword arguments
+            
+        Returns:
+            The result of the function
+        """
+        async with self.session.begin():
+            return await func(*args, **kwargs)
 </file>
 
 <file path="app/db/repositories/templates.py">
@@ -6284,508 +6113,6 @@ class WebhookRepository(BaseRepository[Webhook, Dict[str, Any], Dict[str, Any]])
         
         result = await self.session.execute(query)
         return result.scalars().all()
-</file>
-
-<file path="app/db/session.py">
-"""
-Database session management.
-"""
-# app/db/session.py
-import logging
-from contextlib import asynccontextmanager
-from typing import AsyncGenerator, Any, Type, TypeVar
-
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlalchemy.orm import sessionmaker
-from fastapi import Depends
-
-from app.core.config import settings
-from app.db.base import Base
-
-logger = logging.getLogger("inboxerr.db")
-
-# Create async engine with optimized pool settings
-engine = create_async_engine(
-    settings.DATABASE_URL,
-    echo=settings.DEBUG,
-    # Enhanced pool settings for better concurrency
-    pool_size=20,
-    max_overflow=30,
-    pool_timeout=30,
-    pool_recycle=3600,
-    pool_pre_ping=True
-)
-
-# Create async session factory
-async_session_factory = sessionmaker(
-    engine, class_=AsyncSession, expire_on_commit=False, autoflush=False
-)
-
-# Context manager for database sessions
-@asynccontextmanager
-async def get_session() -> AsyncGenerator[AsyncSession, None]:
-    """
-    Context manager for database sessions.
-    
-    Automatically handles commit/rollback and ensures session is closed.
-    
-    Usage:
-        async with get_session() as session:
-            # Use session here
-    """
-    session = async_session_factory()
-    try:
-        yield session
-        await session.commit()
-        logger.debug("Database session committed")
-    except Exception as e:
-        await session.rollback()
-        logger.error(f"Database session rolled back due to: {str(e)}")
-        raise
-    finally:
-        await session.close()
-        logger.debug("Database session closed")
-
-# Dependency function for FastAPI endpoints
-async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    """
-    Get a database session for FastAPI endpoints via dependency injection.
-    """
-    async with get_session() as session:
-        yield session
-
-# Create a type variable for repository types
-T = TypeVar('T')
-
-# Factory function for repositories
-def get_repository_factory(repo_type: Type[T]):
-    """
-    Create a repository factory for use with FastAPI dependency injection.
-    
-    Usage:
-        @router.get("/")
-        async def endpoint(repo = Depends(get_repository_factory(UserRepository))):
-            # Use repo here
-    """
-    async def _get_repo(session: AsyncSession = Depends(get_db)) -> T:
-        return repo_type(session)
-    return _get_repo
-
-# Context manager for repositories
-@asynccontextmanager
-async def get_repository_context(repo_type: Type[T]) -> AsyncGenerator[T, None]:
-    """
-    Get a repository with managed session lifecycle.
-    
-    Usage:
-        async with get_repository_context(UserRepository) as repo:
-            # Use repo here
-    """
-    async with get_session() as session:
-        yield repo_type(session)
-
-# Legacy function for backward compatibility
-async def get_repository(repo_type: Type[T]) -> T:
-    """
-    Legacy repository factory (for backward compatibility).
-    Warning: Session must be manually closed when using this function.
-    
-    This will be deprecated - use get_repository_context instead.
-    """
-    logger.warning(
-        "Using deprecated get_repository function - session won't be automatically closed. "
-        "Consider using get_repository_context instead."
-    )
-    session = async_session_factory()
-    return repo_type(session)
-
-async def initialize_database() -> None:
-    """
-    Initialize the database connection pool and run any startup tasks.
-    
-    This should be called during application startup.
-    """
-    logger.info("Initializing database connection pool")
-    
-    # Test database connection
-    async with get_session() as session:
-        try:
-            # Use text() for raw SQL queries
-            from sqlalchemy import text
-            query = text("SELECT 1")
-            await session.execute(query)
-            logger.info("Database connection successful")
-        except Exception as e:
-            logger.error(f"Database connection failed: {e}")
-            raise
-            
-    logger.info("Database initialization complete")
-
-
-async def close_database_connections() -> None:
-    """
-    Close all database connections in the pool.
-    
-    This should be called during application shutdown.
-    """
-    logger.info("Closing database connections")
-    
-    # Dispose the engine to close all connections in the pool
-    await engine.dispose()
-    
-    logger.info("Database connections closed")
-</file>
-
-<file path="app/services/campaigns/processor.py">
-# app/services/campaigns/processor.py
-import asyncio
-import logging
-from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional
-import uuid
-
-from app.core.config import settings
-from app.db.repositories.campaigns import CampaignRepository
-from app.db.repositories.messages import MessageRepository
-from app.schemas.message import MessageStatus
-from app.services.event_bus.bus import get_event_bus
-from app.services.event_bus.events import EventType
-from app.services.sms.sender import SMSSender, get_sms_sender
-from app.db.session import get_repository_context
-
-logger = logging.getLogger("inboxerr.campaigns")
-
-class CampaignProcessor:
-    """
-    Service for processing SMS campaigns.
-    
-    Manages campaign execution, chunked processing, and status tracking.
-    Uses context managers for database operations to prevent connection leaks.
-    """
-    
-    def __init__(
-        self,
-        sms_sender: SMSSender,
-        event_bus: Any
-    ):
-        """
-        Initialize campaign processor with required dependencies.
-        
-        Removed repository dependencies to prevent long-lived connections.
-        The repositories will be created as needed using context managers.
-        
-        Args:
-            sms_sender: SMS sender service
-            event_bus: Event bus for publishing events
-        """
-        self.sms_sender = sms_sender
-        self.event_bus = event_bus
-        self._processing_campaigns = set()
-        self._chunk_size = settings.BATCH_SIZE  # Default from settings
-        self._semaphore = asyncio.Semaphore(5)  # Limit concurrent campaigns
-    
-    async def start_campaign(self, campaign_id: str, user_id: str) -> bool:
-        """
-        Start a campaign.
-        
-        Args:
-            campaign_id: Campaign ID
-            user_id: User ID for authorization
-            
-        Returns:
-            bool: True if campaign was started, False otherwise
-        """
-        # Use context manager for repository access
-        async with get_repository_context(CampaignRepository) as campaign_repository:
-            # Get campaign
-            campaign = await campaign_repository.get_by_id(campaign_id)
-            if not campaign:
-                return False
-            
-            # Validate ownership
-            if campaign.user_id != user_id:
-                return False
-            
-            # Check if campaign can be started
-            if campaign.status != "draft" and campaign.status != "paused":
-                return False
-            
-            # Update status to active
-            updated = await campaign_repository.update_campaign_status(
-                campaign_id=campaign_id,
-                status="active",
-                started_at=datetime.now(timezone.utc)
-            )
-            
-            if not updated:
-                return False
-            
-            # Get total_messages for the event
-            total_messages = campaign.total_messages
-        
-        # Start processing in background
-        asyncio.create_task(self._process_campaign(campaign_id))
-        
-        # Publish event
-        await self.event_bus.publish(
-            EventType.BATCH_CREATED,
-            {
-                "campaign_id": campaign_id,
-                "user_id": user_id,
-                "total_messages": total_messages
-            }
-        )
-        
-        return True
-    
-    async def pause_campaign(self, campaign_id: str, user_id: str) -> bool:
-        """
-        Pause a campaign.
-        
-        Args:
-            campaign_id: Campaign ID
-            user_id: User ID for authorization
-            
-        Returns:
-            bool: True if campaign was paused, False otherwise
-        """
-        # Use context manager for repository access
-        async with get_repository_context(CampaignRepository) as campaign_repository:
-            # Get campaign
-            campaign = await campaign_repository.get_by_id(campaign_id)
-            if not campaign:
-                return False
-            
-            # Validate ownership
-            if campaign.user_id != user_id:
-                return False
-            
-            # Check if campaign can be paused
-            if campaign.status != "active":
-                return False
-            
-            # Update status to paused
-            updated = await campaign_repository.update_campaign_status(
-                campaign_id=campaign_id,
-                status="paused"
-            )
-            
-            return updated is not None
-    
-    async def cancel_campaign(self, campaign_id: str, user_id: str) -> bool:
-        """
-        Cancel a campaign.
-        
-        Args:
-            campaign_id: Campaign ID
-            user_id: User ID for authorization
-            
-        Returns:
-            bool: True if campaign was cancelled, False otherwise
-        """
-        # Use context manager for repository access
-        async with get_repository_context(CampaignRepository) as campaign_repository:
-            # Get campaign
-            campaign = await campaign_repository.get_by_id(campaign_id)
-            if not campaign:
-                return False
-            
-            # Validate ownership
-            if campaign.user_id != user_id:
-                return False
-            
-            # Check if campaign can be cancelled
-            if campaign.status in ["completed", "cancelled", "failed"]:
-                return False
-            
-            # Update status to cancelled
-            updated = await campaign_repository.update_campaign_status(
-                campaign_id=campaign_id,
-                status="cancelled",
-                completed_at=datetime.now(timezone.utc)
-            )
-            
-            return updated is not None
-    
-    async def _process_campaign(self, campaign_id: str) -> None:
-        """
-        Process a campaign in the background.
-        
-        Args:
-            campaign_id: Campaign ID
-        """
-        if campaign_id in self._processing_campaigns:
-            logger.warning(f"Campaign {campaign_id} is already being processed")
-            return
-        
-        # Mark as processing
-        self._processing_campaigns.add(campaign_id)
-        
-        try:
-            # Check campaign status with context manager
-            async with get_repository_context(CampaignRepository) as campaign_repository:
-                campaign = await campaign_repository.get_by_id(campaign_id)
-                if not campaign or campaign.status != "active":
-                    return
-            
-            # Process in chunks until complete
-            async with self._semaphore:
-                await self._process_campaign_chunks(campaign_id)
-                
-        except Exception as e:
-            logger.error(f"Error processing campaign {campaign_id}: {e}", exc_info=True)
-            # Update campaign status to failed with a new context manager
-            try:
-                async with get_repository_context(CampaignRepository) as campaign_repository:
-                    await campaign_repository.update_campaign_status(
-                        campaign_id=campaign_id,
-                        status="failed",
-                        completed_at=datetime.now(timezone.utc)
-                    )
-            except Exception as update_error:
-                logger.error(f"Failed to update campaign status: {update_error}")
-        finally:
-            # Remove from processing set
-            self._processing_campaigns.remove(campaign_id)
-    
-    async def _process_campaign_chunks(self, campaign_id: str) -> None:
-        """
-        Process campaign messages in chunks.
-        
-        Args:
-            campaign_id: Campaign ID
-        """
-        # Query pending messages in chunks
-        offset = 0
-        
-        while True:
-            # Check if campaign is still active with context manager
-            campaign = None
-            async with get_repository_context(CampaignRepository) as campaign_repository:
-                campaign = await campaign_repository.get_by_id(campaign_id)
-                if not campaign or campaign.status != "active":
-                    logger.info(f"Campaign {campaign_id} is no longer active, stopping processing")
-                    return
-            
-            # Get next chunk of messages with context manager
-            messages = []
-            total = 0
-            async with get_repository_context(MessageRepository) as message_repository:
-                messages, total = await message_repository.get_messages_for_campaign(
-                    campaign_id=campaign_id,
-                    status=MessageStatus.PENDING,
-                    skip=offset,
-                    limit=self._chunk_size
-                )
-            
-            # If no more messages, campaign is complete
-            if not messages:
-                logger.info(f"No more pending messages for campaign {campaign_id}")
-                async with get_repository_context(CampaignRepository) as campaign_repository:
-                    await campaign_repository.update_campaign_status(
-                        campaign_id=campaign_id,
-                        status="completed",
-                        completed_at=datetime.now(timezone.utc)
-                    )
-                return
-            
-            # Process this chunk
-            await self._process_message_chunk(campaign_id, messages)
-            
-            # Update offset for next chunk
-            offset += len(messages)
-            
-            # Small delay between chunks to avoid overloading
-            await asyncio.sleep(0.5)
-    
-    async def _process_message_chunk(self, campaign_id: str, messages: List[Any]) -> None:
-        """
-        Process a chunk of messages with proper context management.
-        
-        Args:
-            campaign_id: Campaign ID
-            messages: List of message objects
-        """
-        # Process each message in the chunk
-        success_count = 0
-        fail_count = 0
-        
-        for message in messages:
-            try:
-                # Use SMS sender to send the message
-                result = await self.sms_sender._send_to_gateway(
-                    phone_number=message.phone_number,
-                    message_text=message.message,
-                    custom_id=message.custom_id or str(uuid.uuid4())
-                )
-                
-                # Update message status with context manager
-                async with get_repository_context(MessageRepository) as message_repository:
-                    await message_repository.update_message_status(
-                        message_id=message.id,
-                        status=result.get("status", MessageStatus.PENDING),
-                        event_type="campaign_process",
-                        gateway_message_id=result.get("gateway_message_id"),
-                        data=result
-                    )
-                
-                success_count += 1
-                
-                # Add delay between messages to avoid overloading gateway
-                await asyncio.sleep(settings.DELAY_BETWEEN_SMS)
-                
-            except Exception as e:
-                logger.error(f"Error processing message {message.id}: {e}")
-                
-                # Update message status to failed with context manager
-                try:
-                    async with get_repository_context(MessageRepository) as message_repository:
-                        await message_repository.update_message_status(
-                            message_id=message.id,
-                            status=MessageStatus.FAILED,
-                            event_type="campaign_process_error",
-                            reason=str(e),
-                            data={"error": str(e)}
-                        )
-                except Exception as update_error:
-                    logger.error(f"Failed to update message status: {update_error}")
-                
-                fail_count += 1
-        
-        # Update campaign stats with context manager
-        if success_count > 0 or fail_count > 0:
-            try:
-                async with get_repository_context(CampaignRepository) as campaign_repository:
-                    await campaign_repository.update_campaign_stats(
-                        campaign_id=campaign_id,
-                        increment_sent=success_count,
-                        increment_failed=fail_count
-                    )
-            except Exception as update_error:
-                logger.error(f"Failed to update campaign stats: {update_error}")
-        
-        logger.info(f"Processed chunk for campaign {campaign_id}: {success_count} sent, {fail_count} failed")
-
-
-# Dependency injection function
-async def get_campaign_processor():
-    """
-    Get campaign processor service instance.
-    
-    Uses the SMS sender with its dedicated context management but doesn't create
-    long-lived repository instances. Each operation in the processor will
-    create repositories within context managers as needed.
-    """
-    from app.services.event_bus.bus import get_event_bus
-    from app.services.sms.sender import get_sms_sender
-    
-    sms_sender = await get_sms_sender()
-    event_bus = get_event_bus()
-    
-    return CampaignProcessor(
-        sms_sender=sms_sender,
-        event_bus=event_bus
-    )
 </file>
 
 <file path="app/services/event_bus/bus.py">
@@ -8057,6 +7384,178 @@ api_router.include_router(
 )
 </file>
 
+<file path="app/api/v1/dependencies.py">
+"""
+Dependencies for API endpoints.
+"""
+from fastapi import Depends, HTTPException, status, Header
+from fastapi.security import OAuth2PasswordBearer
+from typing import Optional, List
+import jwt
+from datetime import datetime, timedelta, timezone
+
+from app.core.config import settings
+from app.core.exceptions import AuthenticationError, AuthorizationError
+from app.schemas.user import User, TokenData, UserRole
+from app.db.session import get_repository_factory
+from app.db.repositories.users import UserRepository
+from app.services.rate_limiter import RateLimiter
+
+# OAuth2 scheme for token authentication
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"{settings.API_PREFIX}/auth/token")
+
+#: Dependency injection provider for UserRepository.
+#: This uses FastAPI's built-in dependency system to automatically inject
+get_user_repository = get_repository_factory(UserRepository)
+
+
+
+
+async def get_rate_limiter():
+    """Get rate limiter service."""
+    return RateLimiter()
+
+
+async def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    user_repository = Depends(get_user_repository)
+) -> User:
+    """
+    Get the current authenticated user from the JWT token.
+    
+    Args:
+        token: JWT token from Authorization header
+        user_repository: User repository for database access
+        
+    Returns:
+        User: The authenticated user
+        
+    Raises:
+        AuthenticationError: If the token is invalid or expired
+    """
+    try:
+        # Decode JWT token
+        payload = jwt.decode(
+            token, 
+            settings.SECRET_KEY, 
+            algorithms=["HS256"]
+        )
+        token_data = TokenData(**payload)
+        
+        # Check if token is expired
+        if token_data.exp and datetime.now(timezone.utc) > token_data.exp:
+            raise AuthenticationError("Token has expired")
+        
+        # Get user from database
+        user = await user_repository.get_by_id(token_data.sub)
+        if not user:
+            raise AuthenticationError("User not found")
+        
+        # Check if user is active
+        if not user.is_active:
+            raise AuthenticationError("User is inactive")
+        
+        return user
+        
+    except jwt.PyJWTError:
+        raise AuthenticationError("Invalid token")
+
+
+async def verify_api_key(
+    api_key: str = Header(..., alias=settings.API_KEY_HEADER),
+    user_repository = Depends(get_user_repository)
+) -> User:
+    """
+    Verify API key and return the associated user.
+    
+    Args:
+        api_key: API key from header
+        user_repository: User repository for database access
+        
+    Returns:
+        User: The authenticated user
+        
+    Raises:
+        AuthenticationError: If the API key is invalid
+    """
+    try:
+        # Get API key from database
+        api_key_record = await user_repository.get_api_key(api_key)
+        if not api_key_record:
+            raise AuthenticationError("Invalid API key")
+        
+        # Check if API key is active
+        if not api_key_record.is_active:
+            raise AuthenticationError("API key is inactive")
+        
+        # Check if API key is expired
+        if api_key_record.expires_at and datetime.now(timezone.utc) > api_key_record.expires_at:
+            raise AuthenticationError("API key has expired")
+        
+        # Get user associated with API key
+        user = await user_repository.get_by_id(api_key_record.user_id)
+        if not user:
+            raise AuthenticationError("User not found")
+        
+        # Check if user is active
+        if not user.is_active:
+            raise AuthenticationError("User is inactive")
+        
+        # Update last used timestamp
+        await user_repository.update_api_key_usage(api_key)
+        
+        return user
+        
+    except Exception as e:
+        if isinstance(e, AuthenticationError):
+            raise
+        raise AuthenticationError("API key verification failed")
+
+
+async def get_current_active_user(
+    current_user: User = Depends(get_current_user)
+) -> User:
+    """
+    Get the current active user.
+    
+    Args:
+        current_user: Current authenticated user
+        
+    Returns:
+        User: The authenticated active user
+        
+    Raises:
+        AuthenticationError: If the user is inactive
+    """
+    if not current_user.is_active:
+        raise AuthenticationError("Inactive user")
+    return current_user
+
+
+async def validate_permissions(
+    required_permissions: List[str],
+    current_user: User = Depends(get_current_user)
+) -> None:
+    """
+    Validate that the current user has the required permissions.
+    
+    Args:
+        required_permissions: List of required permissions
+        current_user: Current authenticated user
+        
+    Raises:
+        AuthorizationError: If the user doesn't have the required permissions
+    """
+    # Admin role has all permissions
+    if current_user.role == UserRole.ADMIN:
+        return
+    
+    # TODO: Implement proper permission checking
+    # For now, just verify role-based access
+    if current_user.role != UserRole.API and "api" in required_permissions:
+        raise AuthorizationError("Insufficient permissions")
+</file>
+
 <file path="app/api/v1/endpoints/webhooks.py">
 # app/api/v1/endpoints/webhooks.py
 """
@@ -8677,6 +8176,156 @@ class UserRepository(BaseRepository[User, UserCreate, UserUpdate]):
         return True
 </file>
 
+<file path="app/db/session.py">
+"""
+Database session management.
+"""
+# app/db/session.py
+import logging
+from contextlib import asynccontextmanager
+from typing import AsyncGenerator, Any, Type, TypeVar
+
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.orm import sessionmaker
+from fastapi import Depends
+
+from app.core.config import settings
+from app.db.base import Base
+
+logger = logging.getLogger("inboxerr.db")
+
+# Create async engine with optimized pool settings
+engine = create_async_engine(
+    settings.DATABASE_URL,
+    echo=settings.DEBUG,
+    # Enhanced pool settings for better concurrency
+    pool_size=20,
+    max_overflow=30,
+    pool_timeout=30,
+    pool_recycle=3600,
+    pool_pre_ping=True
+)
+
+# Create async session factory
+async_session_factory = sessionmaker(
+    engine, class_=AsyncSession, expire_on_commit=False, autoflush=False
+)
+
+# Context manager for database sessions
+@asynccontextmanager
+async def get_session() -> AsyncGenerator[AsyncSession, None]:
+    """
+    Context manager for database sessions.
+    
+    Automatically handles commit/rollback and ensures session is closed.
+    
+    Usage:
+        async with get_session() as session:
+            # Use session here
+    """
+    session = async_session_factory()
+    try:
+        yield session
+        await session.commit()
+        logger.debug("Database session committed")
+    except Exception as e:
+        await session.rollback()
+        logger.error(f"Database session rolled back due to: {str(e)}")
+        raise
+    finally:
+        await session.close()
+        logger.debug("Database session closed")
+
+# Dependency function for FastAPI endpoints
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    """
+    Get a database session for FastAPI endpoints via dependency injection.
+    """
+    async with get_session() as session:
+        yield session
+
+# Create a type variable for repository types
+T = TypeVar('T')
+
+# Factory function for repositories
+def get_repository_factory(repo_type: Type[T]):
+    """
+    Create a repository factory for use with FastAPI dependency injection.
+    
+    Usage:
+        @router.get("/")
+        async def endpoint(repo = Depends(get_repository_factory(UserRepository))):
+            # Use repo here
+    """
+    async def _get_repo(session: AsyncSession = Depends(get_db)) -> T:
+        return repo_type(session)
+    return _get_repo
+
+# Context manager for repositories
+@asynccontextmanager
+async def get_repository_context(repo_type: Type[T]) -> AsyncGenerator[T, None]:
+    """
+    Get a repository with managed session lifecycle.
+    
+    Usage:
+        async with get_repository_context(UserRepository) as repo:
+            # Use repo here
+    """
+    async with get_session() as session:
+        yield repo_type(session)
+
+# Legacy function for backward compatibility
+async def get_repository(repo_type: Type[T]) -> T:
+    """
+    Legacy repository factory (for backward compatibility).
+    Warning: Session must be manually closed when using this function.
+    
+    This will be deprecated - use get_repository_context instead.
+    """
+    logger.warning(
+        "Using deprecated get_repository function - session won't be automatically closed. "
+        "Consider using get_repository_context instead."
+    )
+    session = async_session_factory()
+    return repo_type(session)
+
+async def initialize_database() -> None:
+    """
+    Initialize the database connection pool and run any startup tasks.
+    
+    This should be called during application startup.
+    """
+    logger.info("Initializing database connection pool")
+    
+    # Test database connection
+    async with get_session() as session:
+        try:
+            # Use text() for raw SQL queries
+            from sqlalchemy import text
+            query = text("SELECT 1")
+            await session.execute(query)
+            logger.info("Database connection successful")
+        except Exception as e:
+            logger.error(f"Database connection failed: {e}")
+            raise
+            
+    logger.info("Database initialization complete")
+
+
+async def close_database_connections() -> None:
+    """
+    Close all database connections in the pool.
+    
+    This should be called during application shutdown.
+    """
+    logger.info("Closing database connections")
+    
+    # Dispose the engine to close all connections in the pool
+    await engine.dispose()
+    
+    logger.info("Database connections closed")
+</file>
+
 <file path="app/models/base.py">
 """
 Base database model with common fields and methods.
@@ -9200,6 +8849,358 @@ class APIKeyCreate(BaseModel):
     permissions: Optional[List[str]] = Field(default=[], description="List of permissions")
 </file>
 
+<file path="app/services/campaigns/processor.py">
+# app/services/campaigns/processor.py
+import asyncio
+import logging
+from datetime import datetime, timezone
+from typing import List, Dict, Any, Optional
+import uuid
+
+from app.core.config import settings
+from app.db.repositories.campaigns import CampaignRepository
+from app.db.repositories.messages import MessageRepository
+from app.schemas.message import MessageStatus
+from app.services.event_bus.bus import get_event_bus
+from app.services.event_bus.events import EventType
+from app.services.sms.sender import SMSSender, get_sms_sender
+from app.db.session import get_repository_context
+
+logger = logging.getLogger("inboxerr.campaigns")
+
+class CampaignProcessor:
+    """
+    Service for processing SMS campaigns.
+    
+    Manages campaign execution, chunked processing, and status tracking.
+    Uses context managers for database operations to prevent connection leaks.
+    """
+    
+    def __init__(
+        self,
+        sms_sender: SMSSender,
+        event_bus: Any
+    ):
+        """
+        Initialize campaign processor with required dependencies.
+        
+        Removed repository dependencies to prevent long-lived connections.
+        The repositories will be created as needed using context managers.
+        
+        Args:
+            sms_sender: SMS sender service
+            event_bus: Event bus for publishing events
+        """
+        self.sms_sender = sms_sender
+        self.event_bus = event_bus
+        self._processing_campaigns = set()
+        self._chunk_size = settings.BATCH_SIZE  # Default from settings
+        self._semaphore = asyncio.Semaphore(5)  # Limit concurrent campaigns
+    
+    async def start_campaign(self, campaign_id: str, user_id: str) -> bool:
+        """
+        Start a campaign.
+        
+        Args:
+            campaign_id: Campaign ID
+            user_id: User ID for authorization
+            
+        Returns:
+            bool: True if campaign was started, False otherwise
+        """
+        # Use context manager for repository access
+        async with get_repository_context(CampaignRepository) as campaign_repository:
+            # Get campaign
+            campaign = await campaign_repository.get_by_id(campaign_id)
+            if not campaign:
+                return False
+            
+            # Validate ownership
+            if campaign.user_id != user_id:
+                return False
+            
+            # Check if campaign can be started
+            if campaign.status != "draft" and campaign.status != "paused":
+                return False
+            
+            # Update status to active
+            updated = await campaign_repository.update_campaign_status(
+                campaign_id=campaign_id,
+                status="active",
+                started_at=datetime.now(timezone.utc)
+            )
+            
+            if not updated:
+                return False
+            
+            # Get total_messages for the event
+            total_messages = campaign.total_messages
+        
+        # Start processing in background
+        asyncio.create_task(self._process_campaign(campaign_id))
+        
+        # Publish event
+        await self.event_bus.publish(
+            EventType.BATCH_CREATED,
+            {
+                "campaign_id": campaign_id,
+                "user_id": user_id,
+                "total_messages": total_messages
+            }
+        )
+        
+        return True
+    
+    async def pause_campaign(self, campaign_id: str, user_id: str) -> bool:
+        """
+        Pause a campaign.
+        
+        Args:
+            campaign_id: Campaign ID
+            user_id: User ID for authorization
+            
+        Returns:
+            bool: True if campaign was paused, False otherwise
+        """
+        # Use context manager for repository access
+        async with get_repository_context(CampaignRepository) as campaign_repository:
+            # Get campaign
+            campaign = await campaign_repository.get_by_id(campaign_id)
+            if not campaign:
+                return False
+            
+            # Validate ownership
+            if campaign.user_id != user_id:
+                return False
+            
+            # Check if campaign can be paused
+            if campaign.status != "active":
+                return False
+            
+            # Update status to paused
+            updated = await campaign_repository.update_campaign_status(
+                campaign_id=campaign_id,
+                status="paused"
+            )
+            
+            return updated is not None
+    
+    async def cancel_campaign(self, campaign_id: str, user_id: str) -> bool:
+        """
+        Cancel a campaign.
+        
+        Args:
+            campaign_id: Campaign ID
+            user_id: User ID for authorization
+            
+        Returns:
+            bool: True if campaign was cancelled, False otherwise
+        """
+        # Use context manager for repository access
+        async with get_repository_context(CampaignRepository) as campaign_repository:
+            # Get campaign
+            campaign = await campaign_repository.get_by_id(campaign_id)
+            if not campaign:
+                return False
+            
+            # Validate ownership
+            if campaign.user_id != user_id:
+                return False
+            
+            # Check if campaign can be cancelled
+            if campaign.status in ["completed", "cancelled", "failed"]:
+                return False
+            
+            # Update status to cancelled
+            updated = await campaign_repository.update_campaign_status(
+                campaign_id=campaign_id,
+                status="cancelled",
+                completed_at=datetime.now(timezone.utc)
+            )
+            
+            return updated is not None
+    
+    async def _process_campaign(self, campaign_id: str) -> None:
+        """
+        Process a campaign in the background.
+        
+        Args:
+            campaign_id: Campaign ID
+        """
+        if campaign_id in self._processing_campaigns:
+            logger.warning(f"Campaign {campaign_id} is already being processed")
+            return
+        
+        # Mark as processing
+        self._processing_campaigns.add(campaign_id)
+        
+        try:
+            # Check campaign status with context manager
+            async with get_repository_context(CampaignRepository) as campaign_repository:
+                campaign = await campaign_repository.get_by_id(campaign_id)
+                if not campaign or campaign.status != "active":
+                    return
+            
+            # Process in chunks until complete
+            async with self._semaphore:
+                await self._process_campaign_chunks(campaign_id)
+                
+        except Exception as e:
+            logger.error(f"Error processing campaign {campaign_id}: {e}", exc_info=True)
+            # Update campaign status to failed with a new context manager
+            try:
+                async with get_repository_context(CampaignRepository) as campaign_repository:
+                    await campaign_repository.update_campaign_status(
+                        campaign_id=campaign_id,
+                        status="failed",
+                        completed_at=datetime.now(timezone.utc)
+                    )
+            except Exception as update_error:
+                logger.error(f"Failed to update campaign status: {update_error}")
+        finally:
+            # Remove from processing set
+            self._processing_campaigns.remove(campaign_id)
+    
+    async def _process_campaign_chunks(self, campaign_id: str) -> None:
+        """
+        Process campaign messages in chunks.
+        
+        Args:
+            campaign_id: Campaign ID
+        """
+        # Query pending messages in chunks
+        offset = 0
+        
+        while True:
+            # Check if campaign is still active with context manager
+            campaign = None
+            async with get_repository_context(CampaignRepository) as campaign_repository:
+                campaign = await campaign_repository.get_by_id(campaign_id)
+                if not campaign or campaign.status != "active":
+                    logger.info(f"Campaign {campaign_id} is no longer active, stopping processing")
+                    return
+            
+            # Get next chunk of messages with context manager
+            messages = []
+            total = 0
+            async with get_repository_context(MessageRepository) as message_repository:
+                messages, total = await message_repository.get_messages_for_campaign(
+                    campaign_id=campaign_id,
+                    status=MessageStatus.PENDING,
+                    skip=offset,
+                    limit=self._chunk_size
+                )
+            
+            # If no more messages, campaign is complete
+            if not messages:
+                logger.info(f"No more pending messages for campaign {campaign_id}")
+                async with get_repository_context(CampaignRepository) as campaign_repository:
+                    await campaign_repository.update_campaign_status(
+                        campaign_id=campaign_id,
+                        status="completed",
+                        completed_at=datetime.now(timezone.utc)
+                    )
+                return
+            
+            # Process this chunk
+            await self._process_message_chunk(campaign_id, messages)
+            
+            # Update offset for next chunk
+            offset += len(messages)
+            
+            # Small delay between chunks to avoid overloading
+            await asyncio.sleep(0.5)
+    
+    async def _process_message_chunk(self, campaign_id: str, messages: List[Any]) -> None:
+        """
+        Process a chunk of messages with proper context management.
+        
+        Args:
+            campaign_id: Campaign ID
+            messages: List of message objects
+        """
+        # Process each message in the chunk
+        success_count = 0
+        fail_count = 0
+        
+        for message in messages:
+            try:
+                # Use SMS sender to send the message
+                result = await self.sms_sender._send_to_gateway(
+                    phone_number=message.phone_number,
+                    message_text=message.message,
+                    custom_id=message.custom_id or str(uuid.uuid4())
+                )
+                
+                # Update message status with context manager
+                async with get_repository_context(MessageRepository) as message_repository:
+                    await message_repository.update_message_status(
+                        message_id=message.id,
+                        status=result.get("status", MessageStatus.PENDING),
+                        event_type="campaign_process",
+                        gateway_message_id=result.get("gateway_message_id"),
+                        data=result
+                    )
+                
+                success_count += 1
+                
+                # Add delay between messages to avoid overloading gateway
+                await asyncio.sleep(settings.DELAY_BETWEEN_SMS)
+                
+            except Exception as e:
+                logger.error(f"Error processing message {message.id}: {e}")
+                
+                # Update message status to failed with context manager
+                try:
+                    async with get_repository_context(MessageRepository) as message_repository:
+                        await message_repository.update_message_status(
+                            message_id=message.id,
+                            status=MessageStatus.FAILED,
+                            event_type="campaign_process_error",
+                            reason=str(e),
+                            data={"error": str(e)}
+                        )
+                except Exception as update_error:
+                    logger.error(f"Failed to update message status: {update_error}")
+                
+                fail_count += 1
+        
+        # Update campaign stats with context manager
+        if success_count > 0 or fail_count > 0:
+            try:
+                async with get_repository_context(CampaignRepository) as campaign_repository:
+                    await campaign_repository.update_campaign_stats(
+                        campaign_id=campaign_id,
+                        increment_sent=success_count,
+                        increment_failed=fail_count
+                    )
+            except Exception as update_error:
+                logger.error(f"Failed to update campaign stats: {update_error}")
+        
+        logger.info(f"Processed chunk for campaign {campaign_id}: {success_count} sent, {fail_count} failed")
+
+
+# Dependency injection function
+async def get_campaign_processor():
+    """
+    Get campaign processor service instance.
+    
+    Uses the SMS sender with its dedicated context management but doesn't create
+    long-lived repository instances. Each operation in the processor will
+    create repositories within context managers as needed.
+    """
+    from app.services.event_bus.bus import get_event_bus
+    from app.services.sms.sender import get_sms_sender
+    
+    sms_sender = await get_sms_sender()
+    event_bus = get_event_bus()
+    
+    return CampaignProcessor(
+        sms_sender=sms_sender,
+        event_bus=event_bus
+    )
+</file>
+
 <file path="app/services/event_bus/events.py">
 """
 Event type definitions for the event bus.
@@ -9409,296 +9410,6 @@ class WebhookEvent(Event):
     def payload(self) -> Dict[str, Any]:
         """Get webhook payload."""
         return self.data.get("payload", {})
-</file>
-
-<file path="app/services/sms/retry_engine.py">
-# app/services/sms/retry_engine.py
-import asyncio
-import logging
-import uuid
-from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Any, Optional
-
-from app.core.config import settings
-from app.db.repositories.messages import MessageRepository
-from app.schemas.message import MessageStatus
-from app.services.event_bus.events import EventType
-from app.services.event_bus.bus import get_event_bus
-from app.core.exceptions import SMSGatewayError, RetryableError
-from app.db.session import get_repository_context
-
-logger = logging.getLogger("inboxerr.retry")
-
-class RetryEngine:
-    """
-    Service for retrying failed messages.
-    
-    Periodically checks for failed messages and attempts to resend them.
-    Uses proper context management for database connections to prevent leaks.
-    """
-    
-    def __init__(self, event_bus: Any, sms_sender: Any):
-        """
-        Initialize retry engine with required dependencies.
-        
-        Args:
-            event_bus: Event bus for publishing events
-            sms_sender: SMS sender service for resending messages
-        """
-        self.event_bus = event_bus
-        self.sms_sender = sms_sender
-        self._running = False
-        self._semaphore = asyncio.Semaphore(5)  # Limit concurrent retries
-        
-    async def start(self) -> None:
-        """Start the retry engine."""
-        if self._running:
-            return
-            
-        self._running = True
-        logger.info("Starting retry engine")
-        
-        while self._running:
-            try:
-                await self._process_retries()
-            except Exception as e:
-                logger.error(f"Error in retry engine: {e}", exc_info=True)
-                
-            # Wait before next cycle
-            await asyncio.sleep(settings.RETRY_INTERVAL_SECONDS)
-            
-    async def stop(self) -> None:
-        """Stop the retry engine."""
-        self._running = False
-        logger.info("Retry engine stopped")
-    
-    async def _process_retries(self) -> None:
-        """Process messages pending retry using context managers for DB access."""
-        # Get messages that need retry - using context manager
-        retry_candidates = await self._get_retry_candidates()
-        
-        if not retry_candidates:
-            logger.debug("No messages to retry")
-            return
-            
-        logger.info(f"Found {len(retry_candidates)} messages to retry")
-        
-        # Process retries with concurrency limit
-        tasks = []
-        for message in retry_candidates:
-            tasks.append(self._retry_message(message))
-            
-        if tasks:
-            # Process retries concurrently but with limit
-            for i in range(0, len(tasks), 5):  # Process in chunks of 5
-                chunk = tasks[i:i+5]
-                await asyncio.gather(*chunk)
-                await asyncio.sleep(1)  # Short delay between chunks
-    
-    async def _get_retry_candidates(self) -> List[Dict[str, Any]]:
-        """
-        Get messages that are candidates for retry.
-        
-        Uses context manager to ensure database connections are properly closed.
-        
-        Returns:
-            List[Dict]: List of messages that should be retried
-        """
-        # Parameters for retry candidate selection
-        now = datetime.now(timezone.utc)
-        max_retries = settings.RETRY_MAX_ATTEMPTS
-        retry_candidates = []
-        
-        try:
-            # Use context manager for database access
-            async with get_repository_context(MessageRepository) as message_repository:
-                # Query for messages that:
-                # 1. Are in a failed state
-                # 2. Have not exceeded max retry attempts
-                # 3. Have a retryable error or no error specified
-                # 4. Last retry attempt was long enough ago (based on exponential backoff)
-                
-                failed_messages = await message_repository.get_retryable_messages(
-                    max_retries=max_retries,
-                    limit=50  # Limit number of messages to process in one cycle
-                )
-                
-                # Filter messages based on retry delay (exponential backoff)
-                for message in failed_messages:
-                    # Get retry attempt count (from message metadata or events)
-                    retry_count = self._get_retry_count(message)
-                    
-                    # Calculate backoff delay - 30s, 2m, 8m, 30m, 2h, etc.
-                    backoff_seconds = 30 * (2 ** retry_count)
-                    
-                    # Get timestamp of last attempt
-                    last_attempt = message.failed_at or message.updated_at
-                    
-                    # Check if enough time has passed for retry
-                    if now - last_attempt > timedelta(seconds=backoff_seconds):
-                        retry_candidates.append(message)
-            
-            return retry_candidates
-        
-        except Exception as e:
-            logger.error(f"Error getting retry candidates: {e}", exc_info=True)
-            # Return empty list on error to prevent crashing the retry engine
-            return []
-    
-    def _get_retry_count(self, message: Any) -> int:
-        """
-        Get the retry count for a message.
-        
-        Args:
-            message: Message object
-            
-        Returns:
-            int: Number of retry attempts
-        """
-        # Check if retry count is in metadata
-        meta_data = getattr(message, 'meta_data', {}) or {}
-        if isinstance(meta_data, dict) and 'retry_count' in meta_data:
-            return meta_data.get('retry_count', 0)
-            
-        # Fallback - count events of type "retry"
-        retry_events = [e for e in getattr(message, 'events', []) 
-                       if getattr(e, 'event_type', '') == 'retry']
-        return len(retry_events)
-    
-    async def _retry_message(self, message: Any) -> None:
-        """
-        Retry sending a message with proper context management.
-        
-        Uses context managers for all database operations to prevent connection leaks.
-        
-        Args:
-            message: Message to retry
-        """
-        message_id = message.id
-        phone_number = message.phone_number
-        message_text = message.message
-        custom_id = message.custom_id
-        
-        # Get current retry count
-        retry_count = self._get_retry_count(message)
-        
-        try:
-            logger.info(f"Retrying message {message_id} (attempt {retry_count + 1})")
-            
-            # Use semaphore to limit concurrent retries
-            async with self._semaphore:
-                # Reset status to pending for retry - using context manager
-                async with get_repository_context(MessageRepository) as message_repository:
-                    # Update message status
-                    await message_repository.update_message_status(
-                        message_id=message_id,
-                        status=MessageStatus.PENDING,
-                        event_type="retry",
-                        data={
-                            "retry_count": retry_count + 1,
-                            "previous_error": message.reason
-                        }
-                    )
-                    
-                    # Update metadata to track retry count
-                    meta_data = getattr(message, 'meta_data', {}) or {}
-                    if isinstance(meta_data, dict):
-                        meta_data['retry_count'] = retry_count + 1
-                        await message_repository.update(
-                            id=message_id,
-                            obj_in={"meta_data": meta_data}
-                        )
-                
-                # Attempt to send again
-                result = await self.sms_sender._send_to_gateway(
-                    phone_number=phone_number,
-                    message_text=message_text,
-                    custom_id=custom_id or str(uuid.uuid4())
-                )
-                
-                # Update message status with new context manager
-                async with get_repository_context(MessageRepository) as message_repository:
-                    await message_repository.update_message_status(
-                        message_id=message_id,
-                        status=result.get("status", MessageStatus.PENDING),
-                        event_type="retry_success",
-                        gateway_message_id=result.get("gateway_message_id"),
-                        data=result
-                    )
-                
-                # Publish event - doesn't need database connection
-                await self.event_bus.publish(
-                    EventType.MESSAGE_RETRIED,
-                    {
-                        "message_id": message_id,
-                        "phone_number": phone_number,
-                        "retry_count": retry_count + 1,
-                        "status": result.get("status", MessageStatus.PENDING)
-                    }
-                )
-                
-                logger.info(f"Successfully retried message {message_id}")
-                
-        except Exception as e:
-            logger.error(f"Error retrying message {message_id}: {e}")
-            
-            # Update status to failed with incremented retry count - in a new context
-            try:
-                error_message = str(e)
-                is_retryable = isinstance(e, RetryableError)
-                
-                async with get_repository_context(MessageRepository) as message_repository:
-                    await message_repository.update_message_status(
-                        message_id=message_id,
-                        status=MessageStatus.FAILED,
-                        event_type="retry_failed",
-                        reason=error_message,
-                        data={
-                            "retry_count": retry_count + 1,
-                            "retryable": is_retryable
-                        }
-                    )
-                
-                # Publish event
-                await self.event_bus.publish(
-                    EventType.MESSAGE_RETRY_FAILED,
-                    {
-                        "message_id": message_id,
-                        "phone_number": phone_number,
-                        "retry_count": retry_count + 1,
-                        "error": error_message,
-                        "retryable": is_retryable
-                    }
-                )
-            except Exception as update_error:
-                logger.error(f"Failed to update error status: {update_error}")
-
-
-# Singleton instance
-_retry_engine = None
-
-async def get_retry_engine():
-    """
-    Get the singleton retry engine instance.
-    
-    Note: This doesn't maintain any long-lived database connections,
-    as the repository is now created within context managers for each operation.
-    """
-    global _retry_engine
-    
-    if _retry_engine is None:
-        from app.services.event_bus.bus import get_event_bus
-        from app.services.sms.sender import get_sms_sender
-        
-        event_bus = get_event_bus()
-        sms_sender = await get_sms_sender()
-        
-        _retry_engine = RetryEngine(
-            event_bus=event_bus,
-            sms_sender=sms_sender
-        )
-        
-    return _retry_engine
 </file>
 
 <file path="README.md">
@@ -10222,6 +9933,518 @@ class MessageTemplate(Base):
     
     # Relationships
     user = relationship("User")
+</file>
+
+<file path="app/services/sms/retry_engine.py">
+# app/services/sms/retry_engine.py
+import asyncio
+import logging
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import List, Dict, Any, Optional
+
+from app.core.config import settings
+from app.db.repositories.messages import MessageRepository
+from app.schemas.message import MessageStatus
+from app.services.event_bus.events import EventType
+from app.services.event_bus.bus import get_event_bus
+from app.core.exceptions import SMSGatewayError, RetryableError
+from app.db.session import get_repository_context
+
+logger = logging.getLogger("inboxerr.retry")
+
+class RetryEngine:
+    """
+    Service for retrying failed messages.
+    
+    Periodically checks for failed messages and attempts to resend them.
+    Uses proper context management for database connections to prevent leaks.
+    """
+    
+    def __init__(self, event_bus: Any, sms_sender: Any):
+        """
+        Initialize retry engine with required dependencies.
+        
+        Args:
+            event_bus: Event bus for publishing events
+            sms_sender: SMS sender service for resending messages
+        """
+        self.event_bus = event_bus
+        self.sms_sender = sms_sender
+        self._running = False
+        self._semaphore = asyncio.Semaphore(5)  # Limit concurrent retries
+        
+    async def start(self) -> None:
+        """Start the retry engine."""
+        if self._running:
+            return
+            
+        self._running = True
+        logger.info("Starting retry engine")
+        
+        while self._running:
+            try:
+                await self._process_retries()
+            except Exception as e:
+                logger.error(f"Error in retry engine: {e}", exc_info=True)
+                
+            # Wait before next cycle
+            await asyncio.sleep(settings.RETRY_INTERVAL_SECONDS)
+            
+    async def stop(self) -> None:
+        """Stop the retry engine."""
+        self._running = False
+        logger.info("Retry engine stopped")
+    
+    async def _process_retries(self) -> None:
+        """Process messages pending retry using context managers for DB access."""
+        # Get messages that need retry - using context manager
+        retry_candidates = await self._get_retry_candidates()
+        
+        if not retry_candidates:
+            logger.debug("No messages to retry")
+            return
+            
+        logger.info(f"Found {len(retry_candidates)} messages to retry")
+        
+        # Process retries with concurrency limit
+        tasks = []
+        for message in retry_candidates:
+            tasks.append(self._retry_message(message))
+            
+        if tasks:
+            # Process retries concurrently but with limit
+            for i in range(0, len(tasks), 5):  # Process in chunks of 5
+                chunk = tasks[i:i+5]
+                await asyncio.gather(*chunk)
+                await asyncio.sleep(1)  # Short delay between chunks
+    
+    async def _get_retry_candidates(self) -> List[Dict[str, Any]]:
+        """
+        Get messages that are candidates for retry.
+        
+        Uses context manager to ensure database connections are properly closed.
+        
+        Returns:
+            List[Dict]: List of messages that should be retried
+        """
+        # Parameters for retry candidate selection
+        now = datetime.now(timezone.utc)
+        max_retries = settings.RETRY_MAX_ATTEMPTS
+        retry_candidates = []
+        
+        try:
+            # Use context manager for database access
+            async with get_repository_context(MessageRepository) as message_repository:
+                # Query for messages that:
+                # 1. Are in a failed state
+                # 2. Have not exceeded max retry attempts
+                # 3. Have a retryable error or no error specified
+                # 4. Last retry attempt was long enough ago (based on exponential backoff)
+                
+                failed_messages = await message_repository.get_retryable_messages(
+                    max_retries=max_retries,
+                    limit=50  # Limit number of messages to process in one cycle
+                )
+                
+                # Filter messages based on retry delay (exponential backoff)
+                for message in failed_messages:
+                    # Get retry attempt count (from message metadata or events)
+                    retry_count = self._get_retry_count(message)
+                    
+                    # Calculate backoff delay - 30s, 2m, 8m, 30m, 2h, etc.
+                    backoff_seconds = 30 * (2 ** retry_count)
+                    
+                    # Get timestamp of last attempt
+                    last_attempt = message.failed_at or message.updated_at
+                    
+                    # Check if enough time has passed for retry
+                    if now - last_attempt > timedelta(seconds=backoff_seconds):
+                        retry_candidates.append(message)
+            
+            return retry_candidates
+        
+        except Exception as e:
+            logger.error(f"Error getting retry candidates: {e}", exc_info=True)
+            # Return empty list on error to prevent crashing the retry engine
+            return []
+    
+    def _get_retry_count(self, message: Any) -> int:
+        """
+        Get the retry count for a message.
+        
+        Args:
+            message: Message object
+            
+        Returns:
+            int: Number of retry attempts
+        """
+        # Check if retry count is in metadata
+        meta_data = getattr(message, 'meta_data', {}) or {}
+        if isinstance(meta_data, dict) and 'retry_count' in meta_data:
+            return meta_data.get('retry_count', 0)
+            
+        # Fallback - count events of type "retry"
+        retry_events = [e for e in getattr(message, 'events', []) 
+                       if getattr(e, 'event_type', '') == 'retry']
+        return len(retry_events)
+    
+    async def _retry_message(self, message: Any) -> None:
+        """
+        Retry sending a message with proper context management.
+        
+        Uses context managers for all database operations to prevent connection leaks.
+        
+        Args:
+            message: Message to retry
+        """
+        message_id = message.id
+        phone_number = message.phone_number
+        message_text = message.message
+        custom_id = message.custom_id
+        
+        # Get current retry count
+        retry_count = self._get_retry_count(message)
+        
+        try:
+            logger.info(f"Retrying message {message_id} (attempt {retry_count + 1})")
+            
+            # Use semaphore to limit concurrent retries
+            async with self._semaphore:
+                # Reset status to pending for retry - using context manager
+                async with get_repository_context(MessageRepository) as message_repository:
+                    # Update message status
+                    await message_repository.update_message_status(
+                        message_id=message_id,
+                        status=MessageStatus.PENDING,
+                        event_type="retry",
+                        data={
+                            "retry_count": retry_count + 1,
+                            "previous_error": message.reason
+                        }
+                    )
+                    
+                    # Update metadata to track retry count
+                    meta_data = getattr(message, 'meta_data', {}) or {}
+                    if isinstance(meta_data, dict):
+                        meta_data['retry_count'] = retry_count + 1
+                        await message_repository.update(
+                            id=message_id,
+                            obj_in={"meta_data": meta_data}
+                        )
+                
+                # Attempt to send again
+                result = await self.sms_sender._send_to_gateway(
+                    phone_number=phone_number,
+                    message_text=message_text,
+                    custom_id=custom_id or str(uuid.uuid4())
+                )
+                
+                # Update message status with new context manager
+                async with get_repository_context(MessageRepository) as message_repository:
+                    await message_repository.update_message_status(
+                        message_id=message_id,
+                        status=result.get("status", MessageStatus.PENDING),
+                        event_type="retry_success",
+                        gateway_message_id=result.get("gateway_message_id"),
+                        data=result
+                    )
+                
+                # Publish event - doesn't need database connection
+                await self.event_bus.publish(
+                    EventType.MESSAGE_RETRIED,
+                    {
+                        "message_id": message_id,
+                        "phone_number": phone_number,
+                        "retry_count": retry_count + 1,
+                        "status": result.get("status", MessageStatus.PENDING)
+                    }
+                )
+                
+                logger.info(f"Successfully retried message {message_id}")
+                
+        except Exception as e:
+            logger.error(f"Error retrying message {message_id}: {e}")
+            
+            # Update status to failed with incremented retry count - in a new context
+            try:
+                error_message = str(e)
+                is_retryable = isinstance(e, RetryableError)
+                
+                async with get_repository_context(MessageRepository) as message_repository:
+                    await message_repository.update_message_status(
+                        message_id=message_id,
+                        status=MessageStatus.FAILED,
+                        event_type="retry_failed",
+                        reason=error_message,
+                        data={
+                            "retry_count": retry_count + 1,
+                            "retryable": is_retryable
+                        }
+                    )
+                
+                # Publish event
+                await self.event_bus.publish(
+                    EventType.MESSAGE_RETRY_FAILED,
+                    {
+                        "message_id": message_id,
+                        "phone_number": phone_number,
+                        "retry_count": retry_count + 1,
+                        "error": error_message,
+                        "retryable": is_retryable
+                    }
+                )
+            except Exception as update_error:
+                logger.error(f"Failed to update error status: {update_error}")
+
+
+# Singleton instance
+_retry_engine = None
+
+async def get_retry_engine():
+    """
+    Get the singleton retry engine instance.
+    
+    Note: This doesn't maintain any long-lived database connections,
+    as the repository is now created within context managers for each operation.
+    """
+    global _retry_engine
+    
+    if _retry_engine is None:
+        from app.services.event_bus.bus import get_event_bus
+        from app.services.sms.sender import get_sms_sender
+        
+        event_bus = get_event_bus()
+        sms_sender = await get_sms_sender()
+        
+        _retry_engine = RetryEngine(
+            event_bus=event_bus,
+            sms_sender=sms_sender
+        )
+        
+    return _retry_engine
+</file>
+
+<file path="requirements.txt">
+aiosqlite==0.21.0
+alembic==1.15.2
+android-sms-gateway==2.0.0
+annotated-types==0.7.0
+anyio==4.9.0
+asgi-lifespan==2.1.0
+asyncpg==0.30.0
+bcrypt==4.3.0
+certifi==2025.1.31
+cffi==1.17.1
+click==8.1.8
+colorama==0.4.6
+coverage==7.8.0
+cryptography==44.0.2
+dnspython==2.7.0
+ecdsa==0.19.1
+email_validator==2.2.0
+fastapi==0.115.12
+greenlet==3.2.1
+h11==0.14.0
+httpcore==1.0.8
+httptools==0.6.4
+httpx==0.28.1
+idna==3.10
+iniconfig==2.1.0
+Mako==1.3.10
+MarkupSafe==3.0.2
+packaging==25.0
+passlib==1.7.4
+phonenumbers==9.0.3
+pluggy==1.5.0
+psycopg2-binary==2.9.10
+pyasn1==0.4.8
+pycparser==2.22
+pydantic==2.11.3
+pydantic-settings==2.9.1
+pydantic_core==2.33.1
+PyJWT==2.10.1
+pytest==8.3.5
+pytest-asyncio==0.26.0
+pytest-cov==6.1.1
+pytest-mock==3.14.0
+python-dateutil==2.9.0.post0
+python-dotenv==1.1.0
+python-jose==3.4.0
+python-multipart==0.0.20
+pytz==2025.2
+PyYAML==6.0.2
+rsa==4.9.1
+six==1.17.0
+sniffio==1.3.1
+SQLAlchemy==2.0.40
+starlette==0.46.2
+typing-inspection==0.4.0
+typing_extensions==4.13.2
+uvicorn==0.34.2
+watchfiles==1.0.5
+websockets==15.0.1
+</file>
+
+<file path="tests/conftest.py">
+import asyncio
+import os
+from datetime import datetime
+from collections.abc import AsyncGenerator
+
+import pytest
+import pytest_asyncio
+from httpx import AsyncClient
+from fastapi.testclient import TestClient
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.orm import sessionmaker
+
+from app.main import app
+from app.db.repositories.users import UserRepository
+from app.db.repositories.templates import TemplateRepository
+from app.core.security import get_password_hash
+from app.models import base as models
+from app.schemas.user import User
+from app.api.v1 import dependencies
+from app.models.user import User as UserModel
+
+
+# Use test DB from env or fallback to SQLite
+TEST_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
+async_engine = create_async_engine(TEST_DATABASE_URL, echo=False, future=True)
+async_session_factory = sessionmaker(async_engine, class_=AsyncSession, expire_on_commit=False)
+
+TEST_USER = {
+    "email": "test@example.com",
+    "password": "Test1234!",
+    "full_name": "Test User",
+    "role": "user"
+}
+
+TEST_TEMPLATES = [
+    {
+        "name": "Welcome Message",
+        "content": "Hi {{name}}, welcome to our service! We're glad you've joined us.",
+        "description": "Template for welcoming new users"
+    },
+    {
+        "name": "OTP Verification",
+        "content": "Your verification code is {{code}}. It will expire in {{minutes}} minutes.",
+        "description": "Template for sending OTP codes"
+    },
+    {
+        "name": "Appointment Reminder",
+        "content": "Hi {{name}}, this is a reminder for your appointment on {{date}} at {{time}}. Reply YES to confirm or call {{phone}} to reschedule.",
+        "description": "Template for appointment reminders"
+    }
+]
+
+@pytest_asyncio.fixture(autouse=True)
+def override_auth():
+    def fake_user():
+        return User(
+            id="test-user-id",
+            email="test@example.com",
+            is_active=True,
+            is_superuser=False,
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow()
+        )
+    app.dependency_overrides[dependencies.get_current_user] = lambda: fake_user()
+    yield
+    app.dependency_overrides.clear()
+
+@pytest.fixture(scope="session", autouse=True)
+def event_loop():
+    loop = asyncio.get_event_loop_policy().new_event_loop()
+    yield loop
+    loop.close()
+
+@pytest_asyncio.fixture(scope="session", autouse=True)
+async def initialize_test_db():
+    print("⚙️  Initializing test DB and seeding data...")
+    async with async_engine.begin() as conn:
+        await conn.run_sync(models.Base.metadata.drop_all)
+        await conn.run_sync(models.Base.metadata.create_all)
+
+    async with async_session_factory() as session:
+        user_repo = UserRepository(session)
+        existing_user = await user_repo.get_by_email(TEST_USER["email"])
+        if not existing_user:
+            user = UserModel(
+                id="test-user-id",
+                email=TEST_USER["email"],
+                hashed_password=get_password_hash(TEST_USER["password"]),
+                full_name=TEST_USER["full_name"],
+                role=TEST_USER["role"],
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow()
+            )
+            session.add(user)
+        else:
+            user = existing_user
+
+        template_repo = TemplateRepository(session)
+        for template in TEST_TEMPLATES:
+            await template_repo.create_template(
+                name=template["name"],
+                content=template["content"],
+                description=template["description"],
+                user_id=user.id
+            )
+
+        await session.commit()
+    
+            # --- Add existing message and task for tests that depend on them ---
+        from app.db.repositories.messages import MessageRepository
+        from datetime import timezone
+
+        now = datetime.now(timezone.utc)
+        message_repo = MessageRepository(session)
+
+
+        await message_repo.create_message(
+            phone_number="+1234567890",
+            message_text="Test message seeded for unit tests",
+            user_id=user.id,
+            custom_id="existing-msg-id",
+            metadata={}
+        )
+
+
+        # Create a batch using repository logic
+        batch = await message_repo.create_batch(
+            user_id=user.id,
+            name="Test Batch",
+            total=1  # One message in batch
+        )
+        # Override ID for the test that expects it
+        batch.id = "existing-task-id"
+
+        # Add a message linked to this batch
+        await message_repo.create_message(
+            phone_number="+1234567890",
+            message_text="Hello from seeded batch",
+            user_id=user.id,
+            custom_id="msg-in-batch",
+            metadata={"batch_id": batch.id}
+        )
+
+        await session.commit()
+
+    print(f"✅ Test DB seeded at {TEST_DATABASE_URL}")
+
+@pytest_asyncio.fixture()
+async def async_client() -> AsyncGenerator[AsyncClient, None]:
+    from httpx import ASGITransport
+    transport = ASGITransport(app=app)
+    async with AsyncClient(base_url="http://testserver", transport=transport) as client:
+        yield client
+
+@pytest_asyncio.fixture()
+async def db_session() -> AsyncGenerator[AsyncSession, None]:
+    async with async_session_factory() as session:
+        yield session
 </file>
 
 <file path="app/services/webhooks/manager.py">
@@ -10851,228 +11074,6 @@ async def fetch_registered_webhooks_from_gateway() -> List[Dict[str, Any]]:
         raise
 </file>
 
-<file path="requirements.txt">
-aiosqlite==0.21.0
-alembic==1.15.2
-android-sms-gateway==2.0.0
-annotated-types==0.7.0
-anyio==4.9.0
-asgi-lifespan==2.1.0
-asyncpg==0.30.0
-bcrypt==4.3.0
-certifi==2025.1.31
-cffi==1.17.1
-click==8.1.8
-colorama==0.4.6
-coverage==7.8.0
-cryptography==44.0.2
-dnspython==2.7.0
-ecdsa==0.19.1
-email_validator==2.2.0
-fastapi==0.115.12
-greenlet==3.2.1
-h11==0.14.0
-httpcore==1.0.8
-httptools==0.6.4
-httpx==0.28.1
-idna==3.10
-iniconfig==2.1.0
-Mako==1.3.10
-MarkupSafe==3.0.2
-packaging==25.0
-passlib==1.7.4
-phonenumbers==9.0.3
-pluggy==1.5.0
-psycopg2-binary==2.9.10
-pyasn1==0.4.8
-pycparser==2.22
-pydantic==2.11.3
-pydantic-settings==2.9.1
-pydantic_core==2.33.1
-PyJWT==2.10.1
-pytest==8.3.5
-pytest-asyncio==0.26.0
-pytest-cov==6.1.1
-pytest-mock==3.14.0
-python-dateutil==2.9.0.post0
-python-dotenv==1.1.0
-python-jose==3.4.0
-python-multipart==0.0.20
-pytz==2025.2
-PyYAML==6.0.2
-rsa==4.9.1
-six==1.17.0
-sniffio==1.3.1
-SQLAlchemy==2.0.40
-starlette==0.46.2
-typing-inspection==0.4.0
-typing_extensions==4.13.2
-uvicorn==0.34.2
-watchfiles==1.0.5
-websockets==15.0.1
-</file>
-
-<file path="tests/conftest.py">
-import asyncio
-import os
-from datetime import datetime
-from collections.abc import AsyncGenerator
-
-import pytest
-import pytest_asyncio
-from httpx import AsyncClient
-from fastapi.testclient import TestClient
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlalchemy.orm import sessionmaker
-
-from app.main import app
-from app.db.repositories.users import UserRepository
-from app.db.repositories.templates import TemplateRepository
-from app.core.security import get_password_hash
-from app.models import base as models
-from app.schemas.user import User
-from app.api.v1 import dependencies
-from app.models.user import User as UserModel
-
-
-# Use test DB from env or fallback to SQLite
-TEST_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
-async_engine = create_async_engine(TEST_DATABASE_URL, echo=False, future=True)
-async_session_factory = sessionmaker(async_engine, class_=AsyncSession, expire_on_commit=False)
-
-TEST_USER = {
-    "email": "test@example.com",
-    "password": "Test1234!",
-    "full_name": "Test User",
-    "role": "user"
-}
-
-TEST_TEMPLATES = [
-    {
-        "name": "Welcome Message",
-        "content": "Hi {{name}}, welcome to our service! We're glad you've joined us.",
-        "description": "Template for welcoming new users"
-    },
-    {
-        "name": "OTP Verification",
-        "content": "Your verification code is {{code}}. It will expire in {{minutes}} minutes.",
-        "description": "Template for sending OTP codes"
-    },
-    {
-        "name": "Appointment Reminder",
-        "content": "Hi {{name}}, this is a reminder for your appointment on {{date}} at {{time}}. Reply YES to confirm or call {{phone}} to reschedule.",
-        "description": "Template for appointment reminders"
-    }
-]
-
-@pytest_asyncio.fixture(autouse=True)
-def override_auth():
-    def fake_user():
-        return User(
-            id="test-user-id",
-            email="test@example.com",
-            is_active=True,
-            is_superuser=False,
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow()
-        )
-    app.dependency_overrides[dependencies.get_current_user] = lambda: fake_user()
-    yield
-    app.dependency_overrides.clear()
-
-@pytest.fixture(scope="session", autouse=True)
-def event_loop():
-    loop = asyncio.get_event_loop_policy().new_event_loop()
-    yield loop
-    loop.close()
-
-@pytest_asyncio.fixture(scope="session", autouse=True)
-async def initialize_test_db():
-    print("⚙️  Initializing test DB and seeding data...")
-    async with async_engine.begin() as conn:
-        await conn.run_sync(models.Base.metadata.drop_all)
-        await conn.run_sync(models.Base.metadata.create_all)
-
-    async with async_session_factory() as session:
-        user_repo = UserRepository(session)
-        existing_user = await user_repo.get_by_email(TEST_USER["email"])
-        if not existing_user:
-            user = UserModel(
-                id="test-user-id",
-                email=TEST_USER["email"],
-                hashed_password=get_password_hash(TEST_USER["password"]),
-                full_name=TEST_USER["full_name"],
-                role=TEST_USER["role"],
-                created_at=datetime.utcnow(),
-                updated_at=datetime.utcnow()
-            )
-            session.add(user)
-        else:
-            user = existing_user
-
-        template_repo = TemplateRepository(session)
-        for template in TEST_TEMPLATES:
-            await template_repo.create_template(
-                name=template["name"],
-                content=template["content"],
-                description=template["description"],
-                user_id=user.id
-            )
-
-        await session.commit()
-    
-            # --- Add existing message and task for tests that depend on them ---
-        from app.db.repositories.messages import MessageRepository
-        from datetime import timezone
-
-        now = datetime.now(timezone.utc)
-        message_repo = MessageRepository(session)
-
-
-        await message_repo.create_message(
-            phone_number="+1234567890",
-            message_text="Test message seeded for unit tests",
-            user_id=user.id,
-            custom_id="existing-msg-id",
-            metadata={}
-        )
-
-
-        # Create a batch using repository logic
-        batch = await message_repo.create_batch(
-            user_id=user.id,
-            name="Test Batch",
-            total=1  # One message in batch
-        )
-        # Override ID for the test that expects it
-        batch.id = "existing-task-id"
-
-        # Add a message linked to this batch
-        await message_repo.create_message(
-            phone_number="+1234567890",
-            message_text="Hello from seeded batch",
-            user_id=user.id,
-            custom_id="msg-in-batch",
-            metadata={"batch_id": batch.id}
-        )
-
-        await session.commit()
-
-    print(f"✅ Test DB seeded at {TEST_DATABASE_URL}")
-
-@pytest_asyncio.fixture()
-async def async_client() -> AsyncGenerator[AsyncClient, None]:
-    from httpx import ASGITransport
-    transport = ASGITransport(app=app)
-    async with AsyncClient(base_url="http://testserver", transport=transport) as client:
-        yield client
-
-@pytest_asyncio.fixture()
-async def db_session() -> AsyncGenerator[AsyncSession, None]:
-    async with async_session_factory() as session:
-        yield session
-</file>
-
 <file path="app/services/sms/sender.py">
 """
 SMS sender service for interacting with the Android SMS Gateway.
@@ -11112,7 +11113,6 @@ class SMSSender:
     
     def __init__(
         self,
-        message_repository: MessageRepository,
         event_bus: Any
     ):
         """
@@ -11122,7 +11122,6 @@ class SMSSender:
             message_repository: Repository for message storage
             event_bus: Event bus for publishing events
         """
-        self.message_repository = message_repository
         self.event_bus = event_bus
         self._semaphore = asyncio.Semaphore(10)  # Limit concurrent requests
         self._last_send_time = 0
@@ -12287,17 +12286,16 @@ class SMSSender:
         return batch_result
 
 # Dependency injection function
-async def get_sms_sender():
-    """Get SMS sender service instance with proper session management."""
-    from app.db.repositories.messages import MessageRepository
-    from app.services.event_bus.bus import get_event_bus
+async def get_sms_sender() -> SMSSender:
+    """
+    Dependency injection provider for SMSSender.
     
-    # Create message repository with session that will be closed
-    # when the SMS sender is no longer needed
-    async with get_repository_context(MessageRepository) as message_repository:
-        event_bus = get_event_bus()
-        
-        return SMSSender(message_repository, event_bus)
+    Returns:
+        SMSSender: An instance of the SMS sending service with event bus.
+    """ 
+    from app.services.event_bus.bus import get_event_bus
+    event_bus = get_event_bus()    
+    return SMSSender(event_bus)
 </file>
 
 <file path="app/db/repositories/messages.py">
