@@ -355,7 +355,7 @@ async def get_system_metrics() -> Dict[str, Any]:
     Get system-wide metrics (for admin).
     
     Returns:
-        Dict[str, Any]: System metrics
+        Dict[str, Any]: System metrics formatted for SystemMetricsResponse
     """
     # For system metrics, we'll query the database directly
     from app.db.repositories.messages import MessageRepository
@@ -414,9 +414,16 @@ async def get_system_metrics() -> Dict[str, Any]:
         result = await user_repo.session.execute(active_query)
         active_users = result.scalar_one_or_none() or 0
         
+        # New users today
+        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        new_today_query = select(func.count(User.id)).where(User.created_at >= today_start)
+        result = await user_repo.session.execute(new_today_query)
+        new_today = result.scalar_one_or_none() or 0
+        
         system_metrics["users"] = {
             "total": total_users,
-            "active": active_users
+            "active": active_users,
+            "new_today": new_today
         }
     
     # Query campaign stats
@@ -433,13 +440,19 @@ async def get_system_metrics() -> Dict[str, Any]:
         result = await campaign_repo.session.execute(active_query)
         active_campaigns = result.scalar_one_or_none() or 0
         
+        # Campaigns completed today
+        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        completed_today_query = select(func.count(Campaign.id)).where(
+            Campaign.completed_at >= today_start
+        )
+        result = await campaign_repo.session.execute(completed_today_query)
+        completed_today = result.scalar_one_or_none() or 0
+        
         system_metrics["campaigns"] = {
             "total": total_campaigns,
-            "active": active_campaigns
+            "active": active_campaigns,
+            "completed_today": completed_today
         }
-    
-    # Add timestamp
-    system_metrics["timestamp"] = datetime.now(timezone.utc).isoformat()
     
     return system_metrics
 
