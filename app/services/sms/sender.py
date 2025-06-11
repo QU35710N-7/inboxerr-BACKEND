@@ -112,11 +112,22 @@ class SMSSender:
                 campaign_id=campaign_id
             )
             
+            # ✅ ALWAYS publish MESSAGE_CREATED event (this was missing!)
+            await self.event_bus.publish(
+                EventType.MESSAGE_CREATED,
+                {
+                    "message_id": db_message.id,
+                    "phone_number": formatted_number,
+                    "user_id": user_id,
+                    "campaign_id": campaign_id
+                }
+            )
+            
             # If scheduled for future, return message details
             if scheduled_at and scheduled_at > datetime.now(timezone.utc):
                 logger.info(f"Message {db_message.id} scheduled for {scheduled_at}")
                 
-                # Publish event
+                # Publish scheduled event
                 await self.event_bus.publish(
                     EventType.MESSAGE_SCHEDULED,
                     {
@@ -150,6 +161,17 @@ class SMSSender:
                     data=result
                 )
                 
+                # ✅ Publish MESSAGE_SENT event (this was missing!)
+                await self.event_bus.publish(
+                    EventType.MESSAGE_SENT,
+                    {
+                        "message_id": db_message.id,
+                        "phone_number": formatted_number,
+                        "user_id": user_id,
+                        "gateway_message_id": result.get("gateway_message_id")
+                    }
+                )
+                
                 # Get updated message
                 updated_message = await repo.get_by_id(db_message.id)
                 return updated_message.dict()
@@ -169,12 +191,23 @@ class SMSSender:
                     data={"error": error_message}
                 )
                 
+                # ✅ Publish MESSAGE_FAILED event (this was missing!)
+                await self.event_bus.publish(
+                    EventType.MESSAGE_FAILED,
+                    {
+                        "message_id": db_message.id,
+                        "phone_number": formatted_number,
+                        "user_id": user_id,
+                        "reason": error_message
+                    }
+                )
+                
                 # Re-raise as SMSGatewayError
                 if isinstance(e, RetryableError):
                     raise SMSGatewayError(message=error_message, code="GATEWAY_ERROR", status_code=503)
                 else:
                     raise SMSGatewayError(message=error_message, code="GATEWAY_ERROR")
-    
+
     async def send_batch(
         self,
         *,

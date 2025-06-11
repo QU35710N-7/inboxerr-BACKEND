@@ -15,7 +15,7 @@ The content is organized as follows:
 2. Repository information
 3. Directory structure
 4. Repository files (if enabled)
-4. Repository files, each consisting of:
+5. Multiple file entries, each consisting of:
   - File path as an attribute
   - Full contents of the file
 </file_format>
@@ -36,10 +36,6 @@ The content is organized as follows:
 - Files matching default ignore patterns are excluded
 - Files are sorted by Git change count (files with more changes are at the bottom)
 </notes>
-
-<additional_info>
-
-</additional_info>
 
 </file_summary>
 
@@ -82,6 +78,7 @@ app/models/user.py
 app/models/webhook.py
 app/schemas/campaign.py
 app/schemas/message.py
+app/schemas/metrics.py
 app/schemas/template.py
 app/schemas/user.py
 app/scripts/create_admin.py
@@ -6266,6 +6263,122 @@ class UserMetrics(Base):
     )
 </file>
 
+<file path="app/schemas/metrics.py">
+"""
+Pydantic schemas for metrics-related API operations.
+"""
+from typing import List, Dict, Any
+from datetime import date
+from pydantic import BaseModel, Field
+
+
+class PeriodInfo(BaseModel):
+    """Schema for period information."""
+    start_date: str = Field(..., description="Start date in ISO format")
+    end_date: str = Field(..., description="End date in ISO format")
+
+
+class MessageMetrics(BaseModel):
+    """Schema for message metrics."""
+    sent: int = Field(..., description="Number of sent messages")
+    delivered: int = Field(..., description="Number of delivered messages")
+    failed: int = Field(..., description="Number of failed messages")
+    delivery_rate: float = Field(..., description="Delivery rate percentage")
+
+
+class CampaignMetrics(BaseModel):
+    """Schema for campaign metrics."""
+    created: int = Field(..., description="Number of created campaigns")
+    completed: int = Field(..., description="Number of completed campaigns")
+    active: int = Field(..., description="Number of active campaigns")
+
+
+class TemplateMetrics(BaseModel):
+    """Schema for template metrics."""
+    created: int = Field(..., description="Number of created templates")
+    used: int = Field(..., description="Number of times templates were used")
+
+
+class QuotaMetrics(BaseModel):
+    """Schema for quota metrics."""
+    used: int = Field(..., description="Number of messages used from quota")
+    total: int = Field(..., description="Total quota limit")
+    percent: float = Field(..., description="Percentage of quota used")
+
+
+class DailyData(BaseModel):
+    """Schema for daily metrics data."""
+    date: str = Field(..., description="Date in ISO format")
+    sent: int = Field(..., description="Messages sent on this date")
+    delivered: int = Field(..., description="Messages delivered on this date")
+    failed: int = Field(..., description="Messages failed on this date")
+
+
+class MetricsSummary(BaseModel):
+    """Schema for metrics summary."""
+    period: PeriodInfo = Field(..., description="Period information")
+    messages: MessageMetrics = Field(..., description="Message metrics")
+    campaigns: CampaignMetrics = Field(..., description="Campaign metrics")
+    templates: TemplateMetrics = Field(..., description="Template metrics")
+    quota: QuotaMetrics = Field(..., description="Quota metrics")
+
+
+class DashboardMetricsResponse(BaseModel):
+    """Schema for dashboard metrics response."""
+    summary: MetricsSummary = Field(..., description="Summary metrics")
+    daily_data: List[DailyData] = Field(..., description="Daily metrics data for charts")
+    period: str = Field(..., description="Requested period")
+
+    class Config:
+        """Pydantic config."""
+        from_attributes = True
+
+
+class UsageMetricsResponse(BaseModel):
+    """Schema for usage metrics response."""
+    message_count: int = Field(..., description="Total message count")
+    delivery_rate: float = Field(..., description="Overall delivery rate")
+    quota: QuotaMetrics = Field(..., description="Quota information")
+
+    class Config:
+        """Pydantic config."""
+        from_attributes = True
+
+
+class SystemMessageMetrics(BaseModel):
+    """Schema for system-wide message metrics."""
+    total: int = Field(..., description="Total messages in system")
+    sent: int = Field(..., description="Total sent messages")
+    delivered: int = Field(..., description="Total delivered messages")
+    failed: int = Field(..., description="Total failed messages")
+    last_24h: int = Field(..., description="Messages in last 24 hours")
+
+
+class SystemUserMetrics(BaseModel):
+    """Schema for system-wide user metrics."""
+    total: int = Field(..., description="Total users in system")
+    active: int = Field(..., description="Active users")
+    new_today: int = Field(..., description="New users today")
+
+
+class SystemCampaignMetrics(BaseModel):
+    """Schema for system-wide campaign metrics."""
+    total: int = Field(..., description="Total campaigns in system")
+    active: int = Field(..., description="Active campaigns")
+    completed_today: int = Field(..., description="Campaigns completed today")
+
+
+class SystemMetricsResponse(BaseModel):
+    """Schema for system metrics response (admin only)."""
+    messages: SystemMessageMetrics = Field(..., description="System message metrics")
+    users: SystemUserMetrics = Field(..., description="System user metrics")
+    campaigns: SystemCampaignMetrics = Field(..., description="System campaign metrics")
+
+    class Config:
+        """Pydantic config."""
+        from_attributes = True
+</file>
+
 <file path="app/services/event_bus/bus.py">
 """
 Enhanced event bus implementation for asynchronous messaging between components.
@@ -7621,67 +7734,6 @@ async def validate_permissions(
     # For now, just verify role-based access
     if current_user.role != UserRole.API and "api" in required_permissions:
         raise AuthorizationError("Insufficient permissions")
-</file>
-
-<file path="app/api/v1/endpoints/metrics.py">
-"""
-API endpoints for metrics and reporting.
-"""
-from fastapi import APIRouter, Depends, HTTPException, Query
-from typing import Dict, Any, Optional
-
-from app.api.v1.dependencies import get_current_user
-from app.schemas.user import User
-from app.services.metrics.collector import get_user_metrics, get_system_metrics
-
-router = APIRouter()
-
-@router.get("/")
-async def get_metrics(
-    current_user: User = Depends(get_current_user)
-):
-    """
-    Get system metrics and statistics.
-    Admin users get system-wide metrics, regular users get their own metrics.
-    """
-    if current_user.role == "admin":
-        # Admins get system-wide metrics
-        return await get_system_metrics()
-    else:
-        # Regular users get their own metrics
-        return await get_user_metrics(current_user.id)
-
-@router.get("/usage")
-async def get_usage_metrics(
-    current_user: User = Depends(get_current_user)
-):
-    """
-    Get usage metrics for the current user.
-    """
-    user_metrics = await get_user_metrics(current_user.id)
-    
-    # Format for the usage endpoint
-    return {
-        "message_count": user_metrics["summary"]["messages"]["sent"],
-        "delivery_rate": user_metrics["summary"]["messages"]["delivery_rate"],
-        "quota": {
-            "used": user_metrics["summary"]["quota"]["used"],
-            "total": user_metrics["summary"]["quota"]["total"]
-        }
-    }
-
-@router.get("/dashboard")
-async def get_dashboard_metrics(
-    period: str = Query("week", description="Time period: day, week, month, year"),
-    current_user: User = Depends(get_current_user)
-):
-    """
-    Get metrics formatted for dashboard display.
-    """
-    metrics = await get_user_metrics(current_user.id, period=period)
-    
-    # Return data already formatted for dashboard
-    return metrics
 </file>
 
 <file path="app/api/v1/endpoints/webhooks.py">
@@ -9619,486 +9671,6 @@ async def get_campaign_processor():
     )
 </file>
 
-<file path="app/services/metrics/collector.py">
-# app/services/metrics/collector.py
-"""
-Metrics collection service.
-"""
-import asyncio
-import logging
-from typing import Dict, Any, Optional, List
-from datetime import datetime, date, timezone, timedelta
-
-from app.services.event_bus.bus import get_event_bus
-from app.services.event_bus.events import EventType
-from app.db.session import get_repository_context
-
-logger = logging.getLogger("inboxerr.metrics")
-
-async def initialize_metrics() -> None:
-    """Initialize metrics collector."""
-    logger.info("Initializing metrics collector")
-    
-    # Subscribe to events
-    event_bus = get_event_bus()
-    
-    # Message events
-    await event_bus.subscribe(
-        EventType.MESSAGE_CREATED,
-        _handle_message_created,
-        "metrics.message_created"
-    )
-    
-    await event_bus.subscribe(
-        EventType.MESSAGE_SENT,
-        _handle_message_sent,
-        "metrics.message_sent"
-    )
-    
-    await event_bus.subscribe(
-        EventType.MESSAGE_DELIVERED,
-        _handle_message_delivered,
-        "metrics.message_delivered"
-    )
-    
-    await event_bus.subscribe(
-        EventType.MESSAGE_FAILED,
-        _handle_message_failed,
-        "metrics.message_failed"
-    )
-    
-    # Campaign events
-    await event_bus.subscribe(
-        EventType.CAMPAIGN_CREATED,
-        _handle_campaign_created,
-        "metrics.campaign_created"
-    )
-    
-    await event_bus.subscribe(
-        EventType.CAMPAIGN_COMPLETED,
-        _handle_campaign_completed,
-        "metrics.campaign_completed"
-    )
-    
-    # Template events
-    await event_bus.subscribe(
-        EventType.TEMPLATE_CREATED,
-        _handle_template_created,
-        "metrics.template_created"
-    )
-    
-    await event_bus.subscribe(
-        EventType.TEMPLATE_USED,
-        _handle_template_used,
-        "metrics.template_used"
-    )
-    
-    logger.info("Metrics collector initialized")
-
-# Event handlers
-async def _handle_message_created(data: Dict[str, Any]) -> None:
-    """Handle message created event."""
-    user_id = data.get("user_id")
-    if not user_id:
-        return
-    
-    # Get today's date
-    today = datetime.now(timezone.utc).date()
-    
-    # Update metrics
-    from app.db.repositories.metrics import MetricsRepository
-    
-    try:
-        async with get_repository_context(MetricsRepository) as metrics_repo:
-            await metrics_repo.increment_metric(
-                user_id=user_id,
-                date=today,
-                metric_name="messages_scheduled",
-                increment=1
-            )
-    except Exception as e:
-        logger.error(f"Error updating metrics for message_created: {e}")
-
-async def _handle_message_sent(data: Dict[str, Any]) -> None:
-    """Handle message sent event."""
-    user_id = data.get("user_id")
-    if not user_id:
-        return
-    
-    # Get today's date
-    today = datetime.now(timezone.utc).date()
-    
-    # Update metrics
-    from app.db.repositories.metrics import MetricsRepository
-    
-    try:
-        async with get_repository_context(MetricsRepository) as metrics_repo:
-            await metrics_repo.increment_metric(
-                user_id=user_id,
-                date=today,
-                metric_name="messages_sent",
-                increment=1
-            )
-            
-            # Decrement scheduled count if it was scheduled
-            scheduled = data.get("scheduled", False)
-            if scheduled:
-                await metrics_repo.increment_metric(
-                    user_id=user_id,
-                    date=today,
-                    metric_name="messages_scheduled",
-                    increment=-1
-                )
-    except Exception as e:
-        logger.error(f"Error updating metrics for message_sent: {e}")
-
-async def _handle_message_delivered(data: Dict[str, Any]) -> None:
-    """Handle message delivered event."""
-    user_id = data.get("user_id")
-    if not user_id:
-        return
-    
-    # Get today's date
-    today = datetime.now(timezone.utc).date()
-    
-    # Update metrics
-    from app.db.repositories.metrics import MetricsRepository
-    
-    try:
-        async with get_repository_context(MetricsRepository) as metrics_repo:
-            await metrics_repo.increment_metric(
-                user_id=user_id,
-                date=today,
-                metric_name="messages_delivered",
-                increment=1
-            )
-    except Exception as e:
-        logger.error(f"Error updating metrics for message_delivered: {e}")
-
-async def _handle_message_failed(data: Dict[str, Any]) -> None:
-    """Handle message failed event."""
-    user_id = data.get("user_id")
-    if not user_id:
-        return
-    
-    # Get today's date
-    today = datetime.now(timezone.utc).date()
-    
-    # Update metrics
-    from app.db.repositories.metrics import MetricsRepository
-    
-    try:
-        async with get_repository_context(MetricsRepository) as metrics_repo:
-            await metrics_repo.increment_metric(
-                user_id=user_id,
-                date=today,
-                metric_name="messages_failed",
-                increment=1
-            )
-    except Exception as e:
-        logger.error(f"Error updating metrics for message_failed: {e}")
-
-async def _handle_campaign_created(data: Dict[str, Any]) -> None:
-    """Handle campaign created event."""
-    user_id = data.get("user_id")
-    if not user_id:
-        return
-    
-    # Get today's date
-    today = datetime.now(timezone.utc).date()
-    
-    # Update metrics
-    from app.db.repositories.metrics import MetricsRepository
-    
-    try:
-        async with get_repository_context(MetricsRepository) as metrics_repo:
-            await metrics_repo.increment_metric(
-                user_id=user_id,
-                date=today,
-                metric_name="campaigns_created",
-                increment=1
-            )
-            
-            # Increment active campaigns too
-            await metrics_repo.increment_metric(
-                user_id=user_id,
-                date=today,
-                metric_name="campaigns_active",
-                increment=1
-            )
-    except Exception as e:
-        logger.error(f"Error updating metrics for campaign_created: {e}")
-
-async def _handle_campaign_completed(data: Dict[str, Any]) -> None:
-    """Handle campaign completed event."""
-    user_id = data.get("user_id")
-    if not user_id:
-        return
-    
-    # Get today's date
-    today = datetime.now(timezone.utc).date()
-    
-    # Update metrics
-    from app.db.repositories.metrics import MetricsRepository
-    
-    try:
-        async with get_repository_context(MetricsRepository) as metrics_repo:
-            await metrics_repo.increment_metric(
-                user_id=user_id,
-                date=today,
-                metric_name="campaigns_completed",
-                increment=1
-            )
-            
-            # Decrement active campaigns
-            await metrics_repo.increment_metric(
-                user_id=user_id,
-                date=today,
-                metric_name="campaigns_active",
-                increment=-1
-            )
-    except Exception as e:
-        logger.error(f"Error updating metrics for campaign_completed: {e}")
-
-async def _handle_template_created(data: Dict[str, Any]) -> None:
-    """Handle template created event."""
-    user_id = data.get("user_id")
-    if not user_id:
-        return
-    
-    # Get today's date
-    today = datetime.now(timezone.utc).date()
-    
-    # Update metrics
-    from app.db.repositories.metrics import MetricsRepository
-    
-    try:
-        async with get_repository_context(MetricsRepository) as metrics_repo:
-            await metrics_repo.increment_metric(
-                user_id=user_id,
-                date=today,
-                metric_name="templates_created",
-                increment=1
-            )
-    except Exception as e:
-        logger.error(f"Error updating metrics for template_created: {e}")
-
-async def _handle_template_used(data: Dict[str, Any]) -> None:
-    """Handle template used event."""
-    user_id = data.get("user_id")
-    if not user_id:
-        return
-    
-    # Get today's date
-    today = datetime.now(timezone.utc).date()
-    
-    # Update metrics
-    from app.db.repositories.metrics import MetricsRepository
-    
-    try:
-        async with get_repository_context(MetricsRepository) as metrics_repo:
-            await metrics_repo.increment_metric(
-                user_id=user_id,
-                date=today,
-                metric_name="templates_used",
-                increment=1
-            )
-    except Exception as e:
-        logger.error(f"Error updating metrics for template_used: {e}")
-
-async def get_user_metrics(
-    user_id: str,
-    period: str = "week"
-) -> Dict[str, Any]:
-    """
-    Get metrics for a specific user.
-    
-    Args:
-        user_id: User ID
-        period: Time period ("day", "week", "month", "year")
-        
-    Returns:
-        Dict[str, Any]: User metrics
-    """
-    from app.db.repositories.metrics import MetricsRepository
-    
-    # Calculate date range based on period
-    end_date = datetime.now(timezone.utc).date()
-    
-    if period == "day":
-        start_date = end_date
-    elif period == "week":
-        start_date = end_date - timedelta(days=7)
-    elif period == "month":
-        start_date = end_date - timedelta(days=30)
-    elif period == "year":
-        start_date = end_date - timedelta(days=365)
-    else:
-        # Default to week
-        start_date = end_date - timedelta(days=7)
-    
-    # Get metrics
-    async with get_repository_context(MetricsRepository) as metrics_repo:
-        # Get summary metrics
-        summary = await metrics_repo.get_summary_metrics(
-            user_id=user_id,
-            start_date=start_date,
-            end_date=end_date
-        )
-        
-        # Get daily metrics for charting
-        metrics_list = await metrics_repo.get_metrics_range(
-            user_id=user_id,
-            start_date=start_date,
-            end_date=end_date
-        )
-        
-        # Format for response
-        daily_data = []
-        for metric in metrics_list:
-            daily_data.append({
-                "date": metric.date.isoformat(),
-                "sent": metric.messages_sent,
-                "delivered": metric.messages_delivered,
-                "failed": metric.messages_failed
-            })
-        
-        # Combine data
-        result = {
-            "summary": summary,
-            "daily_data": daily_data,
-            "period": period
-        }
-        
-        return result
-
-async def get_system_metrics() -> Dict[str, Any]:
-    """
-    Get system-wide metrics (for admin).
-    
-    Returns:
-        Dict[str, Any]: System metrics
-    """
-    # For system metrics, we'll query the database directly
-    from app.db.repositories.messages import MessageRepository
-    from app.db.repositories.users import UserRepository
-    from app.db.repositories.campaigns import CampaignRepository
-    
-    system_metrics = {
-        "messages": {},
-        "users": {},
-        "campaigns": {}
-    }
-    
-    # Query message stats
-    async with get_repository_context(MessageRepository) as message_repo:
-        from sqlalchemy import func, select
-        from app.models.message import Message
-        
-        # Total messages
-        total_query = select(func.count(Message.id))
-        result = await message_repo.session.execute(total_query)
-        total_messages = result.scalar_one_or_none() or 0
-        
-        # Messages by status
-        from app.schemas.message import MessageStatus
-        status_counts = {}
-        for status in [MessageStatus.SENT, MessageStatus.DELIVERED, MessageStatus.FAILED]:
-            status_query = select(func.count(Message.id)).where(Message.status == status)
-            result = await message_repo.session.execute(status_query)
-            status_counts[status] = result.scalar_one_or_none() or 0
-        
-        # Last 24 hours
-        yesterday = datetime.now(timezone.utc) - timedelta(days=1)
-        recent_query = select(func.count(Message.id)).where(Message.created_at >= yesterday)
-        result = await message_repo.session.execute(recent_query)
-        recent_messages = result.scalar_one_or_none() or 0
-        
-        system_metrics["messages"] = {
-            "total": total_messages,
-            "sent": status_counts.get(MessageStatus.SENT, 0),
-            "delivered": status_counts.get(MessageStatus.DELIVERED, 0),
-            "failed": status_counts.get(MessageStatus.FAILED, 0),
-            "last_24h": recent_messages
-        }
-    
-    # Query user stats
-    async with get_repository_context(UserRepository) as user_repo:
-        from app.models.user import User
-        
-        # Total users
-        total_query = select(func.count(User.id))
-        result = await user_repo.session.execute(total_query)
-        total_users = result.scalar_one_or_none() or 0
-        
-        # Active users
-        active_query = select(func.count(User.id)).where(User.is_active == True)
-        result = await user_repo.session.execute(active_query)
-        active_users = result.scalar_one_or_none() or 0
-        
-        system_metrics["users"] = {
-            "total": total_users,
-            "active": active_users
-        }
-    
-    # Query campaign stats
-    async with get_repository_context(CampaignRepository) as campaign_repo:
-        from app.models.campaign import Campaign
-        
-        # Total campaigns
-        total_query = select(func.count(Campaign.id))
-        result = await campaign_repo.session.execute(total_query)
-        total_campaigns = result.scalar_one_or_none() or 0
-        
-        # Active campaigns
-        active_query = select(func.count(Campaign.id)).where(Campaign.status == "active")
-        result = await campaign_repo.session.execute(active_query)
-        active_campaigns = result.scalar_one_or_none() or 0
-        
-        system_metrics["campaigns"] = {
-            "total": total_campaigns,
-            "active": active_campaigns
-        }
-    
-    # Add timestamp
-    system_metrics["timestamp"] = datetime.now(timezone.utc).isoformat()
-    
-    return system_metrics
-
-async def schedule_metrics_update() -> None:
-    """
-    Schedule regular metrics updates.
-    This function is meant to be run as a background task.
-    """
-    from app.db.repositories.metrics import MetricsRepository
-    
-    while True:
-        try:
-            # Calculate time until the next run (midnight UTC)
-            now = datetime.now(timezone.utc)
-            tomorrow = (now + timedelta(days=1)).replace(
-                hour=0, minute=0, second=0, microsecond=0
-            )
-            seconds_until_midnight = (tomorrow - now).total_seconds()
-            
-            # Sleep until midnight
-            logger.info(f"Metrics update scheduled for {tomorrow.isoformat()}")
-            await asyncio.sleep(seconds_until_midnight)
-            
-            # Run the update for yesterday
-            yesterday = now.date() - timedelta(days=1)
-            logger.info(f"Running scheduled metrics update for {yesterday.isoformat()}")
-            
-            async with get_repository_context(MetricsRepository) as metrics_repo:
-                updated_count = await metrics_repo.update_daily_metrics(day=yesterday)
-                logger.info(f"Updated metrics for {updated_count} users")
-                
-        except Exception as e:
-            logger.error(f"Error in scheduled metrics update: {e}")
-            # Sleep for a while before retrying
-            await asyncio.sleep(3600)  # 1 hour
-</file>
-
 <file path="README.md">
 # Inboxerr Backend
 
@@ -10461,6 +10033,97 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 This project is licensed under the MIT License - see the LICENSE file for details.
 </file>
 
+<file path="app/api/v1/endpoints/metrics.py">
+"""
+API endpoints for metrics and reporting.
+"""
+from fastapi import APIRouter, Depends, HTTPException, Query
+from typing import Dict, Any, Optional
+
+from app.api.v1.dependencies import get_current_user
+from app.schemas.user import User
+from app.schemas.metrics import (
+    DashboardMetricsResponse, 
+    UsageMetricsResponse,
+    SystemMetricsResponse
+)
+from app.services.metrics.collector import get_user_metrics, get_system_metrics
+
+router = APIRouter()
+
+
+@router.get("/", response_model=SystemMetricsResponse)
+async def get_metrics(
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Get system metrics and statistics.
+    Admin users get system-wide metrics, regular users get their own metrics.
+    """
+    if current_user.role == "admin":
+        # Admins get system-wide metrics
+        return await get_system_metrics()
+    else:
+        # Regular users get their dashboard metrics instead
+        user_metrics = await get_user_metrics(current_user.id)
+        
+        # Transform user metrics to system format for consistency
+        return {
+            "messages": {
+                "total": user_metrics["summary"]["messages"]["sent"],
+                "sent": user_metrics["summary"]["messages"]["sent"],
+                "delivered": user_metrics["summary"]["messages"]["delivered"],
+                "failed": user_metrics["summary"]["messages"]["failed"],
+                "last_24h": 0  # User-specific doesn't have this breakdown
+            },
+            "users": {
+                "total": 1,  # Just the current user
+                "active": 1,
+                "new_today": 0
+            },
+            "campaigns": {
+                "total": user_metrics["summary"]["campaigns"]["created"],
+                "active": user_metrics["summary"]["campaigns"]["active"],
+                "completed_today": 0
+            }
+        }
+
+
+@router.get("/usage", response_model=UsageMetricsResponse)
+async def get_usage_metrics(
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Get usage metrics for the current user.
+    """
+    user_metrics = await get_user_metrics(current_user.id)
+    
+    # Format for the usage endpoint
+    return {
+        "message_count": user_metrics["summary"]["messages"]["sent"],
+        "delivery_rate": user_metrics["summary"]["messages"]["delivery_rate"],
+        "quota": {
+            "used": user_metrics["summary"]["quota"]["used"],
+            "total": user_metrics["summary"]["quota"]["total"],
+            "percent": user_metrics["summary"]["quota"]["percent"]
+        }
+    }
+
+
+@router.get("/dashboard", response_model=DashboardMetricsResponse)
+async def get_dashboard_metrics(
+    period: str = Query("week", description="Time period: day, week, month, year"),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Get metrics formatted for dashboard display.
+    """
+    metrics = await get_user_metrics(current_user.id, period=period)
+    
+    # Return data already formatted for dashboard
+    return metrics
+</file>
+
 <file path="app/models/message.py">
 """
 Database models for SMS messages.
@@ -10810,6 +10473,499 @@ class WebhookEvent(Event):
     def payload(self) -> Dict[str, Any]:
         """Get webhook payload."""
         return self.data.get("payload", {})
+</file>
+
+<file path="app/services/metrics/collector.py">
+# app/services/metrics/collector.py
+"""
+Metrics collection service.
+"""
+import asyncio
+import logging
+from typing import Dict, Any, Optional, List
+from datetime import datetime, date, timezone, timedelta
+
+from app.services.event_bus.bus import get_event_bus
+from app.services.event_bus.events import EventType
+from app.db.session import get_repository_context
+
+logger = logging.getLogger("inboxerr.metrics")
+
+async def initialize_metrics() -> None:
+    """Initialize metrics collector."""
+    logger.info("Initializing metrics collector")
+    
+    # Subscribe to events
+    event_bus = get_event_bus()
+    
+    # Message events
+    await event_bus.subscribe(
+        EventType.MESSAGE_CREATED,
+        _handle_message_created,
+        "metrics.message_created"
+    )
+    
+    await event_bus.subscribe(
+        EventType.MESSAGE_SENT,
+        _handle_message_sent,
+        "metrics.message_sent"
+    )
+    
+    await event_bus.subscribe(
+        EventType.MESSAGE_DELIVERED,
+        _handle_message_delivered,
+        "metrics.message_delivered"
+    )
+    
+    await event_bus.subscribe(
+        EventType.MESSAGE_FAILED,
+        _handle_message_failed,
+        "metrics.message_failed"
+    )
+    
+    # Campaign events
+    await event_bus.subscribe(
+        EventType.CAMPAIGN_CREATED,
+        _handle_campaign_created,
+        "metrics.campaign_created"
+    )
+    
+    await event_bus.subscribe(
+        EventType.CAMPAIGN_COMPLETED,
+        _handle_campaign_completed,
+        "metrics.campaign_completed"
+    )
+    
+    # Template events
+    await event_bus.subscribe(
+        EventType.TEMPLATE_CREATED,
+        _handle_template_created,
+        "metrics.template_created"
+    )
+    
+    await event_bus.subscribe(
+        EventType.TEMPLATE_USED,
+        _handle_template_used,
+        "metrics.template_used"
+    )
+    
+    logger.info("Metrics collector initialized")
+
+# Event handlers
+async def _handle_message_created(data: Dict[str, Any]) -> None:
+    """Handle message created event."""
+    user_id = data.get("user_id")
+    if not user_id:
+        return
+    
+    # Get today's date
+    today = datetime.now(timezone.utc).date()
+    
+    # Update metrics
+    from app.db.repositories.metrics import MetricsRepository
+    
+    try:
+        async with get_repository_context(MetricsRepository) as metrics_repo:
+            await metrics_repo.increment_metric(
+                user_id=user_id,
+                date=today,
+                metric_name="messages_scheduled",
+                increment=1
+            )
+    except Exception as e:
+        logger.error(f"Error updating metrics for message_created: {e}")
+
+async def _handle_message_sent(data: Dict[str, Any]) -> None:
+    """Handle message sent event."""
+    user_id = data.get("user_id")
+    if not user_id:
+        return
+    
+    # Get today's date
+    today = datetime.now(timezone.utc).date()
+    
+    # Update metrics
+    from app.db.repositories.metrics import MetricsRepository
+    
+    try:
+        async with get_repository_context(MetricsRepository) as metrics_repo:
+            await metrics_repo.increment_metric(
+                user_id=user_id,
+                date=today,
+                metric_name="messages_sent",
+                increment=1
+            )
+            
+            # Decrement scheduled count if it was scheduled
+            scheduled = data.get("scheduled", False)
+            if scheduled:
+                await metrics_repo.increment_metric(
+                    user_id=user_id,
+                    date=today,
+                    metric_name="messages_scheduled",
+                    increment=-1
+                )
+    except Exception as e:
+        logger.error(f"Error updating metrics for message_sent: {e}")
+
+async def _handle_message_delivered(data: Dict[str, Any]) -> None:
+    """Handle message delivered event."""
+    user_id = data.get("user_id")
+    if not user_id:
+        return
+    
+    # Get today's date
+    today = datetime.now(timezone.utc).date()
+    
+    # Update metrics
+    from app.db.repositories.metrics import MetricsRepository
+    
+    try:
+        async with get_repository_context(MetricsRepository) as metrics_repo:
+            await metrics_repo.increment_metric(
+                user_id=user_id,
+                date=today,
+                metric_name="messages_delivered",
+                increment=1
+            )
+    except Exception as e:
+        logger.error(f"Error updating metrics for message_delivered: {e}")
+
+async def _handle_message_failed(data: Dict[str, Any]) -> None:
+    """Handle message failed event."""
+    user_id = data.get("user_id")
+    if not user_id:
+        return
+    
+    # Get today's date
+    today = datetime.now(timezone.utc).date()
+    
+    # Update metrics
+    from app.db.repositories.metrics import MetricsRepository
+    
+    try:
+        async with get_repository_context(MetricsRepository) as metrics_repo:
+            await metrics_repo.increment_metric(
+                user_id=user_id,
+                date=today,
+                metric_name="messages_failed",
+                increment=1
+            )
+    except Exception as e:
+        logger.error(f"Error updating metrics for message_failed: {e}")
+
+async def _handle_campaign_created(data: Dict[str, Any]) -> None:
+    """Handle campaign created event."""
+    user_id = data.get("user_id")
+    if not user_id:
+        return
+    
+    # Get today's date
+    today = datetime.now(timezone.utc).date()
+    
+    # Update metrics
+    from app.db.repositories.metrics import MetricsRepository
+    
+    try:
+        async with get_repository_context(MetricsRepository) as metrics_repo:
+            await metrics_repo.increment_metric(
+                user_id=user_id,
+                date=today,
+                metric_name="campaigns_created",
+                increment=1
+            )
+            
+            # Increment active campaigns too
+            await metrics_repo.increment_metric(
+                user_id=user_id,
+                date=today,
+                metric_name="campaigns_active",
+                increment=1
+            )
+    except Exception as e:
+        logger.error(f"Error updating metrics for campaign_created: {e}")
+
+async def _handle_campaign_completed(data: Dict[str, Any]) -> None:
+    """Handle campaign completed event."""
+    user_id = data.get("user_id")
+    if not user_id:
+        return
+    
+    # Get today's date
+    today = datetime.now(timezone.utc).date()
+    
+    # Update metrics
+    from app.db.repositories.metrics import MetricsRepository
+    
+    try:
+        async with get_repository_context(MetricsRepository) as metrics_repo:
+            await metrics_repo.increment_metric(
+                user_id=user_id,
+                date=today,
+                metric_name="campaigns_completed",
+                increment=1
+            )
+            
+            # Decrement active campaigns
+            await metrics_repo.increment_metric(
+                user_id=user_id,
+                date=today,
+                metric_name="campaigns_active",
+                increment=-1
+            )
+    except Exception as e:
+        logger.error(f"Error updating metrics for campaign_completed: {e}")
+
+async def _handle_template_created(data: Dict[str, Any]) -> None:
+    """Handle template created event."""
+    user_id = data.get("user_id")
+    if not user_id:
+        return
+    
+    # Get today's date
+    today = datetime.now(timezone.utc).date()
+    
+    # Update metrics
+    from app.db.repositories.metrics import MetricsRepository
+    
+    try:
+        async with get_repository_context(MetricsRepository) as metrics_repo:
+            await metrics_repo.increment_metric(
+                user_id=user_id,
+                date=today,
+                metric_name="templates_created",
+                increment=1
+            )
+    except Exception as e:
+        logger.error(f"Error updating metrics for template_created: {e}")
+
+async def _handle_template_used(data: Dict[str, Any]) -> None:
+    """Handle template used event."""
+    user_id = data.get("user_id")
+    if not user_id:
+        return
+    
+    # Get today's date
+    today = datetime.now(timezone.utc).date()
+    
+    # Update metrics
+    from app.db.repositories.metrics import MetricsRepository
+    
+    try:
+        async with get_repository_context(MetricsRepository) as metrics_repo:
+            await metrics_repo.increment_metric(
+                user_id=user_id,
+                date=today,
+                metric_name="templates_used",
+                increment=1
+            )
+    except Exception as e:
+        logger.error(f"Error updating metrics for template_used: {e}")
+
+async def get_user_metrics(
+    user_id: str,
+    period: str = "week"
+) -> Dict[str, Any]:
+    """
+    Get metrics for a specific user.
+    
+    Args:
+        user_id: User ID
+        period: Time period ("day", "week", "month", "year")
+        
+    Returns:
+        Dict[str, Any]: User metrics
+    """
+    from app.db.repositories.metrics import MetricsRepository
+    
+    # Calculate date range based on period
+    end_date = datetime.now(timezone.utc).date()
+    
+    if period == "day":
+        start_date = end_date
+    elif period == "week":
+        start_date = end_date - timedelta(days=7)
+    elif period == "month":
+        start_date = end_date - timedelta(days=30)
+    elif period == "year":
+        start_date = end_date - timedelta(days=365)
+    else:
+        # Default to week
+        start_date = end_date - timedelta(days=7)
+    
+    # Get metrics
+    async with get_repository_context(MetricsRepository) as metrics_repo:
+        # Get summary metrics
+        summary = await metrics_repo.get_summary_metrics(
+            user_id=user_id,
+            start_date=start_date,
+            end_date=end_date
+        )
+        
+        # Get daily metrics for charting
+        metrics_list = await metrics_repo.get_metrics_range(
+            user_id=user_id,
+            start_date=start_date,
+            end_date=end_date
+        )
+        
+        # Format for response
+        daily_data = []
+        for metric in metrics_list:
+            daily_data.append({
+                "date": metric.date.isoformat(),
+                "sent": metric.messages_sent,
+                "delivered": metric.messages_delivered,
+                "failed": metric.messages_failed
+            })
+        
+        # Combine data
+        result = {
+            "summary": summary,
+            "daily_data": daily_data,
+            "period": period
+        }
+        
+        return result
+
+async def get_system_metrics() -> Dict[str, Any]:
+    """
+    Get system-wide metrics (for admin).
+    
+    Returns:
+        Dict[str, Any]: System metrics formatted for SystemMetricsResponse
+    """
+    # For system metrics, we'll query the database directly
+    from app.db.repositories.messages import MessageRepository
+    from app.db.repositories.users import UserRepository
+    from app.db.repositories.campaigns import CampaignRepository
+    
+    system_metrics = {
+        "messages": {},
+        "users": {},
+        "campaigns": {}
+    }
+    
+    # Query message stats
+    async with get_repository_context(MessageRepository) as message_repo:
+        from sqlalchemy import func, select
+        from app.models.message import Message
+        
+        # Total messages
+        total_query = select(func.count(Message.id))
+        result = await message_repo.session.execute(total_query)
+        total_messages = result.scalar_one_or_none() or 0
+        
+        # Messages by status
+        from app.schemas.message import MessageStatus
+        status_counts = {}
+        for status in [MessageStatus.SENT, MessageStatus.DELIVERED, MessageStatus.FAILED]:
+            status_query = select(func.count(Message.id)).where(Message.status == status)
+            result = await message_repo.session.execute(status_query)
+            status_counts[status] = result.scalar_one_or_none() or 0
+        
+        # Last 24 hours
+        yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+        recent_query = select(func.count(Message.id)).where(Message.created_at >= yesterday)
+        result = await message_repo.session.execute(recent_query)
+        recent_messages = result.scalar_one_or_none() or 0
+        
+        system_metrics["messages"] = {
+            "total": total_messages,
+            "sent": status_counts.get(MessageStatus.SENT, 0),
+            "delivered": status_counts.get(MessageStatus.DELIVERED, 0),
+            "failed": status_counts.get(MessageStatus.FAILED, 0),
+            "last_24h": recent_messages
+        }
+    
+    # Query user stats
+    async with get_repository_context(UserRepository) as user_repo:
+        from app.models.user import User
+        
+        # Total users
+        total_query = select(func.count(User.id))
+        result = await user_repo.session.execute(total_query)
+        total_users = result.scalar_one_or_none() or 0
+        
+        # Active users
+        active_query = select(func.count(User.id)).where(User.is_active == True)
+        result = await user_repo.session.execute(active_query)
+        active_users = result.scalar_one_or_none() or 0
+        
+        # New users today
+        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        new_today_query = select(func.count(User.id)).where(User.created_at >= today_start)
+        result = await user_repo.session.execute(new_today_query)
+        new_today = result.scalar_one_or_none() or 0
+        
+        system_metrics["users"] = {
+            "total": total_users,
+            "active": active_users,
+            "new_today": new_today
+        }
+    
+    # Query campaign stats
+    async with get_repository_context(CampaignRepository) as campaign_repo:
+        from app.models.campaign import Campaign
+        
+        # Total campaigns
+        total_query = select(func.count(Campaign.id))
+        result = await campaign_repo.session.execute(total_query)
+        total_campaigns = result.scalar_one_or_none() or 0
+        
+        # Active campaigns
+        active_query = select(func.count(Campaign.id)).where(Campaign.status == "active")
+        result = await campaign_repo.session.execute(active_query)
+        active_campaigns = result.scalar_one_or_none() or 0
+        
+        # Campaigns completed today
+        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        completed_today_query = select(func.count(Campaign.id)).where(
+            Campaign.completed_at >= today_start
+        )
+        result = await campaign_repo.session.execute(completed_today_query)
+        completed_today = result.scalar_one_or_none() or 0
+        
+        system_metrics["campaigns"] = {
+            "total": total_campaigns,
+            "active": active_campaigns,
+            "completed_today": completed_today
+        }
+    
+    return system_metrics
+
+async def schedule_metrics_update() -> None:
+    """
+    Schedule regular metrics updates.
+    This function is meant to be run as a background task.
+    """
+    from app.db.repositories.metrics import MetricsRepository
+    
+    while True:
+        try:
+            # Calculate time until the next run (midnight UTC)
+            now = datetime.now(timezone.utc)
+            tomorrow = (now + timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            seconds_until_midnight = (tomorrow - now).total_seconds()
+            
+            # Sleep until midnight
+            logger.info(f"Metrics update scheduled for {tomorrow.isoformat()}")
+            await asyncio.sleep(seconds_until_midnight)
+            
+            # Run the update for yesterday
+            yesterday = now.date() - timedelta(days=1)
+            logger.info(f"Running scheduled metrics update for {yesterday.isoformat()}")
+            
+            async with get_repository_context(MetricsRepository) as metrics_repo:
+                updated_count = await metrics_repo.update_daily_metrics(day=yesterday)
+                logger.info(f"Updated metrics for {updated_count} users")
+                
+        except Exception as e:
+            logger.error(f"Error in scheduled metrics update: {e}")
+            # Sleep for a while before retrying
+            await asyncio.sleep(3600)  # 1 hour
 </file>
 
 <file path="app/services/sms/retry_engine.py">
@@ -12139,11 +12295,22 @@ class SMSSender:
                 campaign_id=campaign_id
             )
             
+            # ✅ ALWAYS publish MESSAGE_CREATED event (this was missing!)
+            await self.event_bus.publish(
+                EventType.MESSAGE_CREATED,
+                {
+                    "message_id": db_message.id,
+                    "phone_number": formatted_number,
+                    "user_id": user_id,
+                    "campaign_id": campaign_id
+                }
+            )
+            
             # If scheduled for future, return message details
             if scheduled_at and scheduled_at > datetime.now(timezone.utc):
                 logger.info(f"Message {db_message.id} scheduled for {scheduled_at}")
                 
-                # Publish event
+                # Publish scheduled event
                 await self.event_bus.publish(
                     EventType.MESSAGE_SCHEDULED,
                     {
@@ -12177,6 +12344,17 @@ class SMSSender:
                     data=result
                 )
                 
+                # ✅ Publish MESSAGE_SENT event (this was missing!)
+                await self.event_bus.publish(
+                    EventType.MESSAGE_SENT,
+                    {
+                        "message_id": db_message.id,
+                        "phone_number": formatted_number,
+                        "user_id": user_id,
+                        "gateway_message_id": result.get("gateway_message_id")
+                    }
+                )
+                
                 # Get updated message
                 updated_message = await repo.get_by_id(db_message.id)
                 return updated_message.dict()
@@ -12196,12 +12374,23 @@ class SMSSender:
                     data={"error": error_message}
                 )
                 
+                # ✅ Publish MESSAGE_FAILED event (this was missing!)
+                await self.event_bus.publish(
+                    EventType.MESSAGE_FAILED,
+                    {
+                        "message_id": db_message.id,
+                        "phone_number": formatted_number,
+                        "user_id": user_id,
+                        "reason": error_message
+                    }
+                )
+                
                 # Re-raise as SMSGatewayError
                 if isinstance(e, RetryableError):
                     raise SMSGatewayError(message=error_message, code="GATEWAY_ERROR", status_code=503)
                 else:
                     raise SMSGatewayError(message=error_message, code="GATEWAY_ERROR")
-    
+
     async def send_batch(
         self,
         *,
