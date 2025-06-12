@@ -4,8 +4,8 @@ API endpoints for SMS message management.
 import csv
 import io
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, UploadFile, File, Query, Path
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, UploadFile, File, Query, Path, status
+
 
 from app.api.v1.dependencies import get_current_user, get_rate_limiter, verify_api_key
 from app.core.exceptions import ValidationError, SMSGatewayError, NotFoundError
@@ -274,7 +274,7 @@ async def update_message_status(
         raise HTTPException(status_code=500, detail=f"Error updating message status: {str(e)}")
 
 
-@router.delete("/{message_id}", status_code=204)
+@router.delete("/{message_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_message(
     message_id: str = Path(..., description="Message ID"),
     current_user: User = Depends(get_current_user),
@@ -296,7 +296,7 @@ async def delete_message(
         if not success:
             raise HTTPException(status_code=500, detail="Failed to delete message")
         
-        return JSONResponse(status_code=204, content=None)
+        return None  # No content response
         
     except NotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
