@@ -16,7 +16,8 @@ from app.schemas.campaign import (
     CampaignListResponse
 )
 from app.schemas.user import User
-from app.utils.pagination import PaginationParams, paginate_response
+from app.schemas.message import MessageResponse
+from app.utils.pagination import PaginationParams, paginate_response, PaginatedResponse, PageInfo
 from app.services.campaigns.processor import get_campaign_processor
 from app.db.session import get_repository_context
 
@@ -368,7 +369,7 @@ async def cancel_campaign(
        raise HTTPException(status_code=500, detail=f"Error cancelling campaign: {str(e)}")
 
 
-@router.get("/{campaign_id}/messages", response_model=dict)
+@router.get("/{campaign_id}/messages", response_model=PaginatedResponse[MessageResponse])
 async def get_campaign_messages(
    campaign_id: str = Path(..., description="Campaign ID"),
    pagination: PaginationParams = Depends(),
@@ -403,12 +404,24 @@ async def get_campaign_messages(
                skip=pagination.skip,
                limit=pagination.limit
            )
+
+           # Calculate proper pagination info
+           total_pages = (total + pagination.limit - 1) // pagination.limit
+
+           # Create proper PageInfo object
+           page_info = PageInfo(
+               current_page=pagination.page,
+               total_pages=total_pages,
+               page_size=pagination.limit,
+               total_items=total,
+               has_previous=pagination.page > 1,
+               has_next=pagination.page < total_pages
+           )
            
-           # Return paginated response
-           return paginate_response(
-               items=[message.dict() for message in messages],
-               total=total,
-               pagination=pagination
+           # Return PaginatedResponse object
+           return PaginatedResponse(
+               items=messages,  # Direct Message objects - FastAPI will serialize them
+               page_info=page_info
            )
        
    except NotFoundError as e:

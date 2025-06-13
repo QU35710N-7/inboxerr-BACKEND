@@ -102,6 +102,7 @@ Dockerfile
 docs/FRONTEND_API_SETUP.md
 docs/FRONTEND_DEVELOPER_GUIDE.md
 docs/Message Template System - User Guide.md
+docs/tofix.md
 project_structure.md
 README.md
 requirements.txt
@@ -119,6 +120,35 @@ tests/unit/api/messages/test_messages_endpoints.py
 
 <files>
 This section contains the contents of the repository's files.
+
+<file path="docs/tofix.md">
+CSV import can exhaust memory on large files
+await file.read() loads the entire upload into RAM. For big CSVs (> ~50 MB) this will block the event-loop and may kill small instances.
+
+
+
+2.
+
+
+1. Problem Statement
+All three “send” endpoints in app/api/v1/endpoints/messages.py accept a BackgroundTasks object but never enqueue tasks with it.
+
+py
+Copy
+Edit
+async def send_message(..., background_tasks: BackgroundTasks, ...)
+    ...
+    result = await sms_sender.send_message(...)   # ← blocks request
+As a result, every request waits for the SMS gateway (or bulk CSV parsing) before returning, contradicting the 202 “accepted / processing” contract and limiting throughput.
+
+2. Impact
+Area	Consequence
+Latency / UX	Client sits idle for seconds on large batches; 202 is misleading.
+Throughput	Long-running awaits tie up the event loop → fewer concurrent requests.
+Scalability	Memory spike when importing large CSVs (await file.read() loads whole file in RAM).
+Task progress	/tasks/{id} endpoint often returns 404 because no task records are created.
+...
+</file>
 
 <file path="alembic.ini">
 # A generic, single database configuration.
@@ -4189,7 +4219,8 @@ from app.schemas.campaign import (
     CampaignListResponse
 )
 from app.schemas.user import User
-from app.utils.pagination import PaginationParams, paginate_response
+from app.schemas.message import MessageResponse
+from app.utils.pagination import PaginationParams, paginate_response, PaginatedResponse, PageInfo
 from app.services.campaigns.processor import get_campaign_processor
 from app.db.session import get_repository_context
 
@@ -4541,7 +4572,7 @@ async def cancel_campaign(
        raise HTTPException(status_code=500, detail=f"Error cancelling campaign: {str(e)}")
 
 
-@router.get("/{campaign_id}/messages", response_model=dict)
+@router.get("/{campaign_id}/messages", response_model=PaginatedResponse[MessageResponse])
 async def get_campaign_messages(
    campaign_id: str = Path(..., description="Campaign ID"),
    pagination: PaginationParams = Depends(),
@@ -4576,12 +4607,24 @@ async def get_campaign_messages(
                skip=pagination.skip,
                limit=pagination.limit
            )
+
+           # Calculate proper pagination info
+           total_pages = (total + pagination.limit - 1) // pagination.limit
+
+           # Create proper PageInfo object
+           page_info = PageInfo(
+               current_page=pagination.page,
+               total_pages=total_pages,
+               page_size=pagination.limit,
+               total_items=total,
+               has_previous=pagination.page > 1,
+               has_next=pagination.page < total_pages
+           )
            
-           # Return paginated response
-           return paginate_response(
-               items=[message.dict() for message in messages],
-               total=total,
-               pagination=pagination
+           # Return PaginatedResponse object
+           return PaginatedResponse(
+               items=messages,  # Direct Message objects - FastAPI will serialize them
+               page_info=page_info
            )
        
    except NotFoundError as e:
@@ -4631,337 +4674,6 @@ async def delete_campaign(
        raise HTTPException(status_code=404, detail=str(e))
    except Exception as e:
        raise HTTPException(status_code=500, detail=f"Error deleting campaign: {str(e)}")
-</file>
-
-<file path="app/api/v1/endpoints/messages.py">
-"""
-API endpoints for SMS message management.
-"""
-import csv
-import io
-from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, UploadFile, File, Query, Path
-from fastapi.responses import JSONResponse
-
-from app.api.v1.dependencies import get_current_user, get_rate_limiter, verify_api_key
-from app.core.exceptions import ValidationError, SMSGatewayError, NotFoundError
-from app.schemas.message import (
-    MessageCreate,
-    MessageResponse, 
-    BatchMessageRequest, 
-    BatchMessageResponse,
-    MessageStatus,
-    MessageStatusUpdate
-)
-from app.services.sms.sender import get_sms_sender
-from app.schemas.user import User
-from app.utils.pagination import PaginationParams, paginate_response
-from app.utils.pagination import PaginatedResponse
-
-router = APIRouter()
-
-
-@router.post("/send", response_model=MessageResponse, status_code=202)
-async def send_message(
-    message: MessageCreate,
-    background_tasks: BackgroundTasks,
-    current_user: User = Depends(get_current_user),
-    sms_sender = Depends(get_sms_sender),
-    rate_limiter = Depends(get_rate_limiter),
-):
-    """
-    Send a single SMS message.
-    
-    - **phone_number**: Recipient phone number in E.164 format (e.g., +1234567890)
-    - **message**: Content of the SMS message
-    - **scheduled_at**: Optional timestamp to schedule the message for future delivery
-    """
-    # Check rate limits
-    await rate_limiter.check_rate_limit(current_user.id, "send_message")
-    
-    try:
-        # Send message asynchronously
-        result = await sms_sender.send_message(
-            phone_number=message.phone_number,
-            message_text=message.message,
-            user_id=current_user.id,
-            scheduled_at=message.scheduled_at,
-            custom_id=message.custom_id,
-        )
-        
-        return result
-        
-    except ValidationError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    except SMSGatewayError as e:
-        raise HTTPException(status_code=502, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error sending message: {str(e)}")
-
-
-@router.post("/batch", response_model=BatchMessageResponse, status_code=202)
-async def send_batch(
-    batch: BatchMessageRequest,
-    background_tasks: BackgroundTasks,
-    current_user: User = Depends(get_current_user),
-    sms_sender = Depends(get_sms_sender),
-    rate_limiter = Depends(get_rate_limiter),
-):
-    """
-    Send a batch of SMS messages.
-    
-    - **messages**: List of messages to send
-    - **options**: Optional batch processing options
-    """
-    # Check rate limits - higher limit for batch operations
-    await rate_limiter.check_rate_limit(current_user.id, "send_batch")
-    
-    if not batch.messages:
-        raise ValidationError(message="Batch contains no messages")
-    
-    try:
-        # Process batch asynchronously
-        result = await sms_sender.send_batch(
-            messages=batch.messages,
-            user_id=current_user.id,
-            options=batch.options,
-        )
-        
-        return result
-        
-    except ValidationError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    except SMSGatewayError as e:
-        raise HTTPException(status_code=502, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing batch: {str(e)}")
-
-
-@router.post("/import", status_code=202)
-async def import_messages(
-    file: UploadFile = File(...),
-    message_template: str = Query(..., description="Message template to send"),
-    delimiter: str = Query(",", description="CSV delimiter"),
-    has_header: bool = Query(True, description="Whether CSV has a header row"),
-    phone_column: str = Query("phone", description="Column name containing phone numbers"),
-    background_tasks: BackgroundTasks = None,
-    current_user: User = Depends(get_current_user),
-    sms_sender = Depends(get_sms_sender),
-    rate_limiter = Depends(get_rate_limiter),
-):
-    """
-    Import phone numbers from CSV and send messages.
-    
-    - **file**: CSV file with phone numbers
-    - **message_template**: Template for the message to send
-    - **delimiter**: CSV delimiter character
-    - **has_header**: Whether the CSV has a header row
-    - **phone_column**: Column name containing phone numbers (if has_header=True)
-    """
-    # Check rate limits
-    await rate_limiter.check_rate_limit(current_user.id, "import_messages")
-    
-    try:
-        # Read CSV file
-        contents = await file.read()
-        csv_file = io.StringIO(contents.decode('utf-8'))
-        
-        # Parse CSV
-        csv_reader = csv.reader(csv_file, delimiter=delimiter)
-        
-        # Skip header if present
-        if has_header:
-            header = next(csv_reader)
-            try:
-                phone_index = header.index(phone_column)
-            except ValueError:
-                raise ValidationError(
-                    message=f"Column '{phone_column}' not found in CSV header",
-                    details={"available_columns": header}
-                )
-        else:
-            phone_index = 0  # Assume first column has phone numbers
-        
-        # Extract phone numbers
-        phone_numbers = []
-        for row in csv_reader:
-            if row and len(row) > phone_index:
-                phone = row[phone_index].strip()
-                if phone:
-                    phone_numbers.append(phone)
-        
-        if not phone_numbers:
-            raise ValidationError(message="No valid phone numbers found in CSV")
-        
-        # Process in background
-        task_id = await sms_sender.schedule_batch_from_numbers(
-            phone_numbers=phone_numbers,
-            message_text=message_template,
-            user_id=current_user.id,
-        )
-        
-        return {
-            "status": "accepted",
-            "message": f"Processing {len(phone_numbers)} messages",
-            "task_id": task_id,
-        }
-        
-    except ValidationError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error importing messages: {str(e)}")
-
-
-@router.get("/{message_id}", response_model=MessageResponse)
-async def get_message(
-    message_id: str = Path(..., description="Message ID"),
-    current_user: User = Depends(get_current_user),
-    sms_sender = Depends(get_sms_sender),
-):
-    """
-    Get details of a specific message.
-    """
-    try:
-        message = await sms_sender.get_message(message_id, user_id=current_user.id)
-        if not message:
-            raise NotFoundError(message=f"Message {message_id} not found")
-        return message
-    except NotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error retrieving message: {str(e)}")
-
-
-@router.get("/", response_model=PaginatedResponse[MessageResponse])
-async def list_messages(
-    pagination: PaginationParams = Depends(),
-    status: Optional[str] = Query(None, description="Filter by message status"),
-    phone_number: Optional[str] = Query(None, description="Filter by phone number"),
-    from_date: Optional[str] = Query(None, description="Filter from date (ISO format)"),
-    to_date: Optional[str] = Query(None, description="Filter to date (ISO format)"),
-    current_user: User = Depends(get_current_user),
-    sms_sender = Depends(get_sms_sender),
-):
-    """
-    List messages with optional filtering.
-    
-    Returns a paginated list of messages for the current user.
-    """
-    try:
-        filters = {
-            "status": status,
-            "phone_number": phone_number,
-            "from_date": from_date,
-            "to_date": to_date,
-            "user_id": current_user.id
-        }
-        
-        # Get messages with pagination
-        messages, total = await sms_sender.list_messages(
-            filters=filters,
-            skip=pagination.skip,
-            limit=pagination.limit
-        )
-        
-        # Return paginated response
-        return paginate_response(
-            items=messages,
-            total=total,
-            pagination=pagination
-        )
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error listing messages: {str(e)}")
-
-
-@router.put("/{message_id}/status", response_model=MessageResponse)
-async def update_message_status(
-    status_update: MessageStatusUpdate,
-    message_id: str = Path(..., description="Message ID"),
-    current_user: User = Depends(get_current_user),
-    sms_sender = Depends(get_sms_sender),
-):
-    """
-    Update the status of a message.
-    
-    This is primarily for administrative purposes or handling external status updates.
-    """
-    try:
-        # Verify the user has permission to update this message
-        message = await sms_sender.get_message(message_id, user_id=current_user.id)
-        if not message:
-            raise NotFoundError(message=f"Message {message_id} not found")
-        
-        # Update the status
-        updated_message = await sms_sender.update_message_status(
-            message_id=message_id,
-            status=status_update.status,
-            reason=status_update.reason,
-            user_id=current_user.id
-        )
-        
-        return updated_message
-        
-    except NotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except ValidationError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error updating message status: {str(e)}")
-
-
-@router.delete("/{message_id}", status_code=204)
-async def delete_message(
-    message_id: str = Path(..., description="Message ID"),
-    current_user: User = Depends(get_current_user),
-    sms_sender = Depends(get_sms_sender),
-):
-    """
-    Delete a message.
-    
-    This will only remove it from the database, but cannot recall messages already sent.
-    """
-    try:
-        # Verify the message exists and belongs to the user
-        message = await sms_sender.get_message(message_id, user_id=current_user.id)
-        if not message:
-            raise NotFoundError(message=f"Message {message_id} not found")
-        
-        # Delete the message
-        success = await sms_sender.delete_message(message_id, user_id=current_user.id)
-        if not success:
-            raise HTTPException(status_code=500, detail="Failed to delete message")
-        
-        return JSONResponse(status_code=204, content=None)
-        
-    except NotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error deleting message: {str(e)}")
-
-
-@router.get("/tasks/{task_id}", response_model=dict)
-async def get_task_status(
-    task_id: str = Path(..., description="Task ID"),
-    current_user: User = Depends(get_current_user),
-    sms_sender = Depends(get_sms_sender),
-):
-    """
-    Check the status of a background task.
-    
-    Used for tracking progress of batch operations and imports.
-    """
-    try:
-        task_status = await sms_sender.get_task_status(task_id, user_id=current_user.id)
-        if not task_status:
-            raise NotFoundError(message=f"Task {task_id} not found")
-        
-        return task_status
-        
-    except NotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error retrieving task status: {str(e)}")
 </file>
 
 <file path="app/api/v1/endpoints/templates.py">
@@ -7734,6 +7446,337 @@ async def validate_permissions(
     # For now, just verify role-based access
     if current_user.role != UserRole.API and "api" in required_permissions:
         raise AuthorizationError("Insufficient permissions")
+</file>
+
+<file path="app/api/v1/endpoints/messages.py">
+"""
+API endpoints for SMS message management.
+"""
+import csv
+import io
+from typing import List, Optional
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, UploadFile, File, Query, Path, status
+
+
+from app.api.v1.dependencies import get_current_user, get_rate_limiter, verify_api_key
+from app.core.exceptions import ValidationError, SMSGatewayError, NotFoundError
+from app.schemas.message import (
+    MessageCreate,
+    MessageResponse, 
+    BatchMessageRequest, 
+    BatchMessageResponse,
+    MessageStatus,
+    MessageStatusUpdate
+)
+from app.services.sms.sender import get_sms_sender
+from app.schemas.user import User
+from app.utils.pagination import PaginationParams, paginate_response
+from app.utils.pagination import PaginatedResponse
+
+router = APIRouter()
+
+
+@router.post("/send", response_model=MessageResponse, status_code=202)
+async def send_message(
+    message: MessageCreate,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    sms_sender = Depends(get_sms_sender),
+    rate_limiter = Depends(get_rate_limiter),
+):
+    """
+    Send a single SMS message.
+    
+    - **phone_number**: Recipient phone number in E.164 format (e.g., +1234567890)
+    - **message**: Content of the SMS message
+    - **scheduled_at**: Optional timestamp to schedule the message for future delivery
+    """
+    # Check rate limits
+    await rate_limiter.check_rate_limit(current_user.id, "send_message")
+    
+    try:
+        # Send message asynchronously
+        result = await sms_sender.send_message(
+            phone_number=message.phone_number,
+            message_text=message.message,
+            user_id=current_user.id,
+            scheduled_at=message.scheduled_at,
+            custom_id=message.custom_id,
+        )
+        
+        return result
+        
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except SMSGatewayError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error sending message: {str(e)}")
+
+
+@router.post("/batch", response_model=BatchMessageResponse, status_code=202)
+async def send_batch(
+    batch: BatchMessageRequest,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    sms_sender = Depends(get_sms_sender),
+    rate_limiter = Depends(get_rate_limiter),
+):
+    """
+    Send a batch of SMS messages.
+    
+    - **messages**: List of messages to send
+    - **options**: Optional batch processing options
+    """
+    # Check rate limits - higher limit for batch operations
+    await rate_limiter.check_rate_limit(current_user.id, "send_batch")
+    
+    if not batch.messages:
+        raise ValidationError(message="Batch contains no messages")
+    
+    try:
+        # Process batch asynchronously
+        result = await sms_sender.send_batch(
+            messages=batch.messages,
+            user_id=current_user.id,
+            options=batch.options,
+        )
+        
+        return result
+        
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except SMSGatewayError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing batch: {str(e)}")
+
+
+@router.post("/import", status_code=202)
+async def import_messages(
+    file: UploadFile = File(...),
+    message_template: str = Query(..., description="Message template to send"),
+    delimiter: str = Query(",", description="CSV delimiter"),
+    has_header: bool = Query(True, description="Whether CSV has a header row"),
+    phone_column: str = Query("phone", description="Column name containing phone numbers"),
+    background_tasks: BackgroundTasks = None,
+    current_user: User = Depends(get_current_user),
+    sms_sender = Depends(get_sms_sender),
+    rate_limiter = Depends(get_rate_limiter),
+):
+    """
+    Import phone numbers from CSV and send messages.
+    
+    - **file**: CSV file with phone numbers
+    - **message_template**: Template for the message to send
+    - **delimiter**: CSV delimiter character
+    - **has_header**: Whether the CSV has a header row
+    - **phone_column**: Column name containing phone numbers (if has_header=True)
+    """
+    # Check rate limits
+    await rate_limiter.check_rate_limit(current_user.id, "import_messages")
+    
+    try:
+        # Read CSV file
+        contents = await file.read()
+        csv_file = io.StringIO(contents.decode('utf-8'))
+        
+        # Parse CSV
+        csv_reader = csv.reader(csv_file, delimiter=delimiter)
+        
+        # Skip header if present
+        if has_header:
+            header = next(csv_reader)
+            try:
+                phone_index = header.index(phone_column)
+            except ValueError:
+                raise ValidationError(
+                    message=f"Column '{phone_column}' not found in CSV header",
+                    details={"available_columns": header}
+                )
+        else:
+            phone_index = 0  # Assume first column has phone numbers
+        
+        # Extract phone numbers
+        phone_numbers = []
+        for row in csv_reader:
+            if row and len(row) > phone_index:
+                phone = row[phone_index].strip()
+                if phone:
+                    phone_numbers.append(phone)
+        
+        if not phone_numbers:
+            raise ValidationError(message="No valid phone numbers found in CSV")
+        
+        # Process in background
+        task_id = await sms_sender.schedule_batch_from_numbers(
+            phone_numbers=phone_numbers,
+            message_text=message_template,
+            user_id=current_user.id,
+        )
+        
+        return {
+            "status": "accepted",
+            "message": f"Processing {len(phone_numbers)} messages",
+            "task_id": task_id,
+        }
+        
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error importing messages: {str(e)}")
+
+
+@router.get("/{message_id}", response_model=MessageResponse)
+async def get_message(
+    message_id: str = Path(..., description="Message ID"),
+    current_user: User = Depends(get_current_user),
+    sms_sender = Depends(get_sms_sender),
+):
+    """
+    Get details of a specific message.
+    """
+    try:
+        message = await sms_sender.get_message(message_id, user_id=current_user.id)
+        if not message:
+            raise NotFoundError(message=f"Message {message_id} not found")
+        return message
+    except NotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error retrieving message: {str(e)}")
+
+
+@router.get("/", response_model=PaginatedResponse[MessageResponse])
+async def list_messages(
+    pagination: PaginationParams = Depends(),
+    status: Optional[str] = Query(None, description="Filter by message status"),
+    phone_number: Optional[str] = Query(None, description="Filter by phone number"),
+    from_date: Optional[str] = Query(None, description="Filter from date (ISO format)"),
+    to_date: Optional[str] = Query(None, description="Filter to date (ISO format)"),
+    current_user: User = Depends(get_current_user),
+    sms_sender = Depends(get_sms_sender),
+):
+    """
+    List messages with optional filtering.
+    
+    Returns a paginated list of messages for the current user.
+    """
+    try:
+        filters = {
+            "status": status,
+            "phone_number": phone_number,
+            "from_date": from_date,
+            "to_date": to_date,
+            "user_id": current_user.id
+        }
+        
+        # Get messages with pagination
+        messages, total = await sms_sender.list_messages(
+            filters=filters,
+            skip=pagination.skip,
+            limit=pagination.limit
+        )
+        
+        # Return paginated response
+        return paginate_response(
+            items=messages,
+            total=total,
+            pagination=pagination
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error listing messages: {str(e)}")
+
+
+@router.put("/{message_id}/status", response_model=MessageResponse)
+async def update_message_status(
+    status_update: MessageStatusUpdate,
+    message_id: str = Path(..., description="Message ID"),
+    current_user: User = Depends(get_current_user),
+    sms_sender = Depends(get_sms_sender),
+):
+    """
+    Update the status of a message.
+    
+    This is primarily for administrative purposes or handling external status updates.
+    """
+    try:
+        # Verify the user has permission to update this message
+        message = await sms_sender.get_message(message_id, user_id=current_user.id)
+        if not message:
+            raise NotFoundError(message=f"Message {message_id} not found")
+        
+        # Update the status
+        updated_message = await sms_sender.update_message_status(
+            message_id=message_id,
+            status=status_update.status,
+            reason=status_update.reason,
+            user_id=current_user.id
+        )
+        
+        return updated_message
+        
+    except NotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error updating message status: {str(e)}")
+
+
+@router.delete("/{message_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_message(
+    message_id: str = Path(..., description="Message ID"),
+    current_user: User = Depends(get_current_user),
+    sms_sender = Depends(get_sms_sender),
+):
+    """
+    Delete a message.
+    
+    This will only remove it from the database, but cannot recall messages already sent.
+    """
+    try:
+        # Verify the message exists and belongs to the user
+        message = await sms_sender.get_message(message_id, user_id=current_user.id)
+        if not message:
+            raise NotFoundError(message=f"Message {message_id} not found")
+        
+        # Delete the message
+        success = await sms_sender.delete_message(message_id, user_id=current_user.id)
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to delete message")
+        
+        return None  # No content response
+        
+    except NotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error deleting message: {str(e)}")
+
+
+@router.get("/tasks/{task_id}", response_model=dict)
+async def get_task_status(
+    task_id: str = Path(..., description="Task ID"),
+    current_user: User = Depends(get_current_user),
+    sms_sender = Depends(get_sms_sender),
+):
+    """
+    Check the status of a background task.
+    
+    Used for tracking progress of batch operations and imports.
+    """
+    try:
+        task_status = await sms_sender.get_task_status(task_id, user_id=current_user.id)
+        if not task_status:
+            raise NotFoundError(message=f"Task {task_id} not found")
+        
+        return task_status
+        
+    except NotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error retrieving task status: {str(e)}")
 </file>
 
 <file path="app/api/v1/endpoints/webhooks.py">
@@ -12180,6 +12223,577 @@ async def fetch_registered_webhooks_from_gateway() -> List[Dict[str, Any]]:
         raise
 </file>
 
+<file path="app/db/repositories/messages.py">
+"""
+Message repository for database operations related to SMS messages.
+"""
+from datetime import datetime, timezone
+from typing import List, Optional, Dict, Any, Tuple
+from uuid import uuid4
+
+from sqlalchemy import select, update, delete, and_, or_, desc, func
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.exc import IntegrityError
+
+import logging
+from app.utils.ids import generate_prefixed_id, IDPrefix
+from app.models.campaign import Campaign
+from app.db.repositories.base import BaseRepository
+from app.models.message import Message, MessageEvent, MessageBatch, MessageTemplate
+from app.schemas.message import MessageCreate, MessageStatus
+
+logger = logging.getLogger("inboxerr.db")
+
+class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
+    """Message repository for database operations."""
+    
+    def __init__(self, session: AsyncSession):
+        """Initialize with session and Message model."""
+        super().__init__(session=session, model=Message)
+
+    async def create_message(
+        self,
+        *,
+        phone_number: str,
+        message_text: str,
+        user_id: str,
+        custom_id: Optional[str] = None,
+        scheduled_at: Optional[datetime] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        batch_id: Optional[str] = None,
+        campaign_id: Optional[str] = None
+    ) -> Message:
+        """
+        Create a new message with related objects in a single transaction.
+        """
+        # Set initial status based on scheduling
+        initial_status = MessageStatus.SCHEDULED if scheduled_at else MessageStatus.PENDING
+        
+        # Calculate SMS parts
+        parts_count = (len(message_text) + 159) // 160  # 160 chars per SMS part
+        
+        # Generate IDs upfront
+        message_id = generate_prefixed_id(IDPrefix.MESSAGE)
+        event_id = generate_prefixed_id(IDPrefix.EVENT)
+        
+        # Create message instance
+        message = Message(
+            id=message_id,  # Pre-assign ID
+            custom_id=custom_id or str(uuid4()),
+            phone_number=phone_number,
+            message=message_text,
+            status=initial_status,
+            scheduled_at=scheduled_at,
+            user_id=user_id,
+            meta_data=metadata or {},
+            parts_count=parts_count,
+            batch_id=batch_id,
+            campaign_id=campaign_id
+        )
+        
+        # Create event instance with pre-assigned message_id
+        event = MessageEvent(
+            id=event_id,
+            message_id=message_id,
+            event_type="created",
+            status=initial_status,
+            data={
+                "phone_number": phone_number,
+                "scheduled_at": scheduled_at.isoformat() if scheduled_at else None,
+                "campaign_id": campaign_id
+            }
+        )
+        
+        # Begin transaction using savepoint if a transaction is already active
+        async with self.session.begin_nested():
+            # Add both objects to session
+            self.session.add(message)
+            self.session.add(event)
+            
+            # Handle campaign update if needed
+            if campaign_id:
+                try:
+                    # Execute campaign update with direct SQL for better performance in high volume
+                    await self.session.execute(
+                        update(Campaign)
+                        .where(Campaign.id == campaign_id)
+                        .values(total_messages=Campaign.total_messages + 1)
+                    )
+                except Exception as e:
+                    # Log but don't fail the message creation if campaign update fails
+                    logger.error(f"Error updating campaign {campaign_id} message count: {e}")
+        
+        # Commit the outer transaction
+        await self.session.commit()
+        
+        # Refresh message
+        await self.session.refresh(message)
+        
+        return message
+
+    async def update_message_status(
+        self,
+        *,
+        message_id: str,
+        status: str,
+        event_type: str,
+        reason: Optional[str] = None,
+        gateway_message_id: Optional[str] = None,
+        data: Optional[Dict[str, Any]] = None
+    ) -> Optional[Message]:
+        """
+        Update message status with improved concurrency handling.
+        
+        Args:
+            message_id: Message ID
+            status: New status
+            event_type: Event type triggering this update
+            reason: Optional reason for status change
+            gateway_message_id: Optional gateway message ID
+            data: Optional additional data
+            
+        Returns:
+            Message: Updated message or None
+        """
+        # Get the message first to check if it exists
+        message = await self.get_by_id(message_id)
+        if not message:
+            return None
+        
+        # Update status-specific timestamp
+        now = datetime.now(timezone.utc)
+        update_data = {
+            "status": status,
+            "updated_at": now,
+        }
+        
+        if status == MessageStatus.SENT:
+            update_data["sent_at"] = now
+        elif status == MessageStatus.DELIVERED:
+            update_data["delivered_at"] = now
+        elif status == MessageStatus.FAILED:
+            update_data["failed_at"] = now
+            update_data["reason"] = reason
+        
+        # Set gateway message ID if provided
+        if gateway_message_id:
+            update_data["gateway_message_id"] = gateway_message_id
+        
+        # Set a specific savepoint for this operation
+        async with self.session.begin_nested() as nested:
+            try:
+                # Update the message
+                await self.session.execute(
+                    update(Message)
+                    .where(Message.id == message_id)
+                    .values(**update_data)
+                )
+                
+                # Create event for status change with unique ID
+                event_id = generate_prefixed_id(IDPrefix.EVENT)  # Generate new ID for each event
+                event = MessageEvent(
+                    id=event_id,
+                    message_id=message_id,
+                    event_type=event_type,
+                    status=status,
+                    data=data or {}
+                )
+                
+                # Add event to session
+                self.session.add(event)
+                
+                # Commit the nested transaction
+                await nested.commit()
+            except Exception as e:
+                # Transaction will automatically roll back on exception
+                logger.error(f"Error updating message status: {e}")
+                return None
+        
+        # Complete the outer transaction
+        await self.session.commit()
+        
+        # Refresh the message
+        await self.session.refresh(message)
+        
+        return message
+
+    async def create_batch(
+        self,
+        *,
+        user_id: str,
+        name: str,
+        total: int
+    ) -> MessageBatch:
+        """
+        Create a new message batch.
+        
+        Args:
+            user_id: User ID
+            name: Batch name
+            total: Total number of messages
+            
+        Returns:
+            MessageBatch: Created batch
+        """
+        batch_id = generate_prefixed_id(IDPrefix.BATCH)
+        batch = MessageBatch(
+            id=batch_id,
+            name=name,
+            total=total,
+            processed=0,
+            successful=0,
+            failed=0,
+            status=MessageStatus.PENDING,
+            user_id=user_id
+        )
+        
+        async with self.session.begin():
+            self.session.add(batch)
+        
+        await self.session.refresh(batch)
+        
+        return batch
+
+    async def update_batch_progress(
+        self,
+        *,
+        batch_id: str,
+        increment_processed: int = 0,
+        increment_successful: int = 0,
+        increment_failed: int = 0,
+        status: Optional[str] = None
+    ) -> Optional[MessageBatch]:
+        """
+        Update batch progress with proper transaction handling.
+        
+        Args:
+            batch_id: Batch ID
+            increment_processed: Increment processed count
+            increment_successful: Increment successful count
+            increment_failed: Increment failed count
+            status: Optional new status
+            
+        Returns:
+            MessageBatch: Updated batch or None
+        """
+        # Use a proper transaction
+        async with self.session.begin():
+            # Get batch with FOR UPDATE to prevent race conditions
+            query = select(MessageBatch).where(MessageBatch.id == batch_id)
+            result = await self.session.execute(query.with_for_update())
+            batch = result.scalar_one_or_none()
+            
+            if not batch:
+                return None
+            
+            # Update counts
+            batch.processed += increment_processed
+            batch.successful += increment_successful
+            batch.failed += increment_failed
+            
+            # Update status if provided
+            if status:
+                batch.status = status
+                
+            # If all messages processed, update status and completion time
+            if batch.processed >= batch.total:
+                batch.status = MessageStatus.PROCESSED if batch.failed == 0 else "partial"
+                batch.completed_at = datetime.now(timezone.utc)
+            
+            # Add batch to session
+            self.session.add(batch)
+        
+        # Get updated batch
+        query = select(MessageBatch).where(MessageBatch.id == batch_id)
+        result = await self.session.execute(query)
+        updated_batch = result.scalar_one_or_none()
+        
+        return updated_batch
+
+    async def update_batch_progress_safe(
+        self,
+        *,
+        batch_id: str,
+        increment_processed: int = 0,
+        increment_successful: int = 0,
+        increment_failed: int = 0,
+        status: Optional[str] = None
+    ) -> Optional[MessageBatch]:
+        """
+        Update batch progress with proper transaction handling.
+        
+        Args:
+            batch_id: Batch ID
+            increment_processed: Increment processed count
+            increment_successful: Increment successful count
+            increment_failed: Increment failed count
+            status: Optional new status
+            
+        Returns:
+            MessageBatch: Updated batch or None
+        """
+        # Get a completely fresh session for this operation
+        from app.db.session import async_session_factory
+        
+        async with async_session_factory() as fresh_session:
+            try:
+                async with fresh_session.begin():
+                    # Get batch with SELECT FOR UPDATE to prevent race conditions
+                    query = select(MessageBatch).where(MessageBatch.id == batch_id)
+                    result = await fresh_session.execute(query.with_for_update())
+                    batch = result.scalar_one_or_none()
+                    
+                    if not batch:
+                        return None
+                    
+                    # Update counts
+                    batch.processed += increment_processed
+                    batch.successful += increment_successful
+                    batch.failed += increment_failed
+                    
+                    # Update status if provided
+                    if status:
+                        batch.status = status
+                        
+                    # If all messages processed, update status and completion time
+                    if batch.processed >= batch.total:
+                        batch.status = MessageStatus.PROCESSED if batch.failed == 0 else "partial"
+                        batch.completed_at = datetime.now(timezone.utc)
+                    
+                    # Add the updated batch to the session
+                    fresh_session.add(batch)
+                    
+                    # Get updated batch after updates are applied
+                    # This is automatically refreshed at transaction commit
+                    
+                # Now outside the transaction, we can safely refresh
+                query = select(MessageBatch).where(MessageBatch.id == batch_id)
+                result = await fresh_session.execute(query)
+                updated_batch = result.scalar_one_or_none()
+                    
+                return updated_batch
+            
+            except Exception as e:
+                logger.error(f"Error in update_batch_progress_safe: {e}")
+                return None
+            finally:
+                # Explicitly close session to prevent connection leaks
+                await fresh_session.close()
+
+    async def get_by_custom_id(self, custom_id: str) -> Optional[Message]:
+        """
+        Get message by custom ID.
+        
+        Args:
+            custom_id: Custom ID
+            
+        Returns:
+            Message: Found message or None
+        """
+        return await self.get_by_attribute("custom_id", custom_id)
+
+    async def get_by_gateway_id(self, gateway_id: str) -> Optional[Message]:
+        """
+        Get message by gateway ID.
+        
+        Args:
+            gateway_id: Gateway message ID
+            
+        Returns:
+            Message: Found message or None
+        """
+        return await self.get_by_attribute("gateway_message_id", gateway_id)
+
+    async def list_messages_for_user(
+        self,
+        *,
+        user_id: str,
+        status: Optional[str] = None,
+        phone_number: Optional[str] = None,
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+        campaign_id: Optional[str] = None,
+        skip: int = 0,
+        limit: int = 20
+    ) -> Tuple[List[Message], int]:
+        """
+        List messages for user with filtering.
+        
+        Args:
+            user_id: User ID
+            status: Optional status filter
+            phone_number: Optional phone number filter
+            from_date: Optional from date filter
+            to_date: Optional to date filter
+            campaign_id: Optional campaign ID filter
+            skip: Number of records to skip
+            limit: Maximum number of records to return
+            
+        Returns:
+            Tuple[List[Message], int]: List of messages and total count
+        """
+        # Base query
+        query = select(Message).where(Message.user_id == user_id)
+        count_query = select(func.count()).select_from(Message).where(Message.user_id == user_id)
+        
+        # Apply filters
+        if status:
+            query = query.where(Message.status == status)
+            count_query = count_query.where(Message.status == status)
+        
+        if phone_number:
+            query = query.where(Message.phone_number == phone_number)
+            count_query = count_query.where(Message.phone_number == phone_number)
+
+        if campaign_id:
+            query = query.where(Message.campaign_id == campaign_id)
+            count_query = count_query.where(Message.campaign_id == campaign_id)
+        
+        if from_date:
+            try:
+                from_date_obj = datetime.fromisoformat(from_date.replace('Z', '+00:00'))
+                query = query.where(Message.created_at >= from_date_obj)
+                count_query = count_query.where(Message.created_at >= from_date_obj)
+            except ValueError:
+                pass
+        
+        if to_date:
+            try:
+                to_date_obj = datetime.fromisoformat(to_date.replace('Z', '+00:00'))
+                query = query.where(Message.created_at <= to_date_obj)
+                count_query = count_query.where(Message.created_at <= to_date_obj)
+            except ValueError:
+                pass
+        
+        # Order by created_at desc
+        query = query.order_by(desc(Message.created_at))
+        
+        # Pagination
+        query = query.offset(skip).limit(limit)
+        
+        # Execute queries
+        result = await self.session.execute(query)
+        count_result = await self.session.execute(count_query)
+        
+        messages = result.scalars().all()
+        total = count_result.scalar_one()
+        
+        return messages, total
+
+    async def get_messages_for_batch(
+        self,
+        *,
+        batch_id: str,
+        skip: int = 0,
+        limit: int = 20
+    ) -> Tuple[List[Message], int]:
+        """
+        Get messages for a batch.
+        
+        Args:
+            batch_id: Batch ID
+            skip: Number of records to skip
+            limit: Maximum number of records to return
+            
+        Returns:
+            Tuple[List[Message], int]: List of messages and total count
+        """
+        # Base query
+        query = select(Message).where(Message.batch_id == batch_id)
+        count_query = select(func.count()).select_from(Message).where(Message.batch_id == batch_id)
+        
+        # Order by created_at desc
+        query = query.order_by(desc(Message.created_at))
+        
+        # Pagination
+        query = query.offset(skip).limit(limit)
+        
+        # Execute queries
+        result = await self.session.execute(query)
+        count_result = await self.session.execute(count_query)
+        
+        messages = result.scalars().all()
+        total = count_result.scalar_one()
+        
+        return messages, total
+    
+    async def get_messages_for_campaign(
+        self,
+        *,
+        campaign_id: str,
+        status: Optional[str] = None,
+        skip: int = 0,
+        limit: int = 20
+    ) -> Tuple[List[Message], int]:
+        """
+        Get messages for a campaign.
+        
+        Args:
+            campaign_id: Campaign ID
+            status: Optional status filter
+            skip: Number of records to skip
+            limit: Maximum number of records to return
+            
+        Returns:
+            Tuple[List[Message], int]: List of messages and total count
+        """
+        # Base query
+        query = select(Message).where(Message.campaign_id == campaign_id)
+        count_query = select(func.count()).select_from(Message).where(Message.campaign_id == campaign_id)
+        
+        # Apply status filter
+        if status:
+            query = query.where(Message.status == status)
+            count_query = count_query.where(Message.status == status)
+        
+        # Order by created_at desc
+        query = query.order_by(desc(Message.created_at))
+        
+        # Apply pagination
+        query = query.offset(skip).limit(limit)
+        
+        # Execute queries
+        result = await self.session.execute(query)
+        count_result = await self.session.execute(count_query)
+        
+        messages = result.scalars().all()
+        total = count_result.scalar_one()
+        
+        return messages, total
+
+    async def get_retryable_messages(
+        self,
+        *,
+        max_retries: int = 3,
+        limit: int = 50
+    ) -> List[Message]:
+        """
+        Get messages that can be retried.
+        
+        Args:
+            max_retries: Maximum number of retry attempts
+            limit: Maximum number of messages to return
+            
+        Returns:
+            List[Message]: List of retryable messages
+        """
+        # Query for failed messages that can be retried
+        query = select(Message).where(
+            and_(
+                Message.status == MessageStatus.FAILED,
+                or_(
+                    Message.meta_data.is_(None),  # No metadata at all
+                    ~Message.meta_data.contains({"retry_count": max_retries})  # retry_count less than max
+                )
+            )
+        ).order_by(Message.failed_at).limit(limit)
+        
+        result = await self.session.execute(query)
+        return result.scalars().all()
+</file>
+
 <file path="app/services/sms/sender.py">
 """
 SMS sender service for interacting with the Android SMS Gateway.
@@ -13435,577 +14049,6 @@ async def get_sms_sender() -> SMSSender:
     from app.services.event_bus.bus import get_event_bus
     event_bus = get_event_bus()    
     return SMSSender(event_bus)
-</file>
-
-<file path="app/db/repositories/messages.py">
-"""
-Message repository for database operations related to SMS messages.
-"""
-from datetime import datetime, timezone
-from typing import List, Optional, Dict, Any, Tuple
-from uuid import uuid4
-
-from sqlalchemy import select, update, delete, and_, or_, desc, func
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import Session
-from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.exc import IntegrityError
-
-import logging
-from app.utils.ids import generate_prefixed_id, IDPrefix
-from app.models.campaign import Campaign
-from app.db.repositories.base import BaseRepository
-from app.models.message import Message, MessageEvent, MessageBatch, MessageTemplate
-from app.schemas.message import MessageCreate, MessageStatus
-
-logger = logging.getLogger("inboxerr.db")
-
-class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
-    """Message repository for database operations."""
-    
-    def __init__(self, session: AsyncSession):
-        """Initialize with session and Message model."""
-        super().__init__(session=session, model=Message)
-
-    async def create_message(
-        self,
-        *,
-        phone_number: str,
-        message_text: str,
-        user_id: str,
-        custom_id: Optional[str] = None,
-        scheduled_at: Optional[datetime] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        batch_id: Optional[str] = None,
-        campaign_id: Optional[str] = None
-    ) -> Message:
-        """
-        Create a new message with related objects in a single transaction.
-        """
-        # Set initial status based on scheduling
-        initial_status = MessageStatus.SCHEDULED if scheduled_at else MessageStatus.PENDING
-        
-        # Calculate SMS parts
-        parts_count = (len(message_text) + 159) // 160  # 160 chars per SMS part
-        
-        # Generate IDs upfront
-        message_id = generate_prefixed_id(IDPrefix.MESSAGE)
-        event_id = generate_prefixed_id(IDPrefix.EVENT)
-        
-        # Create message instance
-        message = Message(
-            id=message_id,  # Pre-assign ID
-            custom_id=custom_id or str(uuid4()),
-            phone_number=phone_number,
-            message=message_text,
-            status=initial_status,
-            scheduled_at=scheduled_at,
-            user_id=user_id,
-            meta_data=metadata or {},
-            parts_count=parts_count,
-            batch_id=batch_id,
-            campaign_id=campaign_id
-        )
-        
-        # Create event instance with pre-assigned message_id
-        event = MessageEvent(
-            id=event_id,
-            message_id=message_id,
-            event_type="created",
-            status=initial_status,
-            data={
-                "phone_number": phone_number,
-                "scheduled_at": scheduled_at.isoformat() if scheduled_at else None,
-                "campaign_id": campaign_id
-            }
-        )
-        
-        # Begin transaction using savepoint if a transaction is already active
-        async with self.session.begin_nested():
-            # Add both objects to session
-            self.session.add(message)
-            self.session.add(event)
-            
-            # Handle campaign update if needed
-            if campaign_id:
-                try:
-                    # Execute campaign update with direct SQL for better performance in high volume
-                    await self.session.execute(
-                        update(Campaign)
-                        .where(Campaign.id == campaign_id)
-                        .values(total_messages=Campaign.total_messages + 1)
-                    )
-                except Exception as e:
-                    # Log but don't fail the message creation if campaign update fails
-                    logger.error(f"Error updating campaign {campaign_id} message count: {e}")
-        
-        # Commit the outer transaction
-        await self.session.commit()
-        
-        # Refresh message
-        await self.session.refresh(message)
-        
-        return message
-
-    async def update_message_status(
-        self,
-        *,
-        message_id: str,
-        status: str,
-        event_type: str,
-        reason: Optional[str] = None,
-        gateway_message_id: Optional[str] = None,
-        data: Optional[Dict[str, Any]] = None
-    ) -> Optional[Message]:
-        """
-        Update message status with improved concurrency handling.
-        
-        Args:
-            message_id: Message ID
-            status: New status
-            event_type: Event type triggering this update
-            reason: Optional reason for status change
-            gateway_message_id: Optional gateway message ID
-            data: Optional additional data
-            
-        Returns:
-            Message: Updated message or None
-        """
-        # Get the message first to check if it exists
-        message = await self.get_by_id(message_id)
-        if not message:
-            return None
-        
-        # Update status-specific timestamp
-        now = datetime.now(timezone.utc)
-        update_data = {
-            "status": status,
-            "updated_at": now,
-        }
-        
-        if status == MessageStatus.SENT:
-            update_data["sent_at"] = now
-        elif status == MessageStatus.DELIVERED:
-            update_data["delivered_at"] = now
-        elif status == MessageStatus.FAILED:
-            update_data["failed_at"] = now
-            update_data["reason"] = reason
-        
-        # Set gateway message ID if provided
-        if gateway_message_id:
-            update_data["gateway_message_id"] = gateway_message_id
-        
-        # Set a specific savepoint for this operation
-        async with self.session.begin_nested() as nested:
-            try:
-                # Update the message
-                await self.session.execute(
-                    update(Message)
-                    .where(Message.id == message_id)
-                    .values(**update_data)
-                )
-                
-                # Create event for status change with unique ID
-                event_id = generate_prefixed_id(IDPrefix.EVENT)  # Generate new ID for each event
-                event = MessageEvent(
-                    id=event_id,
-                    message_id=message_id,
-                    event_type=event_type,
-                    status=status,
-                    data=data or {}
-                )
-                
-                # Add event to session
-                self.session.add(event)
-                
-                # Commit the nested transaction
-                await nested.commit()
-            except Exception as e:
-                # Transaction will automatically roll back on exception
-                logger.error(f"Error updating message status: {e}")
-                return None
-        
-        # Complete the outer transaction
-        await self.session.commit()
-        
-        # Refresh the message
-        await self.session.refresh(message)
-        
-        return message
-
-    async def create_batch(
-        self,
-        *,
-        user_id: str,
-        name: str,
-        total: int
-    ) -> MessageBatch:
-        """
-        Create a new message batch.
-        
-        Args:
-            user_id: User ID
-            name: Batch name
-            total: Total number of messages
-            
-        Returns:
-            MessageBatch: Created batch
-        """
-        batch_id = generate_prefixed_id(IDPrefix.BATCH)
-        batch = MessageBatch(
-            id=batch_id,
-            name=name,
-            total=total,
-            processed=0,
-            successful=0,
-            failed=0,
-            status=MessageStatus.PENDING,
-            user_id=user_id
-        )
-        
-        async with self.session.begin():
-            self.session.add(batch)
-        
-        await self.session.refresh(batch)
-        
-        return batch
-
-    async def update_batch_progress(
-        self,
-        *,
-        batch_id: str,
-        increment_processed: int = 0,
-        increment_successful: int = 0,
-        increment_failed: int = 0,
-        status: Optional[str] = None
-    ) -> Optional[MessageBatch]:
-        """
-        Update batch progress with proper transaction handling.
-        
-        Args:
-            batch_id: Batch ID
-            increment_processed: Increment processed count
-            increment_successful: Increment successful count
-            increment_failed: Increment failed count
-            status: Optional new status
-            
-        Returns:
-            MessageBatch: Updated batch or None
-        """
-        # Use a proper transaction
-        async with self.session.begin():
-            # Get batch with FOR UPDATE to prevent race conditions
-            query = select(MessageBatch).where(MessageBatch.id == batch_id)
-            result = await self.session.execute(query.with_for_update())
-            batch = result.scalar_one_or_none()
-            
-            if not batch:
-                return None
-            
-            # Update counts
-            batch.processed += increment_processed
-            batch.successful += increment_successful
-            batch.failed += increment_failed
-            
-            # Update status if provided
-            if status:
-                batch.status = status
-                
-            # If all messages processed, update status and completion time
-            if batch.processed >= batch.total:
-                batch.status = MessageStatus.PROCESSED if batch.failed == 0 else "partial"
-                batch.completed_at = datetime.now(timezone.utc)
-            
-            # Add batch to session
-            self.session.add(batch)
-        
-        # Get updated batch
-        query = select(MessageBatch).where(MessageBatch.id == batch_id)
-        result = await self.session.execute(query)
-        updated_batch = result.scalar_one_or_none()
-        
-        return updated_batch
-
-    async def update_batch_progress_safe(
-        self,
-        *,
-        batch_id: str,
-        increment_processed: int = 0,
-        increment_successful: int = 0,
-        increment_failed: int = 0,
-        status: Optional[str] = None
-    ) -> Optional[MessageBatch]:
-        """
-        Update batch progress with proper transaction handling.
-        
-        Args:
-            batch_id: Batch ID
-            increment_processed: Increment processed count
-            increment_successful: Increment successful count
-            increment_failed: Increment failed count
-            status: Optional new status
-            
-        Returns:
-            MessageBatch: Updated batch or None
-        """
-        # Get a completely fresh session for this operation
-        from app.db.session import async_session_factory
-        
-        async with async_session_factory() as fresh_session:
-            try:
-                async with fresh_session.begin():
-                    # Get batch with SELECT FOR UPDATE to prevent race conditions
-                    query = select(MessageBatch).where(MessageBatch.id == batch_id)
-                    result = await fresh_session.execute(query.with_for_update())
-                    batch = result.scalar_one_or_none()
-                    
-                    if not batch:
-                        return None
-                    
-                    # Update counts
-                    batch.processed += increment_processed
-                    batch.successful += increment_successful
-                    batch.failed += increment_failed
-                    
-                    # Update status if provided
-                    if status:
-                        batch.status = status
-                        
-                    # If all messages processed, update status and completion time
-                    if batch.processed >= batch.total:
-                        batch.status = MessageStatus.PROCESSED if batch.failed == 0 else "partial"
-                        batch.completed_at = datetime.now(timezone.utc)
-                    
-                    # Add the updated batch to the session
-                    fresh_session.add(batch)
-                    
-                    # Get updated batch after updates are applied
-                    # This is automatically refreshed at transaction commit
-                    
-                # Now outside the transaction, we can safely refresh
-                query = select(MessageBatch).where(MessageBatch.id == batch_id)
-                result = await fresh_session.execute(query)
-                updated_batch = result.scalar_one_or_none()
-                    
-                return updated_batch
-            
-            except Exception as e:
-                logger.error(f"Error in update_batch_progress_safe: {e}")
-                return None
-            finally:
-                # Explicitly close session to prevent connection leaks
-                await fresh_session.close()
-
-    async def get_by_custom_id(self, custom_id: str) -> Optional[Message]:
-        """
-        Get message by custom ID.
-        
-        Args:
-            custom_id: Custom ID
-            
-        Returns:
-            Message: Found message or None
-        """
-        return await self.get_by_attribute("custom_id", custom_id)
-
-    async def get_by_gateway_id(self, gateway_id: str) -> Optional[Message]:
-        """
-        Get message by gateway ID.
-        
-        Args:
-            gateway_id: Gateway message ID
-            
-        Returns:
-            Message: Found message or None
-        """
-        return await self.get_by_attribute("gateway_message_id", gateway_id)
-
-    async def list_messages_for_user(
-        self,
-        *,
-        user_id: str,
-        status: Optional[str] = None,
-        phone_number: Optional[str] = None,
-        from_date: Optional[str] = None,
-        to_date: Optional[str] = None,
-        campaign_id: Optional[str] = None,
-        skip: int = 0,
-        limit: int = 20
-    ) -> Tuple[List[Message], int]:
-        """
-        List messages for user with filtering.
-        
-        Args:
-            user_id: User ID
-            status: Optional status filter
-            phone_number: Optional phone number filter
-            from_date: Optional from date filter
-            to_date: Optional to date filter
-            campaign_id: Optional campaign ID filter
-            skip: Number of records to skip
-            limit: Maximum number of records to return
-            
-        Returns:
-            Tuple[List[Message], int]: List of messages and total count
-        """
-        # Base query
-        query = select(Message).where(Message.user_id == user_id)
-        count_query = select(func.count()).select_from(Message).where(Message.user_id == user_id)
-        
-        # Apply filters
-        if status:
-            query = query.where(Message.status == status)
-            count_query = count_query.where(Message.status == status)
-        
-        if phone_number:
-            query = query.where(Message.phone_number == phone_number)
-            count_query = count_query.where(Message.phone_number == phone_number)
-
-        if campaign_id:
-            query = query.where(Message.campaign_id == campaign_id)
-            count_query = count_query.where(Message.campaign_id == campaign_id)
-        
-        if from_date:
-            try:
-                from_date_obj = datetime.fromisoformat(from_date.replace('Z', '+00:00'))
-                query = query.where(Message.created_at >= from_date_obj)
-                count_query = count_query.where(Message.created_at >= from_date_obj)
-            except ValueError:
-                pass
-        
-        if to_date:
-            try:
-                to_date_obj = datetime.fromisoformat(to_date.replace('Z', '+00:00'))
-                query = query.where(Message.created_at <= to_date_obj)
-                count_query = count_query.where(Message.created_at <= to_date_obj)
-            except ValueError:
-                pass
-        
-        # Order by created_at desc
-        query = query.order_by(desc(Message.created_at))
-        
-        # Pagination
-        query = query.offset(skip).limit(limit)
-        
-        # Execute queries
-        result = await self.session.execute(query)
-        count_result = await self.session.execute(count_query)
-        
-        messages = result.scalars().all()
-        total = count_result.scalar_one()
-        
-        return messages, total
-
-    async def get_messages_for_batch(
-        self,
-        *,
-        batch_id: str,
-        skip: int = 0,
-        limit: int = 20
-    ) -> Tuple[List[Message], int]:
-        """
-        Get messages for a batch.
-        
-        Args:
-            batch_id: Batch ID
-            skip: Number of records to skip
-            limit: Maximum number of records to return
-            
-        Returns:
-            Tuple[List[Message], int]: List of messages and total count
-        """
-        # Base query
-        query = select(Message).where(Message.batch_id == batch_id)
-        count_query = select(func.count()).select_from(Message).where(Message.batch_id == batch_id)
-        
-        # Order by created_at desc
-        query = query.order_by(desc(Message.created_at))
-        
-        # Pagination
-        query = query.offset(skip).limit(limit)
-        
-        # Execute queries
-        result = await self.session.execute(query)
-        count_result = await self.session.execute(count_query)
-        
-        messages = result.scalars().all()
-        total = count_result.scalar_one()
-        
-        return messages, total
-    
-    async def get_messages_for_campaign(
-        self,
-        *,
-        campaign_id: str,
-        status: Optional[str] = None,
-        skip: int = 0,
-        limit: int = 20
-    ) -> Tuple[List[Message], int]:
-        """
-        Get messages for a campaign.
-        
-        Args:
-            campaign_id: Campaign ID
-            status: Optional status filter
-            skip: Number of records to skip
-            limit: Maximum number of records to return
-            
-        Returns:
-            Tuple[List[Message], int]: List of messages and total count
-        """
-        # Base query
-        query = select(Message).where(Message.campaign_id == campaign_id)
-        count_query = select(func.count()).select_from(Message).where(Message.campaign_id == campaign_id)
-        
-        # Apply status filter
-        if status:
-            query = query.where(Message.status == status)
-            count_query = count_query.where(Message.status == status)
-        
-        # Order by created_at desc
-        query = query.order_by(desc(Message.created_at))
-        
-        # Apply pagination
-        query = query.offset(skip).limit(limit)
-        
-        # Execute queries
-        result = await self.session.execute(query)
-        count_result = await self.session.execute(count_query)
-        
-        messages = result.scalars().all()
-        total = count_result.scalar_one()
-        
-        return messages, total
-
-    async def get_retryable_messages(
-        self,
-        *,
-        max_retries: int = 3,
-        limit: int = 50
-    ) -> List[Message]:
-        """
-        Get messages that can be retried.
-        
-        Args:
-            max_retries: Maximum number of retry attempts
-            limit: Maximum number of messages to return
-            
-        Returns:
-            List[Message]: List of retryable messages
-        """
-        # Query for failed messages that can be retried
-        query = select(Message).where(
-            and_(
-                Message.status == MessageStatus.FAILED,
-                or_(
-                    Message.meta_data.is_(None),  # No metadata at all
-                    ~Message.meta_data.contains({"retry_count": max_retries})  # retry_count less than max
-                )
-            )
-        ).order_by(Message.failed_at).limit(limit)
-        
-        result = await self.session.execute(query)
-        return result.scalars().all()
 </file>
 
 </files>
