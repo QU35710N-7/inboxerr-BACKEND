@@ -59,7 +59,7 @@ class MessageResponse(BaseModel):
     reason: Optional[str] = Field(None, description="Failure reason if applicable")
     gateway_message_id: Optional[str] = Field(None, description="ID from SMS gateway")
     user_id: str = Field(..., description="User who sent the message")
-    metadata: Optional[Dict[str, Any]] = Field(default={}, description="Additional metadata")
+    meta_data: Optional[Dict[str, Any]] = Field(default={}, description="Additional metadata")
     
     class Config:
         """Pydantic config."""
