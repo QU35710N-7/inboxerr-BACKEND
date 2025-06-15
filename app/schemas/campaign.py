@@ -2,8 +2,25 @@
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone
 from uuid import UUID
+from enum import Enum
 
 from pydantic import BaseModel, Field, validator
+
+
+
+class CampaignStatus(str, Enum):
+    """
+    Campaign status enum.
+    
+    Defines all possible states a campaign can be in during its lifecycle.
+    Uses string enum to ensure JSON serialization compatibility and type safety.
+    """
+    DRAFT = "draft"
+    ACTIVE = "active"
+    PAUSED = "paused"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
 
 
 class CampaignBase(BaseModel):
@@ -39,23 +56,10 @@ class CampaignUpdate(BaseModel):
     settings: Optional[Dict[str, Any]] = Field(None, description="Campaign settings")
 
 
-class CampaignStatus(BaseModel):
-    """Schema for campaign status update."""
-    status: str = Field(..., description="Campaign status")
-    
-    @validator("status")
-    def validate_status(cls, v):
-        """Validate status value."""
-        valid_statuses = ["draft", "active", "paused", "completed", "cancelled", "failed"]
-        if v not in valid_statuses:
-            raise ValueError(f"Status must be one of: {', '.join(valid_statuses)}")
-        return v
-
-
 class CampaignResponse(CampaignBase):
     """Schema for campaign response."""
     id: str = Field(..., description="Campaign ID")
-    status: str = Field(..., description="Campaign status")
+    status: CampaignStatus = Field(..., description="Campaign status")
     total_messages: int = Field(..., description="Total number of messages")
     sent_count: int = Field(..., description="Number of sent messages")
     delivered_count: int = Field(..., description="Number of delivered messages")
@@ -75,10 +79,3 @@ class CampaignResponse(CampaignBase):
         from_attributes = True
 
 
-class CampaignListResponse(BaseModel):
-    """Schema for campaign list response with pagination."""
-    items: List[CampaignResponse]
-    total: int
-    page: int
-    size: int
-    pages: int

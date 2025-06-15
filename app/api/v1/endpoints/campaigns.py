@@ -13,7 +13,6 @@ from app.schemas.campaign import (
     CampaignUpdate,
     CampaignResponse,
     CampaignStatus,
-    CampaignListResponse
 )
 from app.schemas.user import User
 from app.schemas.message import MessageResponse
@@ -151,7 +150,7 @@ async def create_campaign_from_csv(
         raise HTTPException(status_code=500, detail=f"Error creating campaign: {str(e)}")
 
 
-@router.get("/", response_model=CampaignListResponse)
+@router.get("/", response_model=PaginatedResponse[CampaignResponse])
 async def list_campaigns(
     pagination: PaginationParams = Depends(),
     status: Optional[str] = Query(None, description="Filter by campaign status"),
@@ -179,14 +178,8 @@ async def list_campaigns(
             total_pages = (total + pagination.limit - 1) // pagination.limit
             
             # Return paginated response
-            return {
-                "items": campaigns,
-                "total": total,
-                "page": pagination.page,
-                "size": pagination.limit,
-                "pages": total_pages
-            }
-        
+            return paginate_response(campaigns, total, pagination)
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error listing campaigns: {str(e)}")
 
