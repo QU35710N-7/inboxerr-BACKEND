@@ -38,7 +38,8 @@ class Campaign(Base):
     
     # Relationships
     user = relationship("User")
-    messages = relationship("Message", back_populates="campaign")
+    # In Campaign model:
+    messages = relationship("Message", back_populates="campaign", cascade="all, delete-orphan")
     
     # Helper properties
     @property
