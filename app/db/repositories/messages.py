@@ -7,7 +7,7 @@ from uuid import uuid4
 
 from sqlalchemy import select, update, delete, and_, or_, desc, func
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload, selectinload
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import IntegrityError
 
@@ -409,7 +409,14 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
             Tuple[List[Message], int]: List of messages and total count
         """
         # Base query
-        query = select(Message).where(Message.user_id == user_id)
+        query = (
+            select(Message)
+            .options(
+                joinedload(Message.campaign),       # Eager load campaign
+                selectinload(Message.events)        # Eager load events if needed
+            )
+            .where(Message.user_id == user_id)
+        )
         count_query = select(func.count()).select_from(Message).where(Message.user_id == user_id)
         
         # Apply filters
@@ -475,7 +482,11 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
             Tuple[List[Message], int]: List of messages and total count
         """
         # Base query
-        query = select(Message).where(Message.batch_id == batch_id)
+        query = (
+            select(Message)
+            .options(joinedload(Message.campaign))
+            .where(Message.batch_id == batch_id)
+        )
         count_query = select(func.count()).select_from(Message).where(Message.batch_id == batch_id)
         
         # Order by created_at desc
@@ -514,7 +525,11 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
             Tuple[List[Message], int]: List of messages and total count
         """
         # Base query
-        query = select(Message).where(Message.campaign_id == campaign_id)
+        query = (
+            select(Message)
+            .options(joinedload(Message.campaign))  # This fixes the DetachedInstanceError
+            .where(Message.campaign_id == campaign_id)
+        )
         count_query = select(func.count()).select_from(Message).where(Message.campaign_id == campaign_id)
         
         # Apply status filter
@@ -536,6 +551,31 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
         total = count_result.scalar_one()
         
         return messages, total
+    
+    async def get_by_id(self, id: str) -> Optional[Message]:
+        """
+        Get a message by ID with eager loading of relationships.
+        
+        This overrides the BaseRepository method to add eager loading
+        for campaign and events relationships.
+        
+        Args:
+            id: Message ID
+            
+        Returns:
+            Message: Found message with relationships loaded, or None
+        """
+        query = (
+            select(Message)
+            .options(
+                joinedload(Message.campaign),    # Eager load campaign
+                selectinload(Message.events)     # Eager load events collection
+            )
+            .where(Message.id == id)
+        )
+        
+        result = await self.session.execute(query)
+        return result.scalars().first()
 
     async def get_retryable_messages(
         self,

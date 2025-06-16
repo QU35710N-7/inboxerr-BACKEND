@@ -6972,482 +6972,6 @@ async def validate_permissions(
         raise AuthorizationError("Insufficient permissions")
 </file>
 
-<file path="app/api/v1/endpoints/campaigns.py">
-# app/api/v1/endpoints/campaigns.py
-import csv
-import io
-from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, UploadFile, File, Query, Path, status
-from fastapi.responses import JSONResponse
-
-from app.api.v1.dependencies import get_current_user, get_rate_limiter
-from app.core.exceptions import ValidationError, NotFoundError
-from app.schemas.campaign import (
-    CampaignCreate,
-    CampaignCreateFromCSV,
-    CampaignUpdate,
-    CampaignResponse,
-    CampaignStatus,
-    CampaignListResponse
-)
-from app.schemas.user import User
-from app.schemas.message import MessageResponse
-from app.utils.pagination import PaginationParams, paginate_response, PaginatedResponse, PageInfo
-from app.services.campaigns.processor import get_campaign_processor
-from app.db.session import get_repository_context
-
-router = APIRouter()
-
-
-@router.post("/", response_model=CampaignResponse, status_code=status.HTTP_201_CREATED)
-async def create_campaign(
-    campaign: CampaignCreate,
-    current_user: User = Depends(get_current_user),
-    rate_limiter = Depends(get_rate_limiter),
-):
-    """
-    Create a new campaign.
-    
-    This creates a campaign in draft status. Messages can be added later.
-    """
-    # Check rate limits
-    await rate_limiter.check_rate_limit(current_user.id, "create_campaign")
-    
-    try:
-        # Use repository context for proper connection management
-        from app.db.repositories.campaigns import CampaignRepository
-        
-        async with get_repository_context(CampaignRepository) as campaign_repo:
-            # Create campaign
-            result = await campaign_repo.create_campaign(
-                name=campaign.name,
-                description=campaign.description,
-                user_id=current_user.id,
-                scheduled_start_at=campaign.scheduled_start_at,
-                scheduled_end_at=campaign.scheduled_end_at,
-                settings=campaign.settings
-            )
-            
-            return result
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error creating campaign: {str(e)}")
-
-
-@router.post("/from-csv", response_model=CampaignResponse, status_code=status.HTTP_201_CREATED)
-async def create_campaign_from_csv(
-    file: UploadFile = File(...),
-    campaign_data: str = Query(..., description="Campaign data as JSON string"),
-    delimiter: str = Query(",", description="CSV delimiter"),
-    has_header: bool = Query(True, description="Whether CSV has a header row"),
-    phone_column: str = Query("phone", description="Column name containing phone numbers"),
-    current_user: User = Depends(get_current_user),
-    rate_limiter = Depends(get_rate_limiter),
-):
-    """
-    Create a campaign and add phone numbers from CSV.
-    
-    This creates a campaign and immediately adds all phone numbers from the CSV.
-    The campaign will remain in draft status until explicitly started.
-    """
-    import json
-    
-    # Check rate limits
-    await rate_limiter.check_rate_limit(current_user.id, "create_campaign")
-    
-    try:
-        # Parse campaign data
-        campaign_dict = json.loads(campaign_data)
-        campaign_data = CampaignCreateFromCSV(**campaign_dict)
-        
-        # Use repository context for proper connection management
-        from app.db.repositories.campaigns import CampaignRepository
-        
-        async with get_repository_context(CampaignRepository) as campaign_repo:
-            # Create campaign
-            campaign = await campaign_repo.create_campaign(
-                name=campaign_data.name,
-                description=campaign_data.description,
-                user_id=current_user.id,
-                scheduled_start_at=campaign_data.scheduled_start_at,
-                scheduled_end_at=campaign_data.scheduled_end_at,
-                settings=campaign_data.settings
-            )
-            
-            # Read CSV file
-            contents = await file.read()
-            csv_file = io.StringIO(contents.decode('utf-8'))
-            
-            # Parse CSV
-            csv_reader = csv.reader(csv_file, delimiter=delimiter)
-            
-            # Skip header if present
-            if has_header:
-                header = next(csv_reader)
-                try:
-                    phone_index = header.index(phone_column)
-                except ValueError:
-                    raise ValidationError(
-                        message=f"Column '{phone_column}' not found in CSV header",
-                        details={"available_columns": header}
-                    )
-            else:
-                phone_index = 0  # Assume first column has phone numbers
-            
-            # Extract phone numbers
-            phone_numbers = []
-            for row in csv_reader:
-                if row and len(row) > phone_index:
-                    phone = row[phone_index].strip()
-                    if phone:
-                        phone_numbers.append(phone)
-            
-            if not phone_numbers:
-                raise ValidationError(message="No valid phone numbers found in CSV")
-            
-            # Add phone numbers to campaign
-            added_count = await campaign_repo.add_messages_to_campaign(
-                campaign_id=campaign.id,
-                phone_numbers=phone_numbers,
-                message_text=campaign_data.message_template,
-                user_id=current_user.id
-            )
-            
-            # Refresh campaign
-            campaign = await campaign_repo.get_by_id(campaign.id)
-            
-            return campaign
-        
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Invalid campaign data JSON")
-    except ValidationError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error creating campaign: {str(e)}")
-
-
-@router.get("/", response_model=CampaignListResponse)
-async def list_campaigns(
-    pagination: PaginationParams = Depends(),
-    status: Optional[str] = Query(None, description="Filter by campaign status"),
-    current_user: User = Depends(get_current_user),
-):
-    """
-    List campaigns for the current user.
-    
-    Returns a paginated list of campaigns.
-    """
-    try:
-        # Use repository context for proper connection management
-        from app.db.repositories.campaigns import CampaignRepository
-        
-        async with get_repository_context(CampaignRepository) as campaign_repo:
-            # Get campaigns with pagination
-            campaigns, total = await campaign_repo.get_campaigns_for_user(
-                user_id=current_user.id,
-                status=status,
-                skip=pagination.skip,
-                limit=pagination.limit
-            )
-            
-            # Calculate pagination info
-            total_pages = (total + pagination.limit - 1) // pagination.limit
-            
-            # Return paginated response
-            return {
-                "items": campaigns,
-                "total": total,
-                "page": pagination.page,
-                "size": pagination.limit,
-                "pages": total_pages
-            }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error listing campaigns: {str(e)}")
-
-
-@router.get("/{campaign_id}", response_model=CampaignResponse)
-async def get_campaign(
-   campaign_id: str = Path(..., description="Campaign ID"),
-   current_user: User = Depends(get_current_user),
-):
-   """
-   Get details of a specific campaign.
-   """
-   try:
-       from app.db.repositories.campaigns import CampaignRepository
-       
-       async with get_repository_context(CampaignRepository) as campaign_repo:
-           # Get campaign
-           campaign = await campaign_repo.get_by_id(campaign_id)
-           if not campaign:
-               raise NotFoundError(message=f"Campaign {campaign_id} not found")
-           
-           # Check authorization
-           if campaign.user_id != current_user.id:
-               raise HTTPException(status_code=403, detail="Not authorized to access this campaign")
-           
-           return campaign
-       
-   except NotFoundError as e:
-       raise HTTPException(status_code=404, detail=str(e))
-   except Exception as e:
-       raise HTTPException(status_code=500, detail=f"Error retrieving campaign: {str(e)}")
-
-
-@router.put("/{campaign_id}", response_model=CampaignResponse)
-async def update_campaign(
-   campaign_update: CampaignUpdate,
-   campaign_id: str = Path(..., description="Campaign ID"),
-   current_user: User = Depends(get_current_user),
-):
-   """
-   Update campaign details.
-   
-   Only draft campaigns can be fully updated. Active campaigns can only have their description updated.
-   """
-   try:
-       from app.db.repositories.campaigns import CampaignRepository
-       
-       async with get_repository_context(CampaignRepository) as campaign_repo:
-           # Get campaign
-           campaign = await campaign_repo.get_by_id(campaign_id)
-           if not campaign:
-               raise NotFoundError(message=f"Campaign {campaign_id} not found")
-           
-           # Check authorization
-           if campaign.user_id != current_user.id:
-               raise HTTPException(status_code=403, detail="Not authorized to update this campaign")
-           
-           # Check if campaign can be updated
-           if campaign.status != "draft" and any([
-               campaign_update.scheduled_start_at is not None,
-               campaign_update.scheduled_end_at is not None,
-               campaign_update.name is not None
-           ]):
-               raise HTTPException(
-                   status_code=400, 
-                   detail="Only draft campaigns can have name or schedule updated"
-               )
-           
-           # Convert to dict and remove None values
-           update_data = {k: v for k, v in campaign_update.dict().items() if v is not None}
-           
-           # Update campaign
-           updated = await campaign_repo.update(id=campaign_id, obj_in=update_data)
-           if not updated:
-               raise HTTPException(status_code=500, detail="Failed to update campaign")
-           
-           return updated
-       
-   except NotFoundError as e:
-       raise HTTPException(status_code=404, detail=str(e))
-   except Exception as e:
-       raise HTTPException(status_code=500, detail=f"Error updating campaign: {str(e)}")
-
-
-@router.post("/{campaign_id}/start", response_model=CampaignResponse)
-async def start_campaign(
-   campaign_id: str = Path(..., description="Campaign ID"),
-   current_user: User = Depends(get_current_user),
-   campaign_processor = Depends(get_campaign_processor),
-):
-   """
-   Start a campaign.
-   
-   This will change the campaign status to active and begin sending messages.
-   """
-   try:
-       # Start campaign - campaign_processor already uses context managers internally
-       success = await campaign_processor.start_campaign(
-           campaign_id=campaign_id,
-           user_id=current_user.id
-       )
-       
-       if not success:
-           raise HTTPException(status_code=400, detail="Failed to start campaign")
-       
-       # Get updated campaign - use context manager for this separate operation
-       from app.db.repositories.campaigns import CampaignRepository
-       
-       async with get_repository_context(CampaignRepository) as campaign_repo:
-           campaign = await campaign_repo.get_by_id(campaign_id)
-           return campaign
-       
-   except Exception as e:
-       raise HTTPException(status_code=500, detail=f"Error starting campaign: {str(e)}")
-
-
-@router.post("/{campaign_id}/pause", response_model=CampaignResponse)
-async def pause_campaign(
-   campaign_id: str = Path(..., description="Campaign ID"),
-   current_user: User = Depends(get_current_user),
-   campaign_processor = Depends(get_campaign_processor),
-):
-   """
-   Pause a campaign.
-   
-   This will change the campaign status to paused and stop sending messages.
-   The campaign can be resumed later.
-   """
-   try:
-       # Pause campaign - campaign_processor already uses context managers internally
-       success = await campaign_processor.pause_campaign(
-           campaign_id=campaign_id,
-           user_id=current_user.id
-       )
-       
-       if not success:
-           raise HTTPException(status_code=400, detail="Failed to pause campaign")
-       
-       # Get updated campaign - use context manager for this separate operation
-       from app.db.repositories.campaigns import CampaignRepository
-       
-       async with get_repository_context(CampaignRepository) as campaign_repo:
-           campaign = await campaign_repo.get_by_id(campaign_id)
-           return campaign
-       
-   except Exception as e:
-       raise HTTPException(status_code=500, detail=f"Error pausing campaign: {str(e)}")
-
-
-@router.post("/{campaign_id}/cancel", response_model=CampaignResponse)
-async def cancel_campaign(
-   campaign_id: str = Path(..., description="Campaign ID"),
-   current_user: User = Depends(get_current_user),
-   campaign_processor = Depends(get_campaign_processor),
-):
-   """
-   Cancel a campaign.
-   
-   This will change the campaign status to cancelled and stop sending messages.
-   The campaign cannot be resumed after cancellation.
-   """
-   try:
-       # Cancel campaign - campaign_processor already uses context managers internally
-       success = await campaign_processor.cancel_campaign(
-           campaign_id=campaign_id,
-           user_id=current_user.id
-       )
-       
-       if not success:
-           raise HTTPException(status_code=400, detail="Failed to cancel campaign")
-       
-       # Get updated campaign - use context manager for this separate operation
-       from app.db.repositories.campaigns import CampaignRepository
-       
-       async with get_repository_context(CampaignRepository) as campaign_repo:
-           campaign = await campaign_repo.get_by_id(campaign_id)
-           return campaign
-       
-   except Exception as e:
-       raise HTTPException(status_code=500, detail=f"Error cancelling campaign: {str(e)}")
-
-
-@router.get("/{campaign_id}/messages", response_model=PaginatedResponse[MessageResponse])
-async def get_campaign_messages(
-   campaign_id: str = Path(..., description="Campaign ID"),
-   pagination: PaginationParams = Depends(),
-   status: Optional[str] = Query(None, description="Filter by message status"),
-   current_user: User = Depends(get_current_user),
-):
-   """
-   Get messages for a campaign.
-   
-   Returns a paginated list of messages for the specified campaign.
-   """
-   try:
-       # Use repository context for proper connection management
-       from app.db.repositories.campaigns import CampaignRepository
-       from app.db.repositories.messages import MessageRepository
-       
-       # First check if campaign exists and belongs to user
-       async with get_repository_context(CampaignRepository) as campaign_repo:
-           campaign = await campaign_repo.get_by_id(campaign_id)
-           
-           if not campaign:
-               raise NotFoundError(message=f"Campaign {campaign_id} not found")
-           
-           if campaign.user_id != current_user.id:
-               raise HTTPException(status_code=403, detail="Not authorized to access this campaign")
-       
-       # Get messages for campaign - in a separate context to avoid long transactions
-       async with get_repository_context(MessageRepository) as message_repo:
-           messages, total = await message_repo.get_messages_for_campaign(
-               campaign_id=campaign_id,
-               status=status,
-               skip=pagination.skip,
-               limit=pagination.limit
-           )
-
-           # Calculate proper pagination info
-           total_pages = (total + pagination.limit - 1) // pagination.limit
-
-           # Create proper PageInfo object
-           page_info = PageInfo(
-               current_page=pagination.page,
-               total_pages=total_pages,
-               page_size=pagination.limit,
-               total_items=total,
-               has_previous=pagination.page > 1,
-               has_next=pagination.page < total_pages
-           )
-           
-           # Return PaginatedResponse object
-           return PaginatedResponse(
-               items=messages,  # Direct Message objects - FastAPI will serialize them
-               page_info=page_info
-           )
-       
-   except NotFoundError as e:
-       raise HTTPException(status_code=404, detail=str(e))
-   except Exception as e:
-       raise HTTPException(status_code=500, detail=f"Error retrieving campaign messages: {str(e)}")
-
-
-@router.delete("/{campaign_id}", status_code=204)
-async def delete_campaign(
-   campaign_id: str = Path(..., description="Campaign ID"),
-   current_user: User = Depends(get_current_user),
-):
-   """
-   Delete a campaign.
-   
-   Only draft campaigns can be deleted. Active, paused, or completed campaigns cannot be deleted.
-   """
-   try:
-       from app.db.repositories.campaigns import CampaignRepository
-       
-       async with get_repository_context(CampaignRepository) as campaign_repo:
-           # Get campaign
-           campaign = await campaign_repo.get_by_id(campaign_id)
-           if not campaign:
-               raise NotFoundError(message=f"Campaign {campaign_id} not found")
-           
-           # Check authorization
-           if campaign.user_id != current_user.id:
-               raise HTTPException(status_code=403, detail="Not authorized to delete this campaign")
-           
-           # Check if campaign can be deleted
-           if campaign.status != "draft":
-               raise HTTPException(
-                   status_code=400, 
-                   detail="Only draft campaigns can be deleted"
-               )
-           
-           # Delete campaign
-           success = await campaign_repo.delete(id=campaign_id)
-           if not success:
-               raise HTTPException(status_code=500, detail="Failed to delete campaign")
-           
-           return JSONResponse(status_code=204, content=None)
-       
-   except NotFoundError as e:
-       raise HTTPException(status_code=404, detail=str(e))
-   except Exception as e:
-       raise HTTPException(status_code=500, detail=f"Error deleting campaign: {str(e)}")
-</file>
-
 <file path="app/api/v1/endpoints/messages.py">
 """
 API endpoints for SMS message management.
@@ -8987,209 +8511,6 @@ class WebhookEvent(Base):
     error_message = Column(String, nullable=True)
 </file>
 
-<file path="app/schemas/campaign.py">
-# app/schemas/campaign.py
-from typing import List, Optional, Dict, Any
-from datetime import datetime, timezone
-from uuid import UUID
-
-from pydantic import BaseModel, Field, validator
-
-
-class CampaignBase(BaseModel):
-    """Base schema for campaign data."""
-    name: str = Field(..., description="Campaign name")
-    description: Optional[str] = Field(None, description="Campaign description")
-    scheduled_start_at: Optional[datetime] = Field(None, description="Scheduled start time")
-    scheduled_end_at: Optional[datetime] = Field(None, description="Scheduled end time")
-    settings: Optional[Dict[str, Any]] = Field(default={}, description="Campaign settings")
-
-
-class CampaignCreate(CampaignBase):
-    """Schema for creating a new campaign."""
-    pass
-
-
-class CampaignCreateFromCSV(BaseModel):
-    """Schema for creating a campaign from CSV file."""
-    name: str = Field(..., description="Campaign name")
-    description: Optional[str] = Field(None, description="Campaign description")
-    message_template: str = Field(..., description="Message template to send")
-    scheduled_start_at: Optional[datetime] = Field(None, description="Scheduled start time")
-    scheduled_end_at: Optional[datetime] = Field(None, description="Scheduled end time")
-    settings: Optional[Dict[str, Any]] = Field(default={}, description="Campaign settings")
-
-
-class CampaignUpdate(BaseModel):
-    """Schema for updating a campaign."""
-    name: Optional[str] = Field(None, description="Campaign name")
-    description: Optional[str] = Field(None, description="Campaign description")
-    scheduled_start_at: Optional[datetime] = Field(None, description="Scheduled start time")
-    scheduled_end_at: Optional[datetime] = Field(None, description="Scheduled end time")
-    settings: Optional[Dict[str, Any]] = Field(None, description="Campaign settings")
-
-
-class CampaignStatus(BaseModel):
-    """Schema for campaign status update."""
-    status: str = Field(..., description="Campaign status")
-    
-    @validator("status")
-    def validate_status(cls, v):
-        """Validate status value."""
-        valid_statuses = ["draft", "active", "paused", "completed", "cancelled", "failed"]
-        if v not in valid_statuses:
-            raise ValueError(f"Status must be one of: {', '.join(valid_statuses)}")
-        return v
-
-
-class CampaignResponse(CampaignBase):
-    """Schema for campaign response."""
-    id: str = Field(..., description="Campaign ID")
-    status: str = Field(..., description="Campaign status")
-    total_messages: int = Field(..., description="Total number of messages")
-    sent_count: int = Field(..., description="Number of sent messages")
-    delivered_count: int = Field(..., description="Number of delivered messages")
-    failed_count: int = Field(..., description="Number of failed messages")
-    created_at: datetime = Field(..., description="Creation timestamp")
-    updated_at: datetime = Field(..., description="Last update timestamp")
-    started_at: Optional[datetime] = Field(None, description="Start timestamp")
-    completed_at: Optional[datetime] = Field(None, description="Completion timestamp")
-    user_id: str = Field(..., description="User ID")
-    
-    # Add computed fields
-    progress_percentage: float = Field(0, description="Progress percentage")
-    delivery_success_rate: float = Field(0, description="Delivery success rate")
-    
-    class Config:
-        """Pydantic config."""
-        from_attributes = True
-
-
-class CampaignListResponse(BaseModel):
-    """Schema for campaign list response with pagination."""
-    items: List[CampaignResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
-</file>
-
-<file path="app/schemas/message.py">
-"""
-Pydantic schemas for message-related API operations.
-"""
-from typing import List, Optional, Dict, Any
-from datetime import datetime, timezone
-from enum import Enum
-from pydantic import BaseModel, Field, validator
-
-
-class MessageStatus(str, Enum):
-    """Possible message statuses."""
-    PENDING = "pending"
-    PROCESSED = "processed"
-    SENT = "sent"
-    DELIVERED = "delivered"
-    FAILED = "failed"
-    SCHEDULED = "scheduled"
-    CANCELLED = "cancelled"
-
-
-class MessageCreate(BaseModel):
-    """Schema for creating a new message."""
-    phone_number: str = Field(..., description="Recipient phone number in E.164 format")
-    message: str = Field(..., description="Message content")
-    scheduled_at: Optional[datetime] = Field(None, description="Schedule message for future delivery")
-    custom_id: Optional[str] = Field(None, description="Custom ID for tracking")
-    
-    @validator("phone_number")
-    def validate_phone_number(cls, v):
-        """Validate phone number format."""
-        # Basic validation - will be handled more thoroughly in the service
-        if not v or not (v.startswith("+") and len(v) >= 8):
-            raise ValueError("Phone number must be in E.164 format (e.g. +1234567890)")
-        return v
-    
-    @validator("message")
-    def validate_message(cls, v):
-        """Validate message content."""
-        if not v or len(v.strip()) == 0:
-            raise ValueError("Message cannot be empty")
-        if len(v) > 1600:  # Allow for multi-part SMS
-            raise ValueError("Message exceeds maximum length of 1600 characters")
-        return v
-
-
-class MessageResponse(BaseModel):
-    """Schema for message response."""
-    id: str = Field(..., description="Message ID")
-    custom_id: Optional[str] = Field(None, description="Custom ID if provided")
-    phone_number: str = Field(..., description="Recipient phone number")
-    message: str = Field(..., description="Message content")
-    status: MessageStatus = Field(..., description="Current message status")
-    created_at: datetime = Field(..., description="Creation timestamp")
-    updated_at: datetime = Field(..., description="Last update timestamp")
-    scheduled_at: Optional[datetime] = Field(None, description="Scheduled delivery time")
-    sent_at: Optional[datetime] = Field(None, description="Time when message was sent")
-    delivered_at: Optional[datetime] = Field(None, description="Time when message was delivered")
-    failed_at: Optional[datetime] = Field(None, description="Time when message failed")
-    reason: Optional[str] = Field(None, description="Failure reason if applicable")
-    gateway_message_id: Optional[str] = Field(None, description="ID from SMS gateway")
-    user_id: str = Field(..., description="User who sent the message")
-    metadata: Optional[Dict[str, Any]] = Field(default={}, description="Additional metadata")
-    
-    class Config:
-        """Pydantic config."""
-        from_attributes = True
-
-
-class MessageStatusUpdate(BaseModel):
-    """Schema for updating message status."""
-    status: MessageStatus = Field(..., description="New message status")
-    reason: Optional[str] = Field(None, description="Reason for status change (required for FAILED)")
-    
-    @validator("reason")
-    def validate_reason(cls, v, values):
-        """Validate reason field."""
-        if values.get("status") == MessageStatus.FAILED and not v:
-            raise ValueError("Reason is required when status is FAILED")
-        return v
-
-
-class BatchOptions(BaseModel):
-    """Options for batch processing."""
-    delay_between_messages: Optional[float] = Field(0.3, description="Delay between messages in seconds")
-    fail_on_first_error: Optional[bool] = Field(False, description="Stop processing on first error")
-    retry_failed: Optional[bool] = Field(True, description="Automatically retry failed messages")
-
-
-class BatchMessageRequest(BaseModel):
-    """Schema for batch message request."""
-    messages: List[MessageCreate] = Field(..., description="List of messages to send")
-    options: Optional[BatchOptions] = Field(default=None, description="Batch processing options")
-    
-    @validator("messages")
-    def validate_messages(cls, v):
-        """Validate message list."""
-        if not v:
-            raise ValueError("Message list cannot be empty")
-        if len(v) > 1000:
-            raise ValueError("Maximum batch size is 1000 messages")
-        return v
-
-
-class BatchMessageResponse(BaseModel):
-    """Schema for batch message response."""
-    batch_id: str = Field(..., description="Batch ID for tracking")
-    total: int = Field(..., description="Total number of messages in batch")
-    processed: int = Field(..., description="Number of messages processed")
-    successful: int = Field(..., description="Number of successful messages")
-    failed: int = Field(..., description="Number of failed messages")
-    status: str = Field(..., description="Overall batch status")
-    created_at: datetime = Field(..., description="Batch creation timestamp")
-    messages: Optional[List[MessageResponse]] = Field(None, description="List of message responses")
-</file>
-
 <file path="app/schemas/user.py">
 """
 Pydantic schemas for user-related API operations.
@@ -10017,6 +9338,475 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 This project is licensed under the MIT License - see the LICENSE file for details.
 </file>
 
+<file path="app/api/v1/endpoints/campaigns.py">
+# app/api/v1/endpoints/campaigns.py
+import csv
+import io
+from typing import List, Optional
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, UploadFile, File, Query, Path, status
+from fastapi.responses import JSONResponse
+
+from app.api.v1.dependencies import get_current_user, get_rate_limiter
+from app.core.exceptions import ValidationError, NotFoundError
+from app.schemas.campaign import (
+    CampaignCreate,
+    CampaignCreateFromCSV,
+    CampaignUpdate,
+    CampaignResponse,
+    CampaignStatus,
+)
+from app.schemas.user import User
+from app.schemas.message import MessageResponse
+from app.utils.pagination import PaginationParams, paginate_response, PaginatedResponse, PageInfo
+from app.services.campaigns.processor import get_campaign_processor
+from app.db.session import get_repository_context
+
+router = APIRouter()
+
+
+@router.post("/", response_model=CampaignResponse, status_code=status.HTTP_201_CREATED)
+async def create_campaign(
+    campaign: CampaignCreate,
+    current_user: User = Depends(get_current_user),
+    rate_limiter = Depends(get_rate_limiter),
+):
+    """
+    Create a new campaign.
+    
+    This creates a campaign in draft status. Messages can be added later.
+    """
+    # Check rate limits
+    await rate_limiter.check_rate_limit(current_user.id, "create_campaign")
+    
+    try:
+        # Use repository context for proper connection management
+        from app.db.repositories.campaigns import CampaignRepository
+        
+        async with get_repository_context(CampaignRepository) as campaign_repo:
+            # Create campaign
+            result = await campaign_repo.create_campaign(
+                name=campaign.name,
+                description=campaign.description,
+                user_id=current_user.id,
+                scheduled_start_at=campaign.scheduled_start_at,
+                scheduled_end_at=campaign.scheduled_end_at,
+                settings=campaign.settings
+            )
+            
+            return result
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error creating campaign: {str(e)}")
+
+
+@router.post("/from-csv", response_model=CampaignResponse, status_code=status.HTTP_201_CREATED)
+async def create_campaign_from_csv(
+    file: UploadFile = File(...),
+    campaign_data: str = Query(..., description="Campaign data as JSON string"),
+    delimiter: str = Query(",", description="CSV delimiter"),
+    has_header: bool = Query(True, description="Whether CSV has a header row"),
+    phone_column: str = Query("phone", description="Column name containing phone numbers"),
+    current_user: User = Depends(get_current_user),
+    rate_limiter = Depends(get_rate_limiter),
+):
+    """
+    Create a campaign and add phone numbers from CSV.
+    
+    This creates a campaign and immediately adds all phone numbers from the CSV.
+    The campaign will remain in draft status until explicitly started.
+    """
+    import json
+    
+    # Check rate limits
+    await rate_limiter.check_rate_limit(current_user.id, "create_campaign")
+    
+    try:
+        # Parse campaign data
+        campaign_dict = json.loads(campaign_data)
+        campaign_data = CampaignCreateFromCSV(**campaign_dict)
+        
+        # Use repository context for proper connection management
+        from app.db.repositories.campaigns import CampaignRepository
+        
+        async with get_repository_context(CampaignRepository) as campaign_repo:
+            # Create campaign
+            campaign = await campaign_repo.create_campaign(
+                name=campaign_data.name,
+                description=campaign_data.description,
+                user_id=current_user.id,
+                scheduled_start_at=campaign_data.scheduled_start_at,
+                scheduled_end_at=campaign_data.scheduled_end_at,
+                settings=campaign_data.settings
+            )
+            
+            # Read CSV file
+            contents = await file.read()
+            csv_file = io.StringIO(contents.decode('utf-8'))
+            
+            # Parse CSV
+            csv_reader = csv.reader(csv_file, delimiter=delimiter)
+            
+            # Skip header if present
+            if has_header:
+                header = next(csv_reader)
+                try:
+                    phone_index = header.index(phone_column)
+                except ValueError:
+                    raise ValidationError(
+                        message=f"Column '{phone_column}' not found in CSV header",
+                        details={"available_columns": header}
+                    )
+            else:
+                phone_index = 0  # Assume first column has phone numbers
+            
+            # Extract phone numbers
+            phone_numbers = []
+            for row in csv_reader:
+                if row and len(row) > phone_index:
+                    phone = row[phone_index].strip()
+                    if phone:
+                        phone_numbers.append(phone)
+            
+            if not phone_numbers:
+                raise ValidationError(message="No valid phone numbers found in CSV")
+            
+            # Add phone numbers to campaign
+            added_count = await campaign_repo.add_messages_to_campaign(
+                campaign_id=campaign.id,
+                phone_numbers=phone_numbers,
+                message_text=campaign_data.message_template,
+                user_id=current_user.id
+            )
+            
+            # Refresh campaign
+            campaign = await campaign_repo.get_by_id(campaign.id)
+            
+            return campaign
+        
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid campaign data JSON")
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error creating campaign: {str(e)}")
+
+
+@router.get("/", response_model=PaginatedResponse[CampaignResponse])
+async def list_campaigns(
+    pagination: PaginationParams = Depends(),
+    status: Optional[str] = Query(None, description="Filter by campaign status"),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    List campaigns for the current user.
+    
+    Returns a paginated list of campaigns.
+    """
+    try:
+        # Use repository context for proper connection management
+        from app.db.repositories.campaigns import CampaignRepository
+        
+        async with get_repository_context(CampaignRepository) as campaign_repo:
+            # Get campaigns with pagination
+            campaigns, total = await campaign_repo.get_campaigns_for_user(
+                user_id=current_user.id,
+                status=status,
+                skip=pagination.skip,
+                limit=pagination.limit
+            )
+            
+            # Calculate pagination info
+            total_pages = (total + pagination.limit - 1) // pagination.limit
+            
+            # Return paginated response
+            return paginate_response(campaigns, total, pagination)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error listing campaigns: {str(e)}")
+
+
+@router.get("/{campaign_id}", response_model=CampaignResponse)
+async def get_campaign(
+   campaign_id: str = Path(..., description="Campaign ID"),
+   current_user: User = Depends(get_current_user),
+):
+   """
+   Get details of a specific campaign.
+   """
+   try:
+       from app.db.repositories.campaigns import CampaignRepository
+       
+       async with get_repository_context(CampaignRepository) as campaign_repo:
+           # Get campaign
+           campaign = await campaign_repo.get_by_id(campaign_id)
+           if not campaign:
+               raise NotFoundError(message=f"Campaign {campaign_id} not found")
+           
+           # Check authorization
+           if campaign.user_id != current_user.id:
+               raise HTTPException(status_code=403, detail="Not authorized to access this campaign")
+           
+           return campaign
+       
+   except NotFoundError as e:
+       raise HTTPException(status_code=404, detail=str(e))
+   except Exception as e:
+       raise HTTPException(status_code=500, detail=f"Error retrieving campaign: {str(e)}")
+
+
+@router.put("/{campaign_id}", response_model=CampaignResponse)
+async def update_campaign(
+   campaign_update: CampaignUpdate,
+   campaign_id: str = Path(..., description="Campaign ID"),
+   current_user: User = Depends(get_current_user),
+):
+   """
+   Update campaign details.
+   
+   Only draft campaigns can be fully updated. Active campaigns can only have their description updated.
+   """
+   try:
+       from app.db.repositories.campaigns import CampaignRepository
+       
+       async with get_repository_context(CampaignRepository) as campaign_repo:
+           # Get campaign
+           campaign = await campaign_repo.get_by_id(campaign_id)
+           if not campaign:
+               raise NotFoundError(message=f"Campaign {campaign_id} not found")
+           
+           # Check authorization
+           if campaign.user_id != current_user.id:
+               raise HTTPException(status_code=403, detail="Not authorized to update this campaign")
+           
+           # Check if campaign can be updated
+           if campaign.status != "draft" and any([
+               campaign_update.scheduled_start_at is not None,
+               campaign_update.scheduled_end_at is not None,
+               campaign_update.name is not None
+           ]):
+               raise HTTPException(
+                   status_code=400, 
+                   detail="Only draft campaigns can have name or schedule updated"
+               )
+           
+           # Convert to dict and remove None values
+           update_data = {k: v for k, v in campaign_update.dict().items() if v is not None}
+           
+           # Update campaign
+           updated = await campaign_repo.update(id=campaign_id, obj_in=update_data)
+           if not updated:
+               raise HTTPException(status_code=500, detail="Failed to update campaign")
+           
+           return updated
+       
+   except NotFoundError as e:
+       raise HTTPException(status_code=404, detail=str(e))
+   except Exception as e:
+       raise HTTPException(status_code=500, detail=f"Error updating campaign: {str(e)}")
+
+
+@router.post("/{campaign_id}/start", response_model=CampaignResponse)
+async def start_campaign(
+   campaign_id: str = Path(..., description="Campaign ID"),
+   current_user: User = Depends(get_current_user),
+   campaign_processor = Depends(get_campaign_processor),
+):
+   """
+   Start a campaign.
+   
+   This will change the campaign status to active and begin sending messages.
+   """
+   try:
+       # Start campaign - campaign_processor already uses context managers internally
+       success = await campaign_processor.start_campaign(
+           campaign_id=campaign_id,
+           user_id=current_user.id
+       )
+       
+       if not success:
+           raise HTTPException(status_code=400, detail="Failed to start campaign")
+       
+       # Get updated campaign - use context manager for this separate operation
+       from app.db.repositories.campaigns import CampaignRepository
+       
+       async with get_repository_context(CampaignRepository) as campaign_repo:
+           campaign = await campaign_repo.get_by_id(campaign_id)
+           return campaign
+       
+   except Exception as e:
+       raise HTTPException(status_code=500, detail=f"Error starting campaign: {str(e)}")
+
+
+@router.post("/{campaign_id}/pause", response_model=CampaignResponse)
+async def pause_campaign(
+   campaign_id: str = Path(..., description="Campaign ID"),
+   current_user: User = Depends(get_current_user),
+   campaign_processor = Depends(get_campaign_processor),
+):
+   """
+   Pause a campaign.
+   
+   This will change the campaign status to paused and stop sending messages.
+   The campaign can be resumed later.
+   """
+   try:
+       # Pause campaign - campaign_processor already uses context managers internally
+       success = await campaign_processor.pause_campaign(
+           campaign_id=campaign_id,
+           user_id=current_user.id
+       )
+       
+       if not success:
+           raise HTTPException(status_code=400, detail="Failed to pause campaign")
+       
+       # Get updated campaign - use context manager for this separate operation
+       from app.db.repositories.campaigns import CampaignRepository
+       
+       async with get_repository_context(CampaignRepository) as campaign_repo:
+           campaign = await campaign_repo.get_by_id(campaign_id)
+           return campaign
+       
+   except Exception as e:
+       raise HTTPException(status_code=500, detail=f"Error pausing campaign: {str(e)}")
+
+
+@router.post("/{campaign_id}/cancel", response_model=CampaignResponse)
+async def cancel_campaign(
+   campaign_id: str = Path(..., description="Campaign ID"),
+   current_user: User = Depends(get_current_user),
+   campaign_processor = Depends(get_campaign_processor),
+):
+   """
+   Cancel a campaign.
+   
+   This will change the campaign status to cancelled and stop sending messages.
+   The campaign cannot be resumed after cancellation.
+   """
+   try:
+       # Cancel campaign - campaign_processor already uses context managers internally
+       success = await campaign_processor.cancel_campaign(
+           campaign_id=campaign_id,
+           user_id=current_user.id
+       )
+       
+       if not success:
+           raise HTTPException(status_code=400, detail="Failed to cancel campaign")
+       
+       # Get updated campaign - use context manager for this separate operation
+       from app.db.repositories.campaigns import CampaignRepository
+       
+       async with get_repository_context(CampaignRepository) as campaign_repo:
+           campaign = await campaign_repo.get_by_id(campaign_id)
+           return campaign
+       
+   except Exception as e:
+       raise HTTPException(status_code=500, detail=f"Error cancelling campaign: {str(e)}")
+
+
+@router.get("/{campaign_id}/messages", response_model=PaginatedResponse[MessageResponse])
+async def get_campaign_messages(
+   campaign_id: str = Path(..., description="Campaign ID"),
+   pagination: PaginationParams = Depends(),
+   status: Optional[str] = Query(None, description="Filter by message status"),
+   current_user: User = Depends(get_current_user),
+):
+   """
+   Get messages for a campaign.
+   
+   Returns a paginated list of messages for the specified campaign.
+   """
+   try:
+       # Use repository context for proper connection management
+       from app.db.repositories.campaigns import CampaignRepository
+       from app.db.repositories.messages import MessageRepository
+       
+       # First check if campaign exists and belongs to user
+       async with get_repository_context(CampaignRepository) as campaign_repo:
+           campaign = await campaign_repo.get_by_id(campaign_id)
+           
+           if not campaign:
+               raise NotFoundError(message=f"Campaign {campaign_id} not found")
+           
+           if campaign.user_id != current_user.id:
+               raise HTTPException(status_code=403, detail="Not authorized to access this campaign")
+       
+       # Get messages for campaign - in a separate context to avoid long transactions
+       async with get_repository_context(MessageRepository) as message_repo:
+           messages, total = await message_repo.get_messages_for_campaign(
+               campaign_id=campaign_id,
+               status=status,
+               skip=pagination.skip,
+               limit=pagination.limit
+           )
+
+           # Calculate proper pagination info
+           total_pages = (total + pagination.limit - 1) // pagination.limit
+
+           # Create proper PageInfo object
+           page_info = PageInfo(
+               current_page=pagination.page,
+               total_pages=total_pages,
+               page_size=pagination.limit,
+               total_items=total,
+               has_previous=pagination.page > 1,
+               has_next=pagination.page < total_pages
+           )
+           
+           # Return PaginatedResponse object
+           return PaginatedResponse(
+               items=messages,  # Direct Message objects - FastAPI will serialize them
+               page_info=page_info
+           )
+       
+   except NotFoundError as e:
+       raise HTTPException(status_code=404, detail=str(e))
+   except Exception as e:
+       raise HTTPException(status_code=500, detail=f"Error retrieving campaign messages: {str(e)}")
+
+
+@router.delete("/{campaign_id}", status_code=204)
+async def delete_campaign(
+   campaign_id: str = Path(..., description="Campaign ID"),
+   current_user: User = Depends(get_current_user),
+):
+   """
+   Delete a campaign.
+   
+   Only draft campaigns can be deleted. Active, paused, or completed campaigns cannot be deleted.
+   """
+   try:
+       from app.db.repositories.campaigns import CampaignRepository
+       
+       async with get_repository_context(CampaignRepository) as campaign_repo:
+           # Get campaign
+           campaign = await campaign_repo.get_by_id(campaign_id)
+           if not campaign:
+               raise NotFoundError(message=f"Campaign {campaign_id} not found")
+           
+           # Check authorization
+           if campaign.user_id != current_user.id:
+               raise HTTPException(status_code=403, detail="Not authorized to delete this campaign")
+           
+           # Check if campaign can be deleted
+           if campaign.status != "draft":
+               raise HTTPException(
+                   status_code=400, 
+                   detail="Only draft campaigns can be deleted"
+               )
+           
+           # Delete campaign
+           success = await campaign_repo.delete(id=campaign_id)
+           if not success:
+               raise HTTPException(status_code=500, detail="Failed to delete campaign")
+           
+           return JSONResponse(status_code=204, content=None)
+       
+   except NotFoundError as e:
+       raise HTTPException(status_code=404, detail=str(e))
+   except Exception as e:
+       raise HTTPException(status_code=500, detail=f"Error deleting campaign: {str(e)}")
+</file>
+
 <file path="app/api/v1/endpoints/metrics.py">
 """
 API endpoints for metrics and reporting.
@@ -10301,6 +10091,204 @@ class APIKey(Base):
     
     # Relationships
     user = relationship("User", back_populates="api_keys")
+</file>
+
+<file path="app/schemas/campaign.py">
+# app/schemas/campaign.py
+from typing import List, Optional, Dict, Any
+from datetime import datetime, timezone
+from uuid import UUID
+from enum import Enum
+
+from pydantic import BaseModel, Field, validator
+
+
+
+class CampaignStatus(str, Enum):
+    """
+    Campaign status enum.
+    
+    Defines all possible states a campaign can be in during its lifecycle.
+    Uses string enum to ensure JSON serialization compatibility and type safety.
+    """
+    DRAFT = "draft"
+    ACTIVE = "active"
+    PAUSED = "paused"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+
+
+class CampaignBase(BaseModel):
+    """Base schema for campaign data."""
+    name: str = Field(..., description="Campaign name")
+    description: Optional[str] = Field(None, description="Campaign description")
+    scheduled_start_at: Optional[datetime] = Field(None, description="Scheduled start time")
+    scheduled_end_at: Optional[datetime] = Field(None, description="Scheduled end time")
+    settings: Optional[Dict[str, Any]] = Field(default={}, description="Campaign settings")
+
+
+class CampaignCreate(CampaignBase):
+    """Schema for creating a new campaign."""
+    pass
+
+
+class CampaignCreateFromCSV(BaseModel):
+    """Schema for creating a campaign from CSV file."""
+    name: str = Field(..., description="Campaign name")
+    description: Optional[str] = Field(None, description="Campaign description")
+    message_template: str = Field(..., description="Message template to send")
+    scheduled_start_at: Optional[datetime] = Field(None, description="Scheduled start time")
+    scheduled_end_at: Optional[datetime] = Field(None, description="Scheduled end time")
+    settings: Optional[Dict[str, Any]] = Field(default={}, description="Campaign settings")
+
+
+class CampaignUpdate(BaseModel):
+    """Schema for updating a campaign."""
+    name: Optional[str] = Field(None, description="Campaign name")
+    description: Optional[str] = Field(None, description="Campaign description")
+    scheduled_start_at: Optional[datetime] = Field(None, description="Scheduled start time")
+    scheduled_end_at: Optional[datetime] = Field(None, description="Scheduled end time")
+    settings: Optional[Dict[str, Any]] = Field(None, description="Campaign settings")
+
+
+class CampaignResponse(CampaignBase):
+    """Schema for campaign response."""
+    id: str = Field(..., description="Campaign ID")
+    status: CampaignStatus = Field(..., description="Campaign status")
+    total_messages: int = Field(..., description="Total number of messages")
+    sent_count: int = Field(..., description="Number of sent messages")
+    delivered_count: int = Field(..., description="Number of delivered messages")
+    failed_count: int = Field(..., description="Number of failed messages")
+    created_at: datetime = Field(..., description="Creation timestamp")
+    updated_at: datetime = Field(..., description="Last update timestamp")
+    started_at: Optional[datetime] = Field(None, description="Start timestamp")
+    completed_at: Optional[datetime] = Field(None, description="Completion timestamp")
+    user_id: str = Field(..., description="User ID")
+    
+    # Add computed fields
+    progress_percentage: float = Field(0, description="Progress percentage")
+    delivery_success_rate: float = Field(0, description="Delivery success rate")
+    
+    class Config:
+        """Pydantic config."""
+        from_attributes = True
+</file>
+
+<file path="app/schemas/message.py">
+"""
+Pydantic schemas for message-related API operations.
+"""
+from typing import List, Optional, Dict, Any
+from datetime import datetime, timezone
+from enum import Enum
+from pydantic import BaseModel, Field, validator
+
+
+class MessageStatus(str, Enum):
+    """Possible message statuses."""
+    PENDING = "pending"
+    PROCESSED = "processed"
+    SENT = "sent"
+    DELIVERED = "delivered"
+    FAILED = "failed"
+    SCHEDULED = "scheduled"
+    CANCELLED = "cancelled"
+
+
+class MessageCreate(BaseModel):
+    """Schema for creating a new message."""
+    phone_number: str = Field(..., description="Recipient phone number in E.164 format")
+    message: str = Field(..., description="Message content")
+    scheduled_at: Optional[datetime] = Field(None, description="Schedule message for future delivery")
+    custom_id: Optional[str] = Field(None, description="Custom ID for tracking")
+    
+    @validator("phone_number")
+    def validate_phone_number(cls, v):
+        """Validate phone number format."""
+        # Basic validation - will be handled more thoroughly in the service
+        if not v or not (v.startswith("+") and len(v) >= 8):
+            raise ValueError("Phone number must be in E.164 format (e.g. +1234567890)")
+        return v
+    
+    @validator("message")
+    def validate_message(cls, v):
+        """Validate message content."""
+        if not v or len(v.strip()) == 0:
+            raise ValueError("Message cannot be empty")
+        if len(v) > 1600:  # Allow for multi-part SMS
+            raise ValueError("Message exceeds maximum length of 1600 characters")
+        return v
+
+
+class MessageResponse(BaseModel):
+    """Schema for message response."""
+    id: str = Field(..., description="Message ID")
+    custom_id: Optional[str] = Field(None, description="Custom ID if provided")
+    phone_number: str = Field(..., description="Recipient phone number")
+    message: str = Field(..., description="Message content")
+    status: MessageStatus = Field(..., description="Current message status")
+    created_at: datetime = Field(..., description="Creation timestamp")
+    updated_at: datetime = Field(..., description="Last update timestamp")
+    scheduled_at: Optional[datetime] = Field(None, description="Scheduled delivery time")
+    sent_at: Optional[datetime] = Field(None, description="Time when message was sent")
+    delivered_at: Optional[datetime] = Field(None, description="Time when message was delivered")
+    failed_at: Optional[datetime] = Field(None, description="Time when message failed")
+    reason: Optional[str] = Field(None, description="Failure reason if applicable")
+    gateway_message_id: Optional[str] = Field(None, description="ID from SMS gateway")
+    user_id: str = Field(..., description="User who sent the message")
+    meta_data: Optional[Dict[str, Any]] = Field(default={}, description="Additional metadata")
+    
+    class Config:
+        """Pydantic config."""
+        from_attributes = True
+
+
+class MessageStatusUpdate(BaseModel):
+    """Schema for updating message status."""
+    status: MessageStatus = Field(..., description="New message status")
+    reason: Optional[str] = Field(None, description="Reason for status change (required for FAILED)")
+    
+    @validator("reason")
+    def validate_reason(cls, v, values):
+        """Validate reason field."""
+        if values.get("status") == MessageStatus.FAILED and not v:
+            raise ValueError("Reason is required when status is FAILED")
+        return v
+
+
+class BatchOptions(BaseModel):
+    """Options for batch processing."""
+    delay_between_messages: Optional[float] = Field(0.3, description="Delay between messages in seconds")
+    fail_on_first_error: Optional[bool] = Field(False, description="Stop processing on first error")
+    retry_failed: Optional[bool] = Field(True, description="Automatically retry failed messages")
+
+
+class BatchMessageRequest(BaseModel):
+    """Schema for batch message request."""
+    messages: List[MessageCreate] = Field(..., description="List of messages to send")
+    options: Optional[BatchOptions] = Field(default=None, description="Batch processing options")
+    
+    @validator("messages")
+    def validate_messages(cls, v):
+        """Validate message list."""
+        if not v:
+            raise ValueError("Message list cannot be empty")
+        if len(v) > 1000:
+            raise ValueError("Maximum batch size is 1000 messages")
+        return v
+
+
+class BatchMessageResponse(BaseModel):
+    """Schema for batch message response."""
+    batch_id: str = Field(..., description="Batch ID for tracking")
+    total: int = Field(..., description="Total number of messages in batch")
+    processed: int = Field(..., description="Number of messages processed")
+    successful: int = Field(..., description="Number of successful messages")
+    failed: int = Field(..., description="Number of failed messages")
+    status: str = Field(..., description="Overall batch status")
+    created_at: datetime = Field(..., description="Batch creation timestamp")
+    messages: Optional[List[MessageResponse]] = Field(None, description="List of message responses")
 </file>
 
 <file path="app/services/event_bus/events.py">

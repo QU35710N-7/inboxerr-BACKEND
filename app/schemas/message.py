@@ -5,6 +5,7 @@ from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone
 from enum import Enum
 from pydantic import BaseModel, Field, validator
+from app.schemas.campaign import CampaignResponse
 
 
 class MessageStatus(str, Enum):
@@ -60,6 +61,10 @@ class MessageResponse(BaseModel):
     gateway_message_id: Optional[str] = Field(None, description="ID from SMS gateway")
     user_id: str = Field(..., description="User who sent the message")
     meta_data: Optional[Dict[str, Any]] = Field(default={}, description="Additional metadata")
+    campaign: Optional[CampaignResponse] = Field(None, description="Campaign information if message belongs to a campaign")
+    parts_count: Optional[int] = Field(None, description="Number of SMS parts")
+
+
     
     class Config:
         """Pydantic config."""
