@@ -5,6 +5,7 @@ import csv
 import io
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, UploadFile, File, Query, Path, status
+import logging
 
 
 from app.api.v1.dependencies import get_current_user, get_rate_limiter, verify_api_key
@@ -15,14 +16,18 @@ from app.schemas.message import (
     BatchMessageRequest, 
     BatchMessageResponse,
     MessageStatus,
-    MessageStatusUpdate
+    MessageStatusUpdate,
+    GlobalBulkDeleteRequest,
+    BulkDeleteResponse
 )
 from app.services.sms.sender import get_sms_sender
 from app.schemas.user import User
 from app.utils.pagination import PaginationParams, paginate_response
 from app.utils.pagination import PaginatedResponse
+from app.db.session import get_repository_context
 
 router = APIRouter()
+logger = logging.getLogger("inboxerr.endpoint")
 
 
 @router.post("/send", response_model=MessageResponse, status_code=202)
@@ -326,3 +331,117 @@ async def get_task_status(
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error retrieving task status: {str(e)}")
+    
+
+@router.delete("/bulk", response_model=BulkDeleteResponse)
+async def bulk_delete_messages(
+    request: GlobalBulkDeleteRequest,
+    current_user: User = Depends(get_current_user),
+    rate_limiter = Depends(get_rate_limiter),
+):
+    """
+    Global bulk delete messages by message IDs.
+    
+    This endpoint efficiently deletes multiple messages by their specific IDs across
+    campaigns or for orphaned message cleanup. Designed for edge cases, power user
+    operations, and system maintenance tasks.
+    
+    **Safety Features:**
+    - User authorization (can only delete own messages)
+    - Smaller batch limits (1K vs 10K for campaign-scoped)
+    - Optional campaign context validation
+    - Detailed failure reporting for partial operations
+    - Comprehensive audit logging
+    
+    **Use Cases:**
+    - Cross-campaign message cleanup by power users
+    - Frontend multi-select bulk operations
+    - Orphaned message removal during maintenance
+    - Compliance-driven deletion by specific message IDs
+    - System administration tasks
+    
+    **Performance:**
+    - Handles up to 1K message deletions efficiently
+    - Uses optimized IN clause with PostgreSQL
+    - Smaller batches for safety vs campaign operations
+    
+    Args:
+        request: Global bulk delete request with message IDs and confirmation
+        current_user: Authenticated user (injected by dependency)
+        rate_limiter: Rate limiting for bulk operations (injected by dependency)
+    
+    Returns:
+        BulkDeleteResponse: Detailed results including failed message IDs
+        
+    Raises:
+        HTTPException 400: Invalid request or confirmation missing
+        HTTPException 403: User not authorized for specified messages
+        HTTPException 429: Rate limit exceeded
+        HTTPException 500: Database or internal server error
+    """
+    import time
+    
+    # Check rate limits for global bulk operations
+    await rate_limiter.check_rate_limit(current_user.id, "bulk_delete_global")
+    
+    start_time = time.time()
+    
+    try:
+        # Use repository context for proper connection management
+        from app.db.repositories.messages import MessageRepository
+        
+        # Perform global bulk deletion
+        async with get_repository_context(MessageRepository) as message_repo:
+            # Execute bulk deletion
+            deleted_count, failed_message_ids = await message_repo.bulk_delete_messages(
+                message_ids=request.message_ids,
+                user_id=current_user.id,
+                campaign_id=request.campaign_id
+            )
+            
+            # Calculate execution time
+            execution_time_ms = int((time.time() - start_time) * 1000)
+            
+            # Build applied filters for audit trail
+            filters_applied = {
+                "message_count": len(request.message_ids),
+                "unique_messages": len(set(request.message_ids))
+            }
+            if request.campaign_id:
+                filters_applied["campaign_context"] = request.campaign_id
+            
+            # Build detailed error messages for failed deletions
+            error_messages = []
+            if failed_message_ids:
+                error_messages = [
+                    f"Failed to delete message: {msg_id} (not found or not owned by user)" 
+                    for msg_id in failed_message_ids
+                ]
+            
+            # Build response
+            response = BulkDeleteResponse(
+                deleted_count=deleted_count,
+                campaign_id=request.campaign_id,
+                failed_count=len(failed_message_ids),
+                errors=error_messages,
+                operation_type="global",
+                filters_applied=filters_applied,
+                execution_time_ms=execution_time_ms
+            )
+            
+            # Log successful operation for audit
+            logger.info(
+                f"User {current_user.id} performed global bulk delete of {deleted_count} messages "
+                f"in {execution_time_ms}ms. Failed: {len(failed_message_ids)}. "
+                f"Campaign context: {request.campaign_id}"
+            )
+            
+            return response
+            
+    except Exception as e:
+        # Log error and return generic error message
+        logger.error(f"Error in global bulk_delete_messages: {e}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Error performing global bulk deletion: {str(e)}"
+        )

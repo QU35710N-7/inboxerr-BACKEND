@@ -116,3 +116,109 @@ class BatchMessageResponse(BaseModel):
     status: str = Field(..., description="Overall batch status")
     created_at: datetime = Field(..., description="Batch creation timestamp")
     messages: Optional[List[MessageResponse]] = Field(None, description="List of message responses")
+
+
+class CampaignBulkDeleteRequest(BaseModel):
+    """Schema for campaign-scoped bulk delete request."""
+    status: Optional[MessageStatus] = Field(None, description="Filter by message status (e.g., 'failed', 'sent')")
+    from_date: Optional[datetime] = Field(None, description="Delete messages from this date onwards (ISO format)")
+    to_date: Optional[datetime] = Field(None, description="Delete messages up to this date (ISO format)")
+    limit: int = Field(default=1000, le=10000, description="Maximum number of messages to delete (max 10,000)")
+    confirm_delete: bool = Field(default=True, description="Confirmation flag - must be true to proceed")
+    
+    @validator("limit")
+    def validate_limit(cls, v):
+        """Validate deletion limit for safety."""
+        if v <= 0:
+            raise ValueError("Limit must be greater than 0")
+        if v > 10000:
+            raise ValueError("Maximum limit is 10,000 messages per operation")
+        return v
+    
+    @validator("confirm_delete")
+    def validate_confirmation(cls, v):
+        """Ensure user confirms the bulk deletion."""
+        if not v:
+            raise ValueError("confirm_delete must be true to proceed with bulk deletion")
+        return v
+    
+    @validator("from_date", "to_date")
+    def validate_dates(cls, v):
+        """Validate date format and timezone."""
+        if v is not None:
+            # Ensure datetime is timezone-aware
+            if v.tzinfo is None:
+                raise ValueError("Date must be timezone-aware (include timezone information)")
+        return v
+
+
+class GlobalBulkDeleteRequest(BaseModel):
+    """Schema for global bulk delete request (by message IDs)."""
+    message_ids: List[str] = Field(..., description="List of message IDs to delete")
+    campaign_id: Optional[str] = Field(None, description="Optional campaign context for validation")
+    confirm_delete: bool = Field(default=True, description="Confirmation flag - must be true to proceed")
+    
+    @validator("message_ids")
+    def validate_message_ids(cls, v):
+        """Validate message ID list."""
+        if not v:
+            raise ValueError("Message IDs list cannot be empty")
+        if len(v) > 1000:
+            raise ValueError("Maximum 1,000 message IDs per global bulk operation")
+        
+        # Check for duplicates
+        if len(v) != len(set(v)):
+            raise ValueError("Duplicate message IDs found in request")
+        
+        return v
+    
+    @validator("confirm_delete")
+    def validate_confirmation(cls, v):
+        """Ensure user confirms the bulk deletion."""
+        if not v:
+            raise ValueError("confirm_delete must be true to proceed with bulk deletion")
+        return v
+
+
+class BulkDeleteResponse(BaseModel):
+    """Schema for bulk delete operation response."""
+    deleted_count: int = Field(..., description="Number of messages successfully deleted")
+    campaign_id: Optional[str] = Field(None, description="Campaign ID if campaign-scoped operation")
+    failed_count: int = Field(default=0, description="Number of messages that failed to delete")
+    errors: List[str] = Field(default=[], description="List of error messages if any failures occurred")
+    operation_type: str = Field(..., description="Type of bulk operation ('campaign' or 'global')")
+    filters_applied: Dict[str, Any] = Field(default={}, description="Filters that were applied during deletion")
+    execution_time_ms: Optional[int] = Field(None, description="Operation execution time in milliseconds")
+    
+    class Config:
+        """Pydantic config."""
+        from_attributes = True
+        schema_extra = {
+            "example": {
+                "deleted_count": 2847,
+                "campaign_id": "camp_abc123",
+                "failed_count": 0,
+                "errors": [],
+                "operation_type": "campaign",
+                "filters_applied": {
+                    "status": "failed",
+                    "from_date": "2024-01-01T00:00:00Z"
+                },
+                "execution_time_ms": 3421
+            }
+        }
+
+
+class BulkDeleteProgress(BaseModel):
+    """Schema for tracking bulk delete operation progress (future use)."""
+    operation_id: str = Field(..., description="Unique operation identifier")
+    status: str = Field(..., description="Operation status ('pending', 'processing', 'completed', 'failed')")
+    progress_percentage: int = Field(..., description="Progress percentage (0-100)")
+    messages_processed: int = Field(..., description="Number of messages processed so far")
+    total_messages: int = Field(..., description="Total number of messages to process")
+    estimated_completion: Optional[datetime] = Field(None, description="Estimated completion time")
+    errors: List[str] = Field(default=[], description="Any errors encountered during processing")
+    
+    class Config:
+        """Pydantic config."""
+        from_attributes = True
