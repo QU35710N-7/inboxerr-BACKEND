@@ -477,41 +477,52 @@ async def bulk_delete_campaign_messages(
     rate_limiter = Depends(get_rate_limiter),
 ):
     """
-    Bulk delete messages from a campaign.
+    Bulk delete messages from a campaign with event safety and server stability.
     
     This endpoint efficiently deletes multiple messages belonging to a specific campaign
-    with optional filtering by status and date range. Designed for high-volume operations
-    handling 10K-30K messages per campaign.
+    with optional filtering by status and date range. Enhanced with delivery event safety
+    checking and batched processing for high-volume operations handling 10K-30K messages.
     
-    **Safety Features:**
+    **Event Safety Features:**
+    - Pre-deletion check for delivery events
+    - Requires explicit confirmation to delete tracking data
+    - Clear warnings about data loss implications
+    - Two-phase deletion (events first, then messages)
+    
+    **Server Stability Features:**
+    - Batched processing prevents server overload
+    - Configurable batch sizes for different load scenarios
+    - Inter-batch delays prevent database lock contention
+    - Graceful handling of partial failures
+    
+    **Business Safety Features:**
     - Campaign ownership validation
     - User authorization checks  
     - Active campaign protection
-    - Configurable deletion limits
     - Comprehensive audit logging
     
     **Performance:**
-    - Single SQL query execution
+    - Single SQL query per batch
     - Optimized for large datasets
-    - 30K deletions in 3-5 seconds
+    - 30K deletions in batches for stability
     
     **Business Use Cases:**
     - Clean up failed messages from campaigns
     - Remove test messages before campaign launch
-    - Compliance-driven message deletion
+    - Compliance-driven message deletion (with event confirmation)
     - Campaign optimization and cleanup
     
     Args:
         campaign_id: ID of the campaign containing messages to delete
-        request: Bulk delete request with filters and confirmation
+        request: Bulk delete request with filters, confirmation, and force options
         current_user: Authenticated user (injected by dependency)
         rate_limiter: Rate limiting for bulk operations (injected by dependency)
     
     Returns:
-        BulkDeleteResponse: Detailed results of the bulk deletion operation
+        BulkDeleteResponse: Detailed results including event safety information
         
     Raises:
-        HTTPException 400: Invalid request or campaign state
+        HTTPException 400: Invalid request, campaign state, or missing confirmation
         HTTPException 403: User not authorized for this campaign
         HTTPException 404: Campaign not found
         HTTPException 429: Rate limit exceeded
@@ -543,27 +554,29 @@ async def bulk_delete_campaign_messages(
                     detail="Not authorized to delete messages from this campaign"
                 )
             
-            # Safety check - prevent deletion from active campaigns
-            if campaign.status == "active":
+            # Safety check - prevent deletion from active campaigns unless force delete
+            if campaign.status == "active" and not request.force_delete:
                 raise HTTPException(
                     status_code=400,
-                    detail="Cannot bulk delete messages from active campaign. Pause the campaign first."
+                    detail="Cannot bulk delete messages from active campaign. Pause the campaign first or use force_delete."
                 )
         
-        # Perform bulk deletion in separate context
+        # Perform bulk deletion with event safety
         async with get_repository_context(MessageRepository) as message_repo:
             # Convert datetime objects to ISO strings for repository method
             from_date_str = request.from_date.isoformat() if request.from_date else None
             to_date_str = request.to_date.isoformat() if request.to_date else None
             
-            # Execute bulk deletion
-            deleted_count, failed_message_ids = await message_repo.bulk_delete_campaign_messages(
+            # Execute bulk deletion with enhanced safety
+            deleted_count, failed_message_ids, metadata = await message_repo.bulk_delete_campaign_messages(
                 campaign_id=campaign_id,
                 user_id=current_user.id,
                 status=request.status.value if request.status else None,
                 from_date=from_date_str,
                 to_date=to_date_str,
-                limit=request.limit
+                limit=request.limit,
+                force_delete=request.force_delete,
+                batch_size=request.batch_size
             )
             
             # Calculate execution time
@@ -578,8 +591,10 @@ async def bulk_delete_campaign_messages(
             if request.to_date:
                 filters_applied["to_date"] = to_date_str
             filters_applied["limit"] = request.limit
+            filters_applied["force_delete"] = request.force_delete
+            filters_applied["batch_size"] = request.batch_size
             
-            # Build response
+            # Build response with enhanced metadata
             response = BulkDeleteResponse(
                 deleted_count=deleted_count,
                 campaign_id=campaign_id,
@@ -587,14 +602,19 @@ async def bulk_delete_campaign_messages(
                 errors=[f"Failed to delete message: {msg_id}" for msg_id in failed_message_ids],
                 operation_type="campaign",
                 filters_applied=filters_applied,
-                execution_time_ms=execution_time_ms
+                execution_time_ms=execution_time_ms,
+                requires_confirmation=metadata.get("requires_confirmation", False),
+                events_count=metadata.get("events_count"),
+                events_deleted=metadata.get("events_deleted", 0),
+                safety_warnings=metadata.get("safety_warnings", []),
+                batch_info=metadata.get("batch_info")
             )
             
             # Log successful operation for audit
             logger.info(
                 f"User {current_user.id} bulk deleted {deleted_count} messages "
                 f"from campaign {campaign_id} in {execution_time_ms}ms "
-                f"with filters: {filters_applied}"
+                f"with filters: {filters_applied}. Events deleted: {metadata.get('events_deleted', 0)}"
             )
             
             return response

@@ -2544,6 +2544,307 @@ Throughput	Long-running awaits tie up the event loop → fewer concurrent reques
 Scalability	Memory spike when importing large CSVs (await file.read() loads whole file in RAM).
 Task progress	/tasks/{id} endpoint often returns 404 because no task records are created.
 ...
+
+
+
+
+
+
+
+
+important for mvp:
+
+
+Inboxerr – Campaign Message Personalization & Integration Update
+1. Objective Overview
+Enforce every campaign includes message content (raw text or template) at creation.
+
+Enable dynamic, per-recipient message personalization (“merge fields”) via CSV import (e.g., {{name}}, {{order_no}}, etc.).
+
+Flow: Create Campaign (w/ message/template) → Attach contacts (with variables) → Start → Generate/send personalized Message records.
+
+2. Schema Changes (Pydantic & DB)
+CampaignCreate, CampaignCreateFromCSV:
+
+Add: message_content: Optional[str]
+
+Add: template_id: Optional[str]
+
+Enforce at least one required (via root validator).
+
+CSV Import: Accept extra columns as variables; for each contact, store variables JSON.
+
+Message Model:
+
+Add: variables: JSON column per message for per-recipient substitution.
+
+CampaignResponse:
+
+Return message_content, template_id (whichever used).
+
+DB:
+
+Migrate Campaign and Message tables as above.
+
+3. Endpoint Behavior Updates
+POST /api/v1/campaigns
+
+Accepts message_content or template_id (reject if neither).
+
+Stores accordingly.
+
+POST /api/v1/campaigns/from-csv
+
+Accept campaign data (with content or template), plus CSV with extra columns mapped as variables per row.
+
+For each recipient: create Message with correct variables.
+
+POST /api/v1/campaigns/{id}/start
+
+For each Message:
+
+If template_id: render message using stored variables JSON per recipient.
+
+If message_content: use as-is (no variables).
+
+4. Edge Cases & Validations
+Both fields provided: template takes precedence or return error.
+
+Only template_id: validate existence, ownership, and activeness.
+
+Only message_content: validate length, reject if empty.
+
+CSV upload: error if required columns (e.g., phone) missing, or variable columns don’t match template variables.
+
+5. Security & Permissions
+User can only reference their own template_id.
+
+Only owner can create/edit campaigns/messages.
+
+6. Testing & Docs
+Cover:
+
+Campaign creation failure (no content/template).
+
+Success with either.
+
+Multiple message records, correct variable mapping.
+
+Template variable substitution logic.
+
+Update API docs/OpenAPI for new fields and logic.
+
+7. Sample Flow
+Campaign create (template_id or content required).
+
+CSV upload:
+
+Phone, name, order_no columns (for example).
+
+Store:
+
+phone: "+15555555555"
+
+variables: { "name": "Bob", "order_no": "12345" }
+
+Start campaign:
+
+For each message, render template with per-recipient variables, send.
+
+Inboxerr – Campaign Message Personalization & Integration Update
+1. Objective Overview
+Enforce every campaign includes message content (raw text or template) at creation.
+
+Enable dynamic, per-recipient message personalization (“merge fields”) via CSV import (e.g., {{name}}, {{order_no}}, etc.).
+
+Flow: Create Campaign (w/ message/template) → Attach contacts (with variables) → Start → Generate/send personalized Message records.
+
+2. Schema Changes (Pydantic & DB)
+CampaignCreate, CampaignCreateFromCSV:
+
+Add: message_content: Optional[str]
+
+Add: template_id: Optional[str]
+
+Enforce at least one required (via root validator).
+
+CSV Import: Accept extra columns as variables; for each contact, store variables JSON.
+
+Message Model:
+
+Add: variables: JSON column per message for per-recipient substitution.
+
+CampaignResponse:
+
+Return message_content, template_id (whichever used).
+
+DB:
+
+Migrate Campaign and Message tables as above.
+
+3. Endpoint Behavior Updates
+POST /api/v1/campaigns
+
+Accepts message_content or template_id (reject if neither).
+
+Stores accordingly.
+
+POST /api/v1/campaigns/from-csv
+
+Accept campaign data (with content or template), plus CSV with extra columns mapped as variables per row.
+
+For each recipient: create Message with correct variables.
+
+POST /api/v1/campaigns/{id}/start
+
+For each Message:
+
+If template_id: render message using stored variables JSON per recipient.
+
+If message_content: use as-is (no variables).
+
+4. Edge Cases & Validations
+Both fields provided: template takes precedence or return error.
+
+Only template_id: validate existence, ownership, and activeness.
+
+Only message_content: validate length, reject if empty.
+
+CSV upload: error if required columns (e.g., phone) missing, or variable columns don’t match template variables.
+
+5. Security & Permissions
+User can only reference their own template_id.
+
+Only owner can create/edit campaigns/messages.
+
+6. Testing & Docs
+Cover:
+
+Campaign creation failure (no content/template).
+
+Success with either.
+
+Multiple message records, correct variable mapping.
+
+Template variable substitution logic.
+
+Update API docs/OpenAPI for new fields and logic.
+
+7. Sample Flow
+Campaign create (template_id or content required).
+
+CSV upload:
+
+Phone, name, order_no columns (for example).
+
+Store:
+
+phone: "+15555555555"
+
+variables: { "name": "Bob", "order_no": "12345" }
+
+Start campaign:
+
+For each message, render template with per-recipient variables, send.
+
+
+
+
+
+------------CSSVV-------
+
+
+CSV → Contacts → Queued Messages — Backend Architecture Specification (FINAL)
+(Share this with the backend team; it contains every decision agreed so far, including the library pick.)
+
+1 — Objectives
+Goal	Success Metric
+MVP CSV upload	100 k-row file parses & queues in < 3 min on a single mid-tier VM
+Zero RAM spikes	RSS remains < 300 MB during import
+No raw-file retention	Temp file deleted immediately after parse; only SHA-256 stored
+Future-proof queue layer	Parsing & dispatch logic unchanged when moving from in-process tasks to Celery/RQ
+
+2 — End-to-End Flow
+POST /imports/csv
+Streams file to /tmp/{import_id}.csv, computes SHA-256, creates import_jobs row (status=processing), returns 202.
+
+BackgroundTasks schedules process_csv(import_id, path) immediately.
+
+Parser (process_csv)
+Reads with csv.DictReader, validates, bulk-inserts Contacts every 1 000 rows, updates counters.
+
+Deletes temp file, updates import_jobs → status=success | error.
+
+Campaign creation accepts import_id; a single INSERT … SELECT pre-creates Message rows (status=queued).
+
+Dispatcher loop (async task in app-lifespan) dequeues 50 queued messages at a time using FOR UPDATE SKIP LOCKED, calls sms_sender, updates status, repeats.
+
+(Later Celery/RQ upgrade: only the runner that invokes process_csv and the dispatcher registration change; the inner logic stays identical.)
+
+3 — Data Model Additions
+Table	Key Columns	Notes
+import_jobs	id UUID, filename, sha256, `status enum(processing	success
+contacts	id UUID, import_id FK, phone, name, tags[], created_at; unique (import_id, phone)	
+(optional Phase-2) campaign_batches	id UUID, campaign_id FK, range_start, range_end, status	
+
+messages already exists; add an optional import_id FK for lineage.
+
+4 — API Surface
+Method	Path	Description
+POST	/api/v1/imports/csv	Multipart CSV upload → {import_id} & 202
+GET	/api/v1/imports/{id}	Progress (status, row counts, sha256)
+GET	/api/v1/imports/{id}/contacts	Paginated preview (first 100 rows)
+POST	/api/v1/campaigns	Existing payload + import_id (alternative to contact list)
+
+5 — Responsibilities & File Map
+Component	File (suggested)	Notes
+Upload handler	app/api/v1/endpoints/imports.py	Streams, hashes, enqueues parser
+Parser	app/services/imports/parser.py	Validates rows, bulk inserts, deletes temp file
+ImportJob model	app/models/import_job.py	Enum ImportStatus shared in constants
+Dispatcher loop	app/services/sms/dispatcher.py	Async loop, FOR UPDATE SKIP LOCKED, asyncio.Semaphore
+Alembic migration	alembic/versions/<ts>_add_import_tables.py	Adds tables & FKs
+
+6 — Library Decision (MVP)
+Library	Pros	Cons	Decision
+Std-lib csv.DictReader	Zero new deps, true streaming, constant memory, parses 100 k rows ≈ 2 s	Pure-Python (slower for > 1 M rows)	✅ Use now
+pandas read_csv(chunksize)	Fast C engine, familiar API	Heavy wheel (~35 MB), higher RAM, unnecessary for current scale	Park for analytics phase
+Polars Arrow read_csv(streaming)	Extremely fast, out-of-core	New binary dep, team unfamiliar	Evaluate in Phase-2 (millions of rows)
+
+→ Implement parser with csv.DictReader; swapping to Pandas/Polars later is a one-liner.
+
+7 — Scaling & Switch-over Plan
+Stage	Trigger	Action
+Phase 0 — BackgroundTasks	Works to ~200 k rows/day on one VM	Monitor p95 latency, CPU
+Phase 1 — Celery/RQ	p95 > 5 min or CPU > 75 % sustained	Add Redis/Rabbit, 2-4 worker containers
+Phase 2 — Horizontal scale	> 1 M rows/day	Partition messages, adopt campaign_batches, more workers
+
+8 — Security & Compliance
+Raw CSV deleted post-parse; only SHA-256 retained.
+
+/tmp mounted with noexec,nosuid; daily cron cleans orphan files.
+
+Future audit need → stream to S3 instead of /tmp (30-day lifecycle), same parser.
+
+9 — Engineering Task List
+DB migrations — import_jobs, contacts, add import_id FK to messages.
+
+Add ImportStatus enum in shared constants.
+
+Implement upload endpoint with streaming + SHA-256.
+
+Build parser service with bulk inserts (1 000 rows/commit) and file deletion.
+
+Extend campaign creation to accept import_id and pre-create queued messages.
+
+Implement dispatcher loop with FOR UPDATE SKIP LOCKED, asyncio.Semaphore.
+
+Unit & load tests:
+
+100 k-row synthetic CSV completes < 3 min.
+
+Dispatcher sends 10 k messages, no duplicates/deadlocks.
+
+Add Prometheus counters: import_rows_processed_total, messages_sent_total, dispatcher_loop_duration_seconds.
 </file>
 
 <file path="scripts/generate_migration.py">
@@ -6972,456 +7273,6 @@ async def validate_permissions(
         raise AuthorizationError("Insufficient permissions")
 </file>
 
-<file path="app/api/v1/endpoints/messages.py">
-"""
-API endpoints for SMS message management.
-"""
-import csv
-import io
-from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, UploadFile, File, Query, Path, status
-import logging
-
-
-from app.api.v1.dependencies import get_current_user, get_rate_limiter, verify_api_key
-from app.core.exceptions import ValidationError, SMSGatewayError, NotFoundError
-from app.schemas.message import (
-    MessageCreate,
-    MessageResponse, 
-    BatchMessageRequest, 
-    BatchMessageResponse,
-    MessageStatus,
-    MessageStatusUpdate,
-    GlobalBulkDeleteRequest,
-    BulkDeleteResponse
-)
-from app.services.sms.sender import get_sms_sender
-from app.schemas.user import User
-from app.utils.pagination import PaginationParams, paginate_response
-from app.utils.pagination import PaginatedResponse
-from app.db.session import get_repository_context
-
-router = APIRouter()
-logger = logging.getLogger("inboxerr.endpoint")
-
-
-@router.post("/send", response_model=MessageResponse, status_code=202)
-async def send_message(
-    message: MessageCreate,
-    background_tasks: BackgroundTasks,
-    current_user: User = Depends(get_current_user),
-    sms_sender = Depends(get_sms_sender),
-    rate_limiter = Depends(get_rate_limiter),
-):
-    """
-    Send a single SMS message.
-    
-    - **phone_number**: Recipient phone number in E.164 format (e.g., +1234567890)
-    - **message**: Content of the SMS message
-    - **scheduled_at**: Optional timestamp to schedule the message for future delivery
-    """
-    # Check rate limits
-    await rate_limiter.check_rate_limit(current_user.id, "send_message")
-    
-    try:
-        # Send message asynchronously
-        result = await sms_sender.send_message(
-            phone_number=message.phone_number,
-            message_text=message.message,
-            user_id=current_user.id,
-            scheduled_at=message.scheduled_at,
-            custom_id=message.custom_id,
-        )
-        
-        return result
-        
-    except ValidationError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    except SMSGatewayError as e:
-        raise HTTPException(status_code=502, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error sending message: {str(e)}")
-
-
-@router.post("/batch", response_model=BatchMessageResponse, status_code=202)
-async def send_batch(
-    batch: BatchMessageRequest,
-    background_tasks: BackgroundTasks,
-    current_user: User = Depends(get_current_user),
-    sms_sender = Depends(get_sms_sender),
-    rate_limiter = Depends(get_rate_limiter),
-):
-    """
-    Send a batch of SMS messages.
-    
-    - **messages**: List of messages to send
-    - **options**: Optional batch processing options
-    """
-    # Check rate limits - higher limit for batch operations
-    await rate_limiter.check_rate_limit(current_user.id, "send_batch")
-    
-    if not batch.messages:
-        raise ValidationError(message="Batch contains no messages")
-    
-    try:
-        # Process batch asynchronously
-        result = await sms_sender.send_batch(
-            messages=batch.messages,
-            user_id=current_user.id,
-            options=batch.options,
-        )
-        
-        return result
-        
-    except ValidationError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    except SMSGatewayError as e:
-        raise HTTPException(status_code=502, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing batch: {str(e)}")
-
-
-@router.post("/import", status_code=202)
-async def import_messages(
-    file: UploadFile = File(...),
-    message_template: str = Query(..., description="Message template to send"),
-    delimiter: str = Query(",", description="CSV delimiter"),
-    has_header: bool = Query(True, description="Whether CSV has a header row"),
-    phone_column: str = Query("phone", description="Column name containing phone numbers"),
-    background_tasks: BackgroundTasks = None,
-    current_user: User = Depends(get_current_user),
-    sms_sender = Depends(get_sms_sender),
-    rate_limiter = Depends(get_rate_limiter),
-):
-    """
-    Import phone numbers from CSV and send messages.
-    
-    - **file**: CSV file with phone numbers
-    - **message_template**: Template for the message to send
-    - **delimiter**: CSV delimiter character
-    - **has_header**: Whether the CSV has a header row
-    - **phone_column**: Column name containing phone numbers (if has_header=True)
-    """
-    # Check rate limits
-    await rate_limiter.check_rate_limit(current_user.id, "import_messages")
-    
-    try:
-        # Read CSV file
-        contents = await file.read()
-        csv_file = io.StringIO(contents.decode('utf-8'))
-        
-        # Parse CSV
-        csv_reader = csv.reader(csv_file, delimiter=delimiter)
-        
-        # Skip header if present
-        if has_header:
-            header = next(csv_reader)
-            try:
-                phone_index = header.index(phone_column)
-            except ValueError:
-                raise ValidationError(
-                    message=f"Column '{phone_column}' not found in CSV header",
-                    details={"available_columns": header}
-                )
-        else:
-            phone_index = 0  # Assume first column has phone numbers
-        
-        # Extract phone numbers
-        phone_numbers = []
-        for row in csv_reader:
-            if row and len(row) > phone_index:
-                phone = row[phone_index].strip()
-                if phone:
-                    phone_numbers.append(phone)
-        
-        if not phone_numbers:
-            raise ValidationError(message="No valid phone numbers found in CSV")
-        
-        # Process in background
-        task_id = await sms_sender.schedule_batch_from_numbers(
-            phone_numbers=phone_numbers,
-            message_text=message_template,
-            user_id=current_user.id,
-        )
-        
-        return {
-            "status": "accepted",
-            "message": f"Processing {len(phone_numbers)} messages",
-            "task_id": task_id,
-        }
-        
-    except ValidationError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error importing messages: {str(e)}")
-
-
-@router.get("/{message_id}", response_model=MessageResponse)
-async def get_message(
-    message_id: str = Path(..., description="Message ID"),
-    current_user: User = Depends(get_current_user),
-    sms_sender = Depends(get_sms_sender),
-):
-    """
-    Get details of a specific message.
-    """
-    try:
-        message = await sms_sender.get_message(message_id, user_id=current_user.id)
-        if not message:
-            raise NotFoundError(message=f"Message {message_id} not found")
-        return message
-    except NotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error retrieving message: {str(e)}")
-
-
-@router.get("/", response_model=PaginatedResponse[MessageResponse])
-async def list_messages(
-    pagination: PaginationParams = Depends(),
-    status: Optional[str] = Query(None, description="Filter by message status"),
-    phone_number: Optional[str] = Query(None, description="Filter by phone number"),
-    from_date: Optional[str] = Query(None, description="Filter from date (ISO format)"),
-    to_date: Optional[str] = Query(None, description="Filter to date (ISO format)"),
-    current_user: User = Depends(get_current_user),
-    sms_sender = Depends(get_sms_sender),
-):
-    """
-    List messages with optional filtering.
-    
-    Returns a paginated list of messages for the current user.
-    """
-    try:
-        filters = {
-            "status": status,
-            "phone_number": phone_number,
-            "from_date": from_date,
-            "to_date": to_date,
-            "user_id": current_user.id
-        }
-        
-        # Get messages with pagination
-        messages, total = await sms_sender.list_messages(
-            filters=filters,
-            skip=pagination.skip,
-            limit=pagination.limit
-        )
-        
-        # Return paginated response
-        return paginate_response(
-            items=messages,
-            total=total,
-            pagination=pagination
-        )
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error listing messages: {str(e)}")
-
-
-@router.put("/{message_id}/status", response_model=MessageResponse)
-async def update_message_status(
-    status_update: MessageStatusUpdate,
-    message_id: str = Path(..., description="Message ID"),
-    current_user: User = Depends(get_current_user),
-    sms_sender = Depends(get_sms_sender),
-):
-    """
-    Update the status of a message.
-    
-    This is primarily for administrative purposes or handling external status updates.
-    """
-    try:
-        # Verify the user has permission to update this message
-        message = await sms_sender.get_message(message_id, user_id=current_user.id)
-        if not message:
-            raise NotFoundError(message=f"Message {message_id} not found")
-        
-        # Update the status
-        updated_message = await sms_sender.update_message_status(
-            message_id=message_id,
-            status=status_update.status,
-            reason=status_update.reason,
-            user_id=current_user.id
-        )
-        
-        return updated_message
-        
-    except NotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except ValidationError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error updating message status: {str(e)}")
-
-
-@router.delete("/{message_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_message(
-    message_id: str = Path(..., description="Message ID"),
-    current_user: User = Depends(get_current_user),
-    sms_sender = Depends(get_sms_sender),
-):
-    """
-    Delete a message.
-    
-    This will only remove it from the database, but cannot recall messages already sent.
-    """
-    try:
-        # Verify the message exists and belongs to the user
-        message = await sms_sender.get_message(message_id, user_id=current_user.id)
-        if not message:
-            raise NotFoundError(message=f"Message {message_id} not found")
-        
-        # Delete the message
-        success = await sms_sender.delete_message(message_id, user_id=current_user.id)
-        if not success:
-            raise HTTPException(status_code=500, detail="Failed to delete message")
-        
-        return None  # No content response
-        
-    except NotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error deleting message: {str(e)}")
-
-
-@router.get("/tasks/{task_id}", response_model=dict)
-async def get_task_status(
-    task_id: str = Path(..., description="Task ID"),
-    current_user: User = Depends(get_current_user),
-    sms_sender = Depends(get_sms_sender),
-):
-    """
-    Check the status of a background task.
-    
-    Used for tracking progress of batch operations and imports.
-    """
-    try:
-        task_status = await sms_sender.get_task_status(task_id, user_id=current_user.id)
-        if not task_status:
-            raise NotFoundError(message=f"Task {task_id} not found")
-        
-        return task_status
-        
-    except NotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error retrieving task status: {str(e)}")
-    
-
-@router.delete("/bulk", response_model=BulkDeleteResponse)
-async def bulk_delete_messages(
-    request: GlobalBulkDeleteRequest,
-    current_user: User = Depends(get_current_user),
-    rate_limiter = Depends(get_rate_limiter),
-):
-    """
-    Global bulk delete messages by message IDs.
-    
-    This endpoint efficiently deletes multiple messages by their specific IDs across
-    campaigns or for orphaned message cleanup. Designed for edge cases, power user
-    operations, and system maintenance tasks.
-    
-    **Safety Features:**
-    - User authorization (can only delete own messages)
-    - Smaller batch limits (1K vs 10K for campaign-scoped)
-    - Optional campaign context validation
-    - Detailed failure reporting for partial operations
-    - Comprehensive audit logging
-    
-    **Use Cases:**
-    - Cross-campaign message cleanup by power users
-    - Frontend multi-select bulk operations
-    - Orphaned message removal during maintenance
-    - Compliance-driven deletion by specific message IDs
-    - System administration tasks
-    
-    **Performance:**
-    - Handles up to 1K message deletions efficiently
-    - Uses optimized IN clause with PostgreSQL
-    - Smaller batches for safety vs campaign operations
-    
-    Args:
-        request: Global bulk delete request with message IDs and confirmation
-        current_user: Authenticated user (injected by dependency)
-        rate_limiter: Rate limiting for bulk operations (injected by dependency)
-    
-    Returns:
-        BulkDeleteResponse: Detailed results including failed message IDs
-        
-    Raises:
-        HTTPException 400: Invalid request or confirmation missing
-        HTTPException 403: User not authorized for specified messages
-        HTTPException 429: Rate limit exceeded
-        HTTPException 500: Database or internal server error
-    """
-    import time
-    
-    # Check rate limits for global bulk operations
-    await rate_limiter.check_rate_limit(current_user.id, "bulk_delete_global")
-    
-    start_time = time.time()
-    
-    try:
-        # Use repository context for proper connection management
-        from app.db.repositories.messages import MessageRepository
-        
-        # Perform global bulk deletion
-        async with get_repository_context(MessageRepository) as message_repo:
-            # Execute bulk deletion
-            deleted_count, failed_message_ids = await message_repo.bulk_delete_messages(
-                message_ids=request.message_ids,
-                user_id=current_user.id,
-                campaign_id=request.campaign_id
-            )
-            
-            # Calculate execution time
-            execution_time_ms = int((time.time() - start_time) * 1000)
-            
-            # Build applied filters for audit trail
-            filters_applied = {
-                "message_count": len(request.message_ids),
-                "unique_messages": len(set(request.message_ids))
-            }
-            if request.campaign_id:
-                filters_applied["campaign_context"] = request.campaign_id
-            
-            # Build detailed error messages for failed deletions
-            error_messages = []
-            if failed_message_ids:
-                error_messages = [
-                    f"Failed to delete message: {msg_id} (not found or not owned by user)" 
-                    for msg_id in failed_message_ids
-                ]
-            
-            # Build response
-            response = BulkDeleteResponse(
-                deleted_count=deleted_count,
-                campaign_id=request.campaign_id,
-                failed_count=len(failed_message_ids),
-                errors=error_messages,
-                operation_type="global",
-                filters_applied=filters_applied,
-                execution_time_ms=execution_time_ms
-            )
-            
-            # Log successful operation for audit
-            logger.info(
-                f"User {current_user.id} performed global bulk delete of {deleted_count} messages "
-                f"in {execution_time_ms}ms. Failed: {len(failed_message_ids)}. "
-                f"Campaign context: {request.campaign_id}"
-            )
-            
-            return response
-            
-    except Exception as e:
-        # Log error and return generic error message
-        logger.error(f"Error in global bulk_delete_messages: {e}")
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Error performing global bulk deletion: {str(e)}"
-        )
-</file>
-
 <file path="app/api/v1/endpoints/webhooks.py">
 # app/api/v1/endpoints/webhooks.py
 """
@@ -9457,620 +9308,485 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 This project is licensed under the MIT License - see the LICENSE file for details.
 </file>
 
-<file path="app/api/v1/endpoints/campaigns.py">
-# app/api/v1/endpoints/campaigns.py
+<file path="app/api/v1/endpoints/messages.py">
+"""
+API endpoints for SMS message management.
+"""
 import csv
 import io
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, UploadFile, File, Query, Path, status
-from fastapi.responses import JSONResponse
 import logging
 
-from app.api.v1.dependencies import get_current_user, get_rate_limiter
-from app.core.exceptions import ValidationError, NotFoundError
-from app.schemas.campaign import (
-    CampaignCreate,
-    CampaignCreateFromCSV,
-    CampaignUpdate,
-    CampaignResponse,
-    CampaignStatus,
+
+from app.api.v1.dependencies import get_current_user, get_rate_limiter, verify_api_key
+from app.core.exceptions import ValidationError, SMSGatewayError, NotFoundError
+from app.schemas.message import (
+    MessageCreate,
+    MessageResponse, 
+    BatchMessageRequest, 
+    BatchMessageResponse,
+    MessageStatus,
+    MessageStatusUpdate,
+    GlobalBulkDeleteRequest,
+    BulkDeleteResponse
 )
+from app.services.sms.sender import get_sms_sender
 from app.schemas.user import User
-from app.schemas.message import MessageResponse, CampaignBulkDeleteRequest, BulkDeleteResponse
-from app.utils.pagination import PaginationParams, paginate_response, PaginatedResponse, PageInfo
-from app.services.campaigns.processor import get_campaign_processor
+from app.utils.pagination import PaginationParams, paginate_response
+from app.utils.pagination import PaginatedResponse
 from app.db.session import get_repository_context
 
 router = APIRouter()
 logger = logging.getLogger("inboxerr.endpoint")
 
+# ===========================
+# COLLECTION OPERATIONS
+# ===========================
 
-
-@router.post("/", response_model=CampaignResponse, status_code=status.HTTP_201_CREATED)
-async def create_campaign(
-    campaign: CampaignCreate,
+@router.get("/", response_model=PaginatedResponse[MessageResponse])
+async def list_messages(
+    pagination: PaginationParams = Depends(),
+    status: Optional[str] = Query(None, description="Filter by message status"),
+    phone_number: Optional[str] = Query(None, description="Filter by phone number"),
+    from_date: Optional[str] = Query(None, description="Filter from date (ISO format)"),
+    to_date: Optional[str] = Query(None, description="Filter to date (ISO format)"),
     current_user: User = Depends(get_current_user),
+    sms_sender = Depends(get_sms_sender),
+):
+    """
+    List messages with optional filtering.
+    
+    Returns a paginated list of messages for the current user.
+    """
+    try:
+        filters = {
+            "status": status,
+            "phone_number": phone_number,
+            "from_date": from_date,
+            "to_date": to_date,
+            "user_id": current_user.id
+        }
+        
+        # Get messages with pagination
+        messages, total = await sms_sender.list_messages(
+            filters=filters,
+            skip=pagination.skip,
+            limit=pagination.limit
+        )
+        
+        # Return paginated response
+        return paginate_response(
+            items=messages,
+            total=total,
+            pagination=pagination
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error listing messages: {str(e)}")
+
+@router.post("/send", response_model=MessageResponse, status_code=202)
+async def send_message(
+    message: MessageCreate,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    sms_sender = Depends(get_sms_sender),
     rate_limiter = Depends(get_rate_limiter),
 ):
     """
-    Create a new campaign.
+    Send a single SMS message.
     
-    This creates a campaign in draft status. Messages can be added later.
+    - **phone_number**: Recipient phone number in E.164 format (e.g., +1234567890)
+    - **message**: Content of the SMS message
+    - **scheduled_at**: Optional timestamp to schedule the message for future delivery
     """
     # Check rate limits
-    await rate_limiter.check_rate_limit(current_user.id, "create_campaign")
+    await rate_limiter.check_rate_limit(current_user.id, "send_message")
     
     try:
-        # Use repository context for proper connection management
-        from app.db.repositories.campaigns import CampaignRepository
+        # Send message asynchronously
+        result = await sms_sender.send_message(
+            phone_number=message.phone_number,
+            message_text=message.message,
+            user_id=current_user.id,
+            scheduled_at=message.scheduled_at,
+            custom_id=message.custom_id,
+        )
         
-        async with get_repository_context(CampaignRepository) as campaign_repo:
-            # Create campaign
-            result = await campaign_repo.create_campaign(
-                name=campaign.name,
-                description=campaign.description,
-                user_id=current_user.id,
-                scheduled_start_at=campaign.scheduled_start_at,
-                scheduled_end_at=campaign.scheduled_end_at,
-                settings=campaign.settings
-            )
-            
-            return result
+        return result
         
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except SMSGatewayError as e:
+        raise HTTPException(status_code=502, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error creating campaign: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error sending message: {str(e)}")
 
 
-@router.post("/from-csv", response_model=CampaignResponse, status_code=status.HTTP_201_CREATED)
-async def create_campaign_from_csv(
+@router.post("/batch", response_model=BatchMessageResponse, status_code=202)
+async def send_batch(
+    batch: BatchMessageRequest,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    sms_sender = Depends(get_sms_sender),
+    rate_limiter = Depends(get_rate_limiter),
+):
+    """
+    Send a batch of SMS messages.
+    
+    - **messages**: List of messages to send
+    - **options**: Optional batch processing options
+    """
+    # Check rate limits - higher limit for batch operations
+    await rate_limiter.check_rate_limit(current_user.id, "send_batch")
+    
+    if not batch.messages:
+        raise ValidationError(message="Batch contains no messages")
+    
+    try:
+        # Process batch asynchronously
+        result = await sms_sender.send_batch(
+            messages=batch.messages,
+            user_id=current_user.id,
+            options=batch.options,
+        )
+        
+        return result
+        
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except SMSGatewayError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing batch: {str(e)}")
+
+
+@router.post("/import", status_code=202)
+async def import_messages(
     file: UploadFile = File(...),
-    campaign_data: str = Query(..., description="Campaign data as JSON string"),
+    message_template: str = Query(..., description="Message template to send"),
     delimiter: str = Query(",", description="CSV delimiter"),
     has_header: bool = Query(True, description="Whether CSV has a header row"),
     phone_column: str = Query("phone", description="Column name containing phone numbers"),
+    background_tasks: BackgroundTasks = None,
     current_user: User = Depends(get_current_user),
+    sms_sender = Depends(get_sms_sender),
     rate_limiter = Depends(get_rate_limiter),
 ):
     """
-    Create a campaign and add phone numbers from CSV.
+    Import phone numbers from CSV and send messages.
     
-    This creates a campaign and immediately adds all phone numbers from the CSV.
-    The campaign will remain in draft status until explicitly started.
+    - **file**: CSV file with phone numbers
+    - **message_template**: Template for the message to send
+    - **delimiter**: CSV delimiter character
+    - **has_header**: Whether the CSV has a header row
+    - **phone_column**: Column name containing phone numbers (if has_header=True)
     """
-    import json
-    
     # Check rate limits
-    await rate_limiter.check_rate_limit(current_user.id, "create_campaign")
+    await rate_limiter.check_rate_limit(current_user.id, "import_messages")
     
     try:
-        # Parse campaign data
-        campaign_dict = json.loads(campaign_data)
-        campaign_data = CampaignCreateFromCSV(**campaign_dict)
+        # Read CSV file
+        contents = await file.read()
+        csv_file = io.StringIO(contents.decode('utf-8'))
         
-        # Use repository context for proper connection management
-        from app.db.repositories.campaigns import CampaignRepository
+        # Parse CSV
+        csv_reader = csv.reader(csv_file, delimiter=delimiter)
         
-        async with get_repository_context(CampaignRepository) as campaign_repo:
-            # Create campaign
-            campaign = await campaign_repo.create_campaign(
-                name=campaign_data.name,
-                description=campaign_data.description,
-                user_id=current_user.id,
-                scheduled_start_at=campaign_data.scheduled_start_at,
-                scheduled_end_at=campaign_data.scheduled_end_at,
-                settings=campaign_data.settings
-            )
-            
-            # Read CSV file
-            contents = await file.read()
-            csv_file = io.StringIO(contents.decode('utf-8'))
-            
-            # Parse CSV
-            csv_reader = csv.reader(csv_file, delimiter=delimiter)
-            
-            # Skip header if present
-            if has_header:
-                header = next(csv_reader)
-                try:
-                    phone_index = header.index(phone_column)
-                except ValueError:
-                    raise ValidationError(
-                        message=f"Column '{phone_column}' not found in CSV header",
-                        details={"available_columns": header}
-                    )
-            else:
-                phone_index = 0  # Assume first column has phone numbers
-            
-            # Extract phone numbers
-            phone_numbers = []
-            for row in csv_reader:
-                if row and len(row) > phone_index:
-                    phone = row[phone_index].strip()
-                    if phone:
-                        phone_numbers.append(phone)
-            
-            if not phone_numbers:
-                raise ValidationError(message="No valid phone numbers found in CSV")
-            
-            # Add phone numbers to campaign
-            added_count = await campaign_repo.add_messages_to_campaign(
-                campaign_id=campaign.id,
-                phone_numbers=phone_numbers,
-                message_text=campaign_data.message_template,
-                user_id=current_user.id
-            )
-            
-            # Refresh campaign
-            campaign = await campaign_repo.get_by_id(campaign.id)
-            
-            return campaign
+        # Skip header if present
+        if has_header:
+            header = next(csv_reader)
+            try:
+                phone_index = header.index(phone_column)
+            except ValueError:
+                raise ValidationError(
+                    message=f"Column '{phone_column}' not found in CSV header",
+                    details={"available_columns": header}
+                )
+        else:
+            phone_index = 0  # Assume first column has phone numbers
         
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Invalid campaign data JSON")
+        # Extract phone numbers
+        phone_numbers = []
+        for row in csv_reader:
+            if row and len(row) > phone_index:
+                phone = row[phone_index].strip()
+                if phone:
+                    phone_numbers.append(phone)
+        
+        if not phone_numbers:
+            raise ValidationError(message="No valid phone numbers found in CSV")
+        
+        # Process in background
+        task_id = await sms_sender.schedule_batch_from_numbers(
+            phone_numbers=phone_numbers,
+            message_text=message_template,
+            user_id=current_user.id,
+        )
+        
+        return {
+            "status": "accepted",
+            "message": f"Processing {len(phone_numbers)} messages",
+            "task_id": task_id,
+        }
+        
     except ValidationError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error creating campaign: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error importing messages: {str(e)}")
 
 
-@router.get("/", response_model=PaginatedResponse[CampaignResponse])
-async def list_campaigns(
-    pagination: PaginationParams = Depends(),
-    status: Optional[str] = Query(None, description="Filter by campaign status"),
-    current_user: User = Depends(get_current_user),
-):
-    """
-    List campaigns for the current user.
-    
-    Returns a paginated list of campaigns.
-    """
-    try:
-        # Use repository context for proper connection management
-        from app.db.repositories.campaigns import CampaignRepository
-        
-        async with get_repository_context(CampaignRepository) as campaign_repo:
-            # Get campaigns with pagination
-            campaigns, total = await campaign_repo.get_campaigns_for_user(
-                user_id=current_user.id,
-                status=status,
-                skip=pagination.skip,
-                limit=pagination.limit
-            )
-            
-            # Calculate pagination info
-            total_pages = (total + pagination.limit - 1) // pagination.limit
-            
-            # Return paginated response
-            return paginate_response(campaigns, total, pagination)
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error listing campaigns: {str(e)}")
-
-
-@router.get("/{campaign_id}", response_model=CampaignResponse)
-async def get_campaign(
-   campaign_id: str = Path(..., description="Campaign ID"),
-   current_user: User = Depends(get_current_user),
-):
-   """
-   Get details of a specific campaign.
-   """
-   try:
-       from app.db.repositories.campaigns import CampaignRepository
-       
-       async with get_repository_context(CampaignRepository) as campaign_repo:
-           # Get campaign
-           campaign = await campaign_repo.get_by_id(campaign_id)
-           if not campaign:
-               raise NotFoundError(message=f"Campaign {campaign_id} not found")
-           
-           # Check authorization
-           if campaign.user_id != current_user.id:
-               raise HTTPException(status_code=403, detail="Not authorized to access this campaign")
-           
-           return campaign
-       
-   except NotFoundError as e:
-       raise HTTPException(status_code=404, detail=str(e))
-   except Exception as e:
-       raise HTTPException(status_code=500, detail=f"Error retrieving campaign: {str(e)}")
-
-
-@router.put("/{campaign_id}", response_model=CampaignResponse)
-async def update_campaign(
-   campaign_update: CampaignUpdate,
-   campaign_id: str = Path(..., description="Campaign ID"),
-   current_user: User = Depends(get_current_user),
-):
-   """
-   Update campaign details.
-   
-   Only draft campaigns can be fully updated. Active campaigns can only have their description updated.
-   """
-   try:
-       from app.db.repositories.campaigns import CampaignRepository
-       
-       async with get_repository_context(CampaignRepository) as campaign_repo:
-           # Get campaign
-           campaign = await campaign_repo.get_by_id(campaign_id)
-           if not campaign:
-               raise NotFoundError(message=f"Campaign {campaign_id} not found")
-           
-           # Check authorization
-           if campaign.user_id != current_user.id:
-               raise HTTPException(status_code=403, detail="Not authorized to update this campaign")
-           
-           # Check if campaign can be updated
-           if campaign.status != "draft" and any([
-               campaign_update.scheduled_start_at is not None,
-               campaign_update.scheduled_end_at is not None,
-               campaign_update.name is not None
-           ]):
-               raise HTTPException(
-                   status_code=400, 
-                   detail="Only draft campaigns can have name or schedule updated"
-               )
-           
-           # Convert to dict and remove None values
-           update_data = {k: v for k, v in campaign_update.dict().items() if v is not None}
-           
-           # Update campaign
-           updated = await campaign_repo.update(id=campaign_id, obj_in=update_data)
-           if not updated:
-               raise HTTPException(status_code=500, detail="Failed to update campaign")
-           
-           return updated
-       
-   except NotFoundError as e:
-       raise HTTPException(status_code=404, detail=str(e))
-   except Exception as e:
-       raise HTTPException(status_code=500, detail=f"Error updating campaign: {str(e)}")
-
-
-@router.post("/{campaign_id}/start", response_model=CampaignResponse)
-async def start_campaign(
-   campaign_id: str = Path(..., description="Campaign ID"),
-   current_user: User = Depends(get_current_user),
-   campaign_processor = Depends(get_campaign_processor),
-):
-   """
-   Start a campaign.
-   
-   This will change the campaign status to active and begin sending messages.
-   """
-   try:
-       # Start campaign - campaign_processor already uses context managers internally
-       success = await campaign_processor.start_campaign(
-           campaign_id=campaign_id,
-           user_id=current_user.id
-       )
-       
-       if not success:
-           raise HTTPException(status_code=400, detail="Failed to start campaign")
-       
-       # Get updated campaign - use context manager for this separate operation
-       from app.db.repositories.campaigns import CampaignRepository
-       
-       async with get_repository_context(CampaignRepository) as campaign_repo:
-           campaign = await campaign_repo.get_by_id(campaign_id)
-           return campaign
-       
-   except Exception as e:
-       raise HTTPException(status_code=500, detail=f"Error starting campaign: {str(e)}")
-
-
-@router.post("/{campaign_id}/pause", response_model=CampaignResponse)
-async def pause_campaign(
-   campaign_id: str = Path(..., description="Campaign ID"),
-   current_user: User = Depends(get_current_user),
-   campaign_processor = Depends(get_campaign_processor),
-):
-   """
-   Pause a campaign.
-   
-   This will change the campaign status to paused and stop sending messages.
-   The campaign can be resumed later.
-   """
-   try:
-       # Pause campaign - campaign_processor already uses context managers internally
-       success = await campaign_processor.pause_campaign(
-           campaign_id=campaign_id,
-           user_id=current_user.id
-       )
-       
-       if not success:
-           raise HTTPException(status_code=400, detail="Failed to pause campaign")
-       
-       # Get updated campaign - use context manager for this separate operation
-       from app.db.repositories.campaigns import CampaignRepository
-       
-       async with get_repository_context(CampaignRepository) as campaign_repo:
-           campaign = await campaign_repo.get_by_id(campaign_id)
-           return campaign
-       
-   except Exception as e:
-       raise HTTPException(status_code=500, detail=f"Error pausing campaign: {str(e)}")
-
-
-@router.post("/{campaign_id}/cancel", response_model=CampaignResponse)
-async def cancel_campaign(
-   campaign_id: str = Path(..., description="Campaign ID"),
-   current_user: User = Depends(get_current_user),
-   campaign_processor = Depends(get_campaign_processor),
-):
-   """
-   Cancel a campaign.
-   
-   This will change the campaign status to cancelled and stop sending messages.
-   The campaign cannot be resumed after cancellation.
-   """
-   try:
-       # Cancel campaign - campaign_processor already uses context managers internally
-       success = await campaign_processor.cancel_campaign(
-           campaign_id=campaign_id,
-           user_id=current_user.id
-       )
-       
-       if not success:
-           raise HTTPException(status_code=400, detail="Failed to cancel campaign")
-       
-       # Get updated campaign - use context manager for this separate operation
-       from app.db.repositories.campaigns import CampaignRepository
-       
-       async with get_repository_context(CampaignRepository) as campaign_repo:
-           campaign = await campaign_repo.get_by_id(campaign_id)
-           return campaign
-       
-   except Exception as e:
-       raise HTTPException(status_code=500, detail=f"Error cancelling campaign: {str(e)}")
-
-
-@router.get("/{campaign_id}/messages", response_model=PaginatedResponse[MessageResponse])
-async def get_campaign_messages(
-   campaign_id: str = Path(..., description="Campaign ID"),
-   pagination: PaginationParams = Depends(),
-   status: Optional[str] = Query(None, description="Filter by message status"),
-   current_user: User = Depends(get_current_user),
-):
-   """
-   Get messages for a campaign.
-   
-   Returns a paginated list of messages for the specified campaign.
-   """
-   try:
-       # Use repository context for proper connection management
-       from app.db.repositories.campaigns import CampaignRepository
-       from app.db.repositories.messages import MessageRepository
-       
-       # First check if campaign exists and belongs to user
-       async with get_repository_context(CampaignRepository) as campaign_repo:
-           campaign = await campaign_repo.get_by_id(campaign_id)
-           
-           if not campaign:
-               raise NotFoundError(message=f"Campaign {campaign_id} not found")
-           
-           if campaign.user_id != current_user.id:
-               raise HTTPException(status_code=403, detail="Not authorized to access this campaign")
-       
-       # Get messages for campaign - in a separate context to avoid long transactions
-       async with get_repository_context(MessageRepository) as message_repo:
-           messages, total = await message_repo.get_messages_for_campaign(
-               campaign_id=campaign_id,
-               status=status,
-               skip=pagination.skip,
-               limit=pagination.limit
-           )
-
-           # Calculate proper pagination info
-           total_pages = (total + pagination.limit - 1) // pagination.limit
-
-           # Create proper PageInfo object
-           page_info = PageInfo(
-               current_page=pagination.page,
-               total_pages=total_pages,
-               page_size=pagination.limit,
-               total_items=total,
-               has_previous=pagination.page > 1,
-               has_next=pagination.page < total_pages
-           )
-           
-           # Return PaginatedResponse object
-           return PaginatedResponse(
-               items=messages,  # Direct Message objects - FastAPI will serialize them
-               page_info=page_info
-           )
-       
-   except NotFoundError as e:
-       raise HTTPException(status_code=404, detail=str(e))
-   except Exception as e:
-       raise HTTPException(status_code=500, detail=f"Error retrieving campaign messages: {str(e)}")
-
-
-@router.delete("/{campaign_id}", status_code=204)
-async def delete_campaign(
-   campaign_id: str = Path(..., description="Campaign ID"),
-   current_user: User = Depends(get_current_user),
-):
-   """
-   Delete a campaign.
-   
-   Only draft campaigns can be deleted. Active, paused, or completed campaigns cannot be deleted.
-   """
-   try:
-       from app.db.repositories.campaigns import CampaignRepository
-       
-       async with get_repository_context(CampaignRepository) as campaign_repo:
-           # Get campaign
-           campaign = await campaign_repo.get_by_id(campaign_id)
-           if not campaign:
-               raise NotFoundError(message=f"Campaign {campaign_id} not found")
-           
-           # Check authorization
-           if campaign.user_id != current_user.id:
-               raise HTTPException(status_code=403, detail="Not authorized to delete this campaign")
-           
-           # Check if campaign can be deleted
-           if campaign.status != "draft":
-               raise HTTPException(
-                   status_code=400, 
-                   detail="Only draft campaigns can be deleted"
-               )
-           
-           # Delete campaign
-           success = await campaign_repo.delete(id=campaign_id)
-           if not success:
-               raise HTTPException(status_code=500, detail="Failed to delete campaign")
-           
-           return JSONResponse(status_code=204, content=None)
-       
-   except NotFoundError as e:
-       raise HTTPException(status_code=404, detail=str(e))
-   except Exception as e:
-       raise HTTPException(status_code=500, detail=f"Error deleting campaign: {str(e)}")
-   
-
-@router.delete("/{campaign_id}/messages/bulk", response_model=BulkDeleteResponse)
-async def bulk_delete_campaign_messages(
-    request: CampaignBulkDeleteRequest,
-    campaign_id: str = Path(..., description="Campaign ID"),
+@router.delete("/bulk", response_model=BulkDeleteResponse)
+async def bulk_delete_messages(
+    request: GlobalBulkDeleteRequest,
     current_user: User = Depends(get_current_user),
     rate_limiter = Depends(get_rate_limiter),
 ):
     """
-    Bulk delete messages from a campaign.
+    Global bulk delete messages by message IDs with event safety.
     
-    This endpoint efficiently deletes multiple messages belonging to a specific campaign
-    with optional filtering by status and date range. Designed for high-volume operations
-    handling 10K-30K messages per campaign.
+    This endpoint efficiently deletes multiple messages by their specific IDs across
+    campaigns or for orphaned message cleanup. Enhanced with delivery event safety
+    checking for edge cases, power user operations, and system maintenance tasks.
+    
+    **Event Safety Features:**
+    - Pre-deletion check for delivery events
+    - Requires explicit confirmation to delete tracking data
+    - Clear warnings about analytics data loss
+    - Two-phase deletion (events first, then messages)
     
     **Safety Features:**
-    - Campaign ownership validation
-    - User authorization checks  
-    - Active campaign protection
-    - Configurable deletion limits
+    - User authorization (can only delete own messages)
+    - Smaller batch limits (1K vs 10K for campaign-scoped)
+    - Optional campaign context validation
+    - Detailed failure reporting for partial operations
     - Comprehensive audit logging
     
-    **Performance:**
-    - Single SQL query execution
-    - Optimized for large datasets
-    - 30K deletions in 3-5 seconds
+    **Use Cases:**
+    - Cross-campaign message cleanup by power users
+    - Frontend multi-select bulk operations
+    - Orphaned message removal during maintenance
+    - Compliance-driven deletion by specific message IDs
+    - System administration tasks
     
-    **Business Use Cases:**
-    - Clean up failed messages from campaigns
-    - Remove test messages before campaign launch
-    - Compliance-driven message deletion
-    - Campaign optimization and cleanup
+    **Performance:**
+    - Handles up to 1K message deletions efficiently
+    - Uses optimized IN clause with PostgreSQL
+    - Smaller batches for safety vs campaign operations
+    - Batched processing prevents server overload
     
     Args:
-        campaign_id: ID of the campaign containing messages to delete
-        request: Bulk delete request with filters and confirmation
+        request: Global bulk delete request with message IDs, confirmation, and force options
         current_user: Authenticated user (injected by dependency)
         rate_limiter: Rate limiting for bulk operations (injected by dependency)
     
     Returns:
-        BulkDeleteResponse: Detailed results of the bulk deletion operation
+        BulkDeleteResponse: Detailed results including event safety information
         
     Raises:
-        HTTPException 400: Invalid request or campaign state
-        HTTPException 403: User not authorized for this campaign
-        HTTPException 404: Campaign not found
+        HTTPException 400: Invalid request or missing confirmation
+        HTTPException 403: User not authorized for specified messages
         HTTPException 429: Rate limit exceeded
         HTTPException 500: Database or internal server error
     """
     import time
     
-    # Check rate limits for bulk operations
-    await rate_limiter.check_rate_limit(current_user.id, "bulk_delete_campaign")
+    # Check rate limits for global bulk operations
+    await rate_limiter.check_rate_limit(current_user.id, "bulk_delete_global")
     
     start_time = time.time()
     
     try:
         # Use repository context for proper connection management
-        from app.db.repositories.campaigns import CampaignRepository
         from app.db.repositories.messages import MessageRepository
         
-        # First validate campaign exists and user has access
-        async with get_repository_context(CampaignRepository) as campaign_repo:
-            campaign = await campaign_repo.get_by_id(campaign_id)
-            
-            if not campaign:
-                raise NotFoundError(message=f"Campaign {campaign_id} not found")
-            
-            # Check authorization
-            if campaign.user_id != current_user.id:
-                raise HTTPException(
-                    status_code=403, 
-                    detail="Not authorized to delete messages from this campaign"
-                )
-            
-            # Safety check - prevent deletion from active campaigns
-            if campaign.status == "active":
-                raise HTTPException(
-                    status_code=400,
-                    detail="Cannot bulk delete messages from active campaign. Pause the campaign first."
-                )
-        
-        # Perform bulk deletion in separate context
+        # Perform global bulk deletion with event safety
         async with get_repository_context(MessageRepository) as message_repo:
-            # Convert datetime objects to ISO strings for repository method
-            from_date_str = request.from_date.isoformat() if request.from_date else None
-            to_date_str = request.to_date.isoformat() if request.to_date else None
-            
-            # Execute bulk deletion
-            deleted_count, failed_message_ids = await message_repo.bulk_delete_campaign_messages(
-                campaign_id=campaign_id,
+            # Execute bulk deletion with enhanced safety
+            deleted_count, failed_message_ids, metadata = await message_repo.bulk_delete_messages(
+                message_ids=request.message_ids,
                 user_id=current_user.id,
-                status=request.status.value if request.status else None,
-                from_date=from_date_str,
-                to_date=to_date_str,
-                limit=request.limit
+                campaign_id=request.campaign_id,
+                force_delete=request.force_delete
             )
             
             # Calculate execution time
             execution_time_ms = int((time.time() - start_time) * 1000)
             
             # Build applied filters for audit trail
-            filters_applied = {}
-            if request.status:
-                filters_applied["status"] = request.status.value
-            if request.from_date:
-                filters_applied["from_date"] = from_date_str
-            if request.to_date:
-                filters_applied["to_date"] = to_date_str
-            filters_applied["limit"] = request.limit
+            filters_applied = {
+                "message_count": len(request.message_ids),
+                "unique_messages": len(set(request.message_ids)),
+                "force_delete": request.force_delete
+            }
+            if request.campaign_id:
+                filters_applied["campaign_context"] = request.campaign_id
             
-            # Build response
+            # Build detailed error messages for failed deletions
+            error_messages = []
+            if failed_message_ids:
+                if metadata.get("requires_confirmation"):
+                    # Failed due to event safety check
+                    error_messages = metadata.get("safety_warnings", [])
+                else:
+                    # Failed due to other reasons (not found, not owned, etc.)
+                    error_messages = [
+                        f"Failed to delete message: {msg_id} (not found or not owned by user)" 
+                        for msg_id in failed_message_ids
+                    ]
+            
+            # Build response with enhanced metadata
             response = BulkDeleteResponse(
                 deleted_count=deleted_count,
-                campaign_id=campaign_id,
+                campaign_id=request.campaign_id,
                 failed_count=len(failed_message_ids),
-                errors=[f"Failed to delete message: {msg_id}" for msg_id in failed_message_ids],
-                operation_type="campaign",
+                errors=error_messages,
+                operation_type="global",
                 filters_applied=filters_applied,
-                execution_time_ms=execution_time_ms
+                execution_time_ms=execution_time_ms,
+                requires_confirmation=metadata.get("requires_confirmation", False),
+                events_count=metadata.get("events_count"),
+                events_deleted=metadata.get("events_deleted", 0),
+                safety_warnings=metadata.get("safety_warnings", []),
+                batch_info=None  # Global operations use smaller fixed batches
             )
             
             # Log successful operation for audit
             logger.info(
-                f"User {current_user.id} bulk deleted {deleted_count} messages "
-                f"from campaign {campaign_id} in {execution_time_ms}ms "
-                f"with filters: {filters_applied}"
+                f"User {current_user.id} performed global bulk delete of {deleted_count} messages "
+                f"in {execution_time_ms}ms. Failed: {len(failed_message_ids)}. "
+                f"Campaign context: {request.campaign_id}. Events deleted: {metadata.get('events_deleted', 0)}. "
+                f"Force delete: {request.force_delete}"
             )
             
             return response
             
-    except NotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except HTTPException:
-        # Re-raise HTTP exceptions as-is
-        raise
     except Exception as e:
         # Log error and return generic error message
-        logger.error(f"Error in bulk_delete_campaign_messages: {e}")
+        logger.error(f"Error in global bulk_delete_messages: {e}")
         raise HTTPException(
             status_code=500, 
-            detail=f"Error performing bulk deletion: {str(e)}"
+            detail=f"Error performing global bulk deletion: {str(e)}"
         )
+
+# ===========================
+# NESTED RESOURCES SECTION
+# ===========================
+
+@router.get("/tasks/{task_id}", response_model=dict)
+async def get_task_status(
+    task_id: str = Path(..., description="Task ID"),
+    current_user: User = Depends(get_current_user),
+    sms_sender = Depends(get_sms_sender),
+):
+    """
+    Check the status of a background task.
+    
+    Used for tracking progress of batch operations and imports.
+    """
+    try:
+        task_status = await sms_sender.get_task_status(task_id, user_id=current_user.id)
+        if not task_status:
+            raise NotFoundError(message=f"Task {task_id} not found")
+        
+        return task_status
+        
+    except NotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error retrieving task status: {str(e)}")
+    
+
+# ===========================
+# INDIVIDUAL RESOURCES (ALWAYS LAST)
+# ===========================
+
+
+@router.get("/{message_id}", response_model=MessageResponse)
+async def get_message(
+    message_id: str = Path(..., description="Message ID"),
+    current_user: User = Depends(get_current_user),
+    sms_sender = Depends(get_sms_sender),
+):
+    """
+    Get details of a specific message.
+    """
+    try:
+        message = await sms_sender.get_message(message_id, user_id=current_user.id)
+        if not message:
+            raise NotFoundError(message=f"Message {message_id} not found")
+        return message
+    except NotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error retrieving message: {str(e)}")
+
+
+
+@router.put("/{message_id}/status", response_model=MessageResponse)
+async def update_message_status(
+    status_update: MessageStatusUpdate,
+    message_id: str = Path(..., description="Message ID"),
+    current_user: User = Depends(get_current_user),
+    sms_sender = Depends(get_sms_sender),
+):
+    """
+    Update the status of a message.
+    
+    This is primarily for administrative purposes or handling external status updates.
+    """
+    try:
+        # Verify the user has permission to update this message
+        message = await sms_sender.get_message(message_id, user_id=current_user.id)
+        if not message:
+            raise NotFoundError(message=f"Message {message_id} not found")
+        
+        # Update the status
+        updated_message = await sms_sender.update_message_status(
+            message_id=message_id,
+            status=status_update.status,
+            reason=status_update.reason,
+            user_id=current_user.id
+        )
+        
+        return updated_message
+        
+    except NotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error updating message status: {str(e)}")
+
+
+@router.delete("/{message_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_message(
+    message_id: str = Path(..., description="Message ID"),
+    current_user: User = Depends(get_current_user),
+    sms_sender = Depends(get_sms_sender),
+):
+    """
+    Delete a message.
+    
+    This will only remove it from the database, but cannot recall messages already sent.
+    """
+    try:
+        # Verify the message exists and belongs to the user
+        message = await sms_sender.get_message(message_id, user_id=current_user.id)
+        if not message:
+            raise NotFoundError(message=f"Message {message_id} not found")
+        
+        # Delete the message
+        success = await sms_sender.delete_message(message_id, user_id=current_user.id)
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to delete message")
+        
+        return None  # No content response
+        
+    except NotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error deleting message: {str(e)}")
 </file>
 
 <file path="app/api/v1/endpoints/metrics.py">
@@ -11662,6 +11378,642 @@ async def db_session() -> AsyncGenerator[AsyncSession, None]:
         yield session
 </file>
 
+<file path="app/api/v1/endpoints/campaigns.py">
+# app/api/v1/endpoints/campaigns.py
+import csv
+import io
+from typing import List, Optional
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, UploadFile, File, Query, Path, status
+from fastapi.responses import JSONResponse
+import logging
+
+from app.api.v1.dependencies import get_current_user, get_rate_limiter
+from app.core.exceptions import ValidationError, NotFoundError
+from app.schemas.campaign import (
+    CampaignCreate,
+    CampaignCreateFromCSV,
+    CampaignUpdate,
+    CampaignResponse,
+    CampaignStatus,
+)
+from app.schemas.user import User
+from app.schemas.message import MessageResponse, CampaignBulkDeleteRequest, BulkDeleteResponse
+from app.utils.pagination import PaginationParams, paginate_response, PaginatedResponse, PageInfo
+from app.services.campaigns.processor import get_campaign_processor
+from app.db.session import get_repository_context
+
+router = APIRouter()
+logger = logging.getLogger("inboxerr.endpoint")
+
+
+
+@router.post("/", response_model=CampaignResponse, status_code=status.HTTP_201_CREATED)
+async def create_campaign(
+    campaign: CampaignCreate,
+    current_user: User = Depends(get_current_user),
+    rate_limiter = Depends(get_rate_limiter),
+):
+    """
+    Create a new campaign.
+    
+    This creates a campaign in draft status. Messages can be added later.
+    """
+    # Check rate limits
+    await rate_limiter.check_rate_limit(current_user.id, "create_campaign")
+    
+    try:
+        # Use repository context for proper connection management
+        from app.db.repositories.campaigns import CampaignRepository
+        
+        async with get_repository_context(CampaignRepository) as campaign_repo:
+            # Create campaign
+            result = await campaign_repo.create_campaign(
+                name=campaign.name,
+                description=campaign.description,
+                user_id=current_user.id,
+                scheduled_start_at=campaign.scheduled_start_at,
+                scheduled_end_at=campaign.scheduled_end_at,
+                settings=campaign.settings
+            )
+            
+            return result
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error creating campaign: {str(e)}")
+
+
+@router.post("/from-csv", response_model=CampaignResponse, status_code=status.HTTP_201_CREATED)
+async def create_campaign_from_csv(
+    file: UploadFile = File(...),
+    campaign_data: str = Query(..., description="Campaign data as JSON string"),
+    delimiter: str = Query(",", description="CSV delimiter"),
+    has_header: bool = Query(True, description="Whether CSV has a header row"),
+    phone_column: str = Query("phone", description="Column name containing phone numbers"),
+    current_user: User = Depends(get_current_user),
+    rate_limiter = Depends(get_rate_limiter),
+):
+    """
+    Create a campaign and add phone numbers from CSV.
+    
+    This creates a campaign and immediately adds all phone numbers from the CSV.
+    The campaign will remain in draft status until explicitly started.
+    """
+    import json
+    
+    # Check rate limits
+    await rate_limiter.check_rate_limit(current_user.id, "create_campaign")
+    
+    try:
+        # Parse campaign data
+        campaign_dict = json.loads(campaign_data)
+        campaign_data = CampaignCreateFromCSV(**campaign_dict)
+        
+        # Use repository context for proper connection management
+        from app.db.repositories.campaigns import CampaignRepository
+        
+        async with get_repository_context(CampaignRepository) as campaign_repo:
+            # Create campaign
+            campaign = await campaign_repo.create_campaign(
+                name=campaign_data.name,
+                description=campaign_data.description,
+                user_id=current_user.id,
+                scheduled_start_at=campaign_data.scheduled_start_at,
+                scheduled_end_at=campaign_data.scheduled_end_at,
+                settings=campaign_data.settings
+            )
+            
+            # Read CSV file
+            contents = await file.read()
+            csv_file = io.StringIO(contents.decode('utf-8'))
+            
+            # Parse CSV
+            csv_reader = csv.reader(csv_file, delimiter=delimiter)
+            
+            # Skip header if present
+            if has_header:
+                header = next(csv_reader)
+                try:
+                    phone_index = header.index(phone_column)
+                except ValueError:
+                    raise ValidationError(
+                        message=f"Column '{phone_column}' not found in CSV header",
+                        details={"available_columns": header}
+                    )
+            else:
+                phone_index = 0  # Assume first column has phone numbers
+            
+            # Extract phone numbers
+            phone_numbers = []
+            for row in csv_reader:
+                if row and len(row) > phone_index:
+                    phone = row[phone_index].strip()
+                    if phone:
+                        phone_numbers.append(phone)
+            
+            if not phone_numbers:
+                raise ValidationError(message="No valid phone numbers found in CSV")
+            
+            # Add phone numbers to campaign
+            added_count = await campaign_repo.add_messages_to_campaign(
+                campaign_id=campaign.id,
+                phone_numbers=phone_numbers,
+                message_text=campaign_data.message_template,
+                user_id=current_user.id
+            )
+            
+            # Refresh campaign
+            campaign = await campaign_repo.get_by_id(campaign.id)
+            
+            return campaign
+        
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid campaign data JSON")
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error creating campaign: {str(e)}")
+
+
+@router.get("/", response_model=PaginatedResponse[CampaignResponse])
+async def list_campaigns(
+    pagination: PaginationParams = Depends(),
+    status: Optional[str] = Query(None, description="Filter by campaign status"),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    List campaigns for the current user.
+    
+    Returns a paginated list of campaigns.
+    """
+    try:
+        # Use repository context for proper connection management
+        from app.db.repositories.campaigns import CampaignRepository
+        
+        async with get_repository_context(CampaignRepository) as campaign_repo:
+            # Get campaigns with pagination
+            campaigns, total = await campaign_repo.get_campaigns_for_user(
+                user_id=current_user.id,
+                status=status,
+                skip=pagination.skip,
+                limit=pagination.limit
+            )
+            
+            # Calculate pagination info
+            total_pages = (total + pagination.limit - 1) // pagination.limit
+            
+            # Return paginated response
+            return paginate_response(campaigns, total, pagination)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error listing campaigns: {str(e)}")
+
+
+@router.get("/{campaign_id}", response_model=CampaignResponse)
+async def get_campaign(
+   campaign_id: str = Path(..., description="Campaign ID"),
+   current_user: User = Depends(get_current_user),
+):
+   """
+   Get details of a specific campaign.
+   """
+   try:
+       from app.db.repositories.campaigns import CampaignRepository
+       
+       async with get_repository_context(CampaignRepository) as campaign_repo:
+           # Get campaign
+           campaign = await campaign_repo.get_by_id(campaign_id)
+           if not campaign:
+               raise NotFoundError(message=f"Campaign {campaign_id} not found")
+           
+           # Check authorization
+           if campaign.user_id != current_user.id:
+               raise HTTPException(status_code=403, detail="Not authorized to access this campaign")
+           
+           return campaign
+       
+   except NotFoundError as e:
+       raise HTTPException(status_code=404, detail=str(e))
+   except Exception as e:
+       raise HTTPException(status_code=500, detail=f"Error retrieving campaign: {str(e)}")
+
+
+@router.put("/{campaign_id}", response_model=CampaignResponse)
+async def update_campaign(
+   campaign_update: CampaignUpdate,
+   campaign_id: str = Path(..., description="Campaign ID"),
+   current_user: User = Depends(get_current_user),
+):
+   """
+   Update campaign details.
+   
+   Only draft campaigns can be fully updated. Active campaigns can only have their description updated.
+   """
+   try:
+       from app.db.repositories.campaigns import CampaignRepository
+       
+       async with get_repository_context(CampaignRepository) as campaign_repo:
+           # Get campaign
+           campaign = await campaign_repo.get_by_id(campaign_id)
+           if not campaign:
+               raise NotFoundError(message=f"Campaign {campaign_id} not found")
+           
+           # Check authorization
+           if campaign.user_id != current_user.id:
+               raise HTTPException(status_code=403, detail="Not authorized to update this campaign")
+           
+           # Check if campaign can be updated
+           if campaign.status != "draft" and any([
+               campaign_update.scheduled_start_at is not None,
+               campaign_update.scheduled_end_at is not None,
+               campaign_update.name is not None
+           ]):
+               raise HTTPException(
+                   status_code=400, 
+                   detail="Only draft campaigns can have name or schedule updated"
+               )
+           
+           # Convert to dict and remove None values
+           update_data = {k: v for k, v in campaign_update.dict().items() if v is not None}
+           
+           # Update campaign
+           updated = await campaign_repo.update(id=campaign_id, obj_in=update_data)
+           if not updated:
+               raise HTTPException(status_code=500, detail="Failed to update campaign")
+           
+           return updated
+       
+   except NotFoundError as e:
+       raise HTTPException(status_code=404, detail=str(e))
+   except Exception as e:
+       raise HTTPException(status_code=500, detail=f"Error updating campaign: {str(e)}")
+
+
+@router.post("/{campaign_id}/start", response_model=CampaignResponse)
+async def start_campaign(
+   campaign_id: str = Path(..., description="Campaign ID"),
+   current_user: User = Depends(get_current_user),
+   campaign_processor = Depends(get_campaign_processor),
+):
+   """
+   Start a campaign.
+   
+   This will change the campaign status to active and begin sending messages.
+   """
+   try:
+       # Start campaign - campaign_processor already uses context managers internally
+       success = await campaign_processor.start_campaign(
+           campaign_id=campaign_id,
+           user_id=current_user.id
+       )
+       
+       if not success:
+           raise HTTPException(status_code=400, detail="Failed to start campaign")
+       
+       # Get updated campaign - use context manager for this separate operation
+       from app.db.repositories.campaigns import CampaignRepository
+       
+       async with get_repository_context(CampaignRepository) as campaign_repo:
+           campaign = await campaign_repo.get_by_id(campaign_id)
+           return campaign
+       
+   except Exception as e:
+       raise HTTPException(status_code=500, detail=f"Error starting campaign: {str(e)}")
+
+
+@router.post("/{campaign_id}/pause", response_model=CampaignResponse)
+async def pause_campaign(
+   campaign_id: str = Path(..., description="Campaign ID"),
+   current_user: User = Depends(get_current_user),
+   campaign_processor = Depends(get_campaign_processor),
+):
+   """
+   Pause a campaign.
+   
+   This will change the campaign status to paused and stop sending messages.
+   The campaign can be resumed later.
+   """
+   try:
+       # Pause campaign - campaign_processor already uses context managers internally
+       success = await campaign_processor.pause_campaign(
+           campaign_id=campaign_id,
+           user_id=current_user.id
+       )
+       
+       if not success:
+           raise HTTPException(status_code=400, detail="Failed to pause campaign")
+       
+       # Get updated campaign - use context manager for this separate operation
+       from app.db.repositories.campaigns import CampaignRepository
+       
+       async with get_repository_context(CampaignRepository) as campaign_repo:
+           campaign = await campaign_repo.get_by_id(campaign_id)
+           return campaign
+       
+   except Exception as e:
+       raise HTTPException(status_code=500, detail=f"Error pausing campaign: {str(e)}")
+
+
+@router.post("/{campaign_id}/cancel", response_model=CampaignResponse)
+async def cancel_campaign(
+   campaign_id: str = Path(..., description="Campaign ID"),
+   current_user: User = Depends(get_current_user),
+   campaign_processor = Depends(get_campaign_processor),
+):
+   """
+   Cancel a campaign.
+   
+   This will change the campaign status to cancelled and stop sending messages.
+   The campaign cannot be resumed after cancellation.
+   """
+   try:
+       # Cancel campaign - campaign_processor already uses context managers internally
+       success = await campaign_processor.cancel_campaign(
+           campaign_id=campaign_id,
+           user_id=current_user.id
+       )
+       
+       if not success:
+           raise HTTPException(status_code=400, detail="Failed to cancel campaign")
+       
+       # Get updated campaign - use context manager for this separate operation
+       from app.db.repositories.campaigns import CampaignRepository
+       
+       async with get_repository_context(CampaignRepository) as campaign_repo:
+           campaign = await campaign_repo.get_by_id(campaign_id)
+           return campaign
+       
+   except Exception as e:
+       raise HTTPException(status_code=500, detail=f"Error cancelling campaign: {str(e)}")
+
+
+@router.get("/{campaign_id}/messages", response_model=PaginatedResponse[MessageResponse])
+async def get_campaign_messages(
+   campaign_id: str = Path(..., description="Campaign ID"),
+   pagination: PaginationParams = Depends(),
+   status: Optional[str] = Query(None, description="Filter by message status"),
+   current_user: User = Depends(get_current_user),
+):
+   """
+   Get messages for a campaign.
+   
+   Returns a paginated list of messages for the specified campaign.
+   """
+   try:
+       # Use repository context for proper connection management
+       from app.db.repositories.campaigns import CampaignRepository
+       from app.db.repositories.messages import MessageRepository
+       
+       # First check if campaign exists and belongs to user
+       async with get_repository_context(CampaignRepository) as campaign_repo:
+           campaign = await campaign_repo.get_by_id(campaign_id)
+           
+           if not campaign:
+               raise NotFoundError(message=f"Campaign {campaign_id} not found")
+           
+           if campaign.user_id != current_user.id:
+               raise HTTPException(status_code=403, detail="Not authorized to access this campaign")
+       
+       # Get messages for campaign - in a separate context to avoid long transactions
+       async with get_repository_context(MessageRepository) as message_repo:
+           messages, total = await message_repo.get_messages_for_campaign(
+               campaign_id=campaign_id,
+               status=status,
+               skip=pagination.skip,
+               limit=pagination.limit
+           )
+
+           # Calculate proper pagination info
+           total_pages = (total + pagination.limit - 1) // pagination.limit
+
+           # Create proper PageInfo object
+           page_info = PageInfo(
+               current_page=pagination.page,
+               total_pages=total_pages,
+               page_size=pagination.limit,
+               total_items=total,
+               has_previous=pagination.page > 1,
+               has_next=pagination.page < total_pages
+           )
+           
+           # Return PaginatedResponse object
+           return PaginatedResponse(
+               items=messages,  # Direct Message objects - FastAPI will serialize them
+               page_info=page_info
+           )
+       
+   except NotFoundError as e:
+       raise HTTPException(status_code=404, detail=str(e))
+   except Exception as e:
+       raise HTTPException(status_code=500, detail=f"Error retrieving campaign messages: {str(e)}")
+
+
+@router.delete("/{campaign_id}", status_code=204)
+async def delete_campaign(
+   campaign_id: str = Path(..., description="Campaign ID"),
+   current_user: User = Depends(get_current_user),
+):
+   """
+   Delete a campaign.
+   
+   Only draft campaigns can be deleted. Active, paused, or completed campaigns cannot be deleted.
+   """
+   try:
+       from app.db.repositories.campaigns import CampaignRepository
+       
+       async with get_repository_context(CampaignRepository) as campaign_repo:
+           # Get campaign
+           campaign = await campaign_repo.get_by_id(campaign_id)
+           if not campaign:
+               raise NotFoundError(message=f"Campaign {campaign_id} not found")
+           
+           # Check authorization
+           if campaign.user_id != current_user.id:
+               raise HTTPException(status_code=403, detail="Not authorized to delete this campaign")
+           
+           # Check if campaign can be deleted
+           if campaign.status != "draft":
+               raise HTTPException(
+                   status_code=400, 
+                   detail="Only draft campaigns can be deleted"
+               )
+           
+           # Delete campaign
+           success = await campaign_repo.delete(id=campaign_id)
+           if not success:
+               raise HTTPException(status_code=500, detail="Failed to delete campaign")
+           
+           return JSONResponse(status_code=204, content=None)
+       
+   except NotFoundError as e:
+       raise HTTPException(status_code=404, detail=str(e))
+   except Exception as e:
+       raise HTTPException(status_code=500, detail=f"Error deleting campaign: {str(e)}")
+   
+
+@router.delete("/{campaign_id}/messages/bulk", response_model=BulkDeleteResponse)
+async def bulk_delete_campaign_messages(
+    request: CampaignBulkDeleteRequest,
+    campaign_id: str = Path(..., description="Campaign ID"),
+    current_user: User = Depends(get_current_user),
+    rate_limiter = Depends(get_rate_limiter),
+):
+    """
+    Bulk delete messages from a campaign with event safety and server stability.
+    
+    This endpoint efficiently deletes multiple messages belonging to a specific campaign
+    with optional filtering by status and date range. Enhanced with delivery event safety
+    checking and batched processing for high-volume operations handling 10K-30K messages.
+    
+    **Event Safety Features:**
+    - Pre-deletion check for delivery events
+    - Requires explicit confirmation to delete tracking data
+    - Clear warnings about data loss implications
+    - Two-phase deletion (events first, then messages)
+    
+    **Server Stability Features:**
+    - Batched processing prevents server overload
+    - Configurable batch sizes for different load scenarios
+    - Inter-batch delays prevent database lock contention
+    - Graceful handling of partial failures
+    
+    **Business Safety Features:**
+    - Campaign ownership validation
+    - User authorization checks  
+    - Active campaign protection
+    - Comprehensive audit logging
+    
+    **Performance:**
+    - Single SQL query per batch
+    - Optimized for large datasets
+    - 30K deletions in batches for stability
+    
+    **Business Use Cases:**
+    - Clean up failed messages from campaigns
+    - Remove test messages before campaign launch
+    - Compliance-driven message deletion (with event confirmation)
+    - Campaign optimization and cleanup
+    
+    Args:
+        campaign_id: ID of the campaign containing messages to delete
+        request: Bulk delete request with filters, confirmation, and force options
+        current_user: Authenticated user (injected by dependency)
+        rate_limiter: Rate limiting for bulk operations (injected by dependency)
+    
+    Returns:
+        BulkDeleteResponse: Detailed results including event safety information
+        
+    Raises:
+        HTTPException 400: Invalid request, campaign state, or missing confirmation
+        HTTPException 403: User not authorized for this campaign
+        HTTPException 404: Campaign not found
+        HTTPException 429: Rate limit exceeded
+        HTTPException 500: Database or internal server error
+    """
+    import time
+    
+    # Check rate limits for bulk operations
+    await rate_limiter.check_rate_limit(current_user.id, "bulk_delete_campaign")
+    
+    start_time = time.time()
+    
+    try:
+        # Use repository context for proper connection management
+        from app.db.repositories.campaigns import CampaignRepository
+        from app.db.repositories.messages import MessageRepository
+        
+        # First validate campaign exists and user has access
+        async with get_repository_context(CampaignRepository) as campaign_repo:
+            campaign = await campaign_repo.get_by_id(campaign_id)
+            
+            if not campaign:
+                raise NotFoundError(message=f"Campaign {campaign_id} not found")
+            
+            # Check authorization
+            if campaign.user_id != current_user.id:
+                raise HTTPException(
+                    status_code=403, 
+                    detail="Not authorized to delete messages from this campaign"
+                )
+            
+            # Safety check - prevent deletion from active campaigns unless force delete
+            if campaign.status == "active" and not request.force_delete:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Cannot bulk delete messages from active campaign. Pause the campaign first or use force_delete."
+                )
+        
+        # Perform bulk deletion with event safety
+        async with get_repository_context(MessageRepository) as message_repo:
+            # Convert datetime objects to ISO strings for repository method
+            from_date_str = request.from_date.isoformat() if request.from_date else None
+            to_date_str = request.to_date.isoformat() if request.to_date else None
+            
+            # Execute bulk deletion with enhanced safety
+            deleted_count, failed_message_ids, metadata = await message_repo.bulk_delete_campaign_messages(
+                campaign_id=campaign_id,
+                user_id=current_user.id,
+                status=request.status.value if request.status else None,
+                from_date=from_date_str,
+                to_date=to_date_str,
+                limit=request.limit,
+                force_delete=request.force_delete,
+                batch_size=request.batch_size
+            )
+            
+            # Calculate execution time
+            execution_time_ms = int((time.time() - start_time) * 1000)
+            
+            # Build applied filters for audit trail
+            filters_applied = {}
+            if request.status:
+                filters_applied["status"] = request.status.value
+            if request.from_date:
+                filters_applied["from_date"] = from_date_str
+            if request.to_date:
+                filters_applied["to_date"] = to_date_str
+            filters_applied["limit"] = request.limit
+            filters_applied["force_delete"] = request.force_delete
+            filters_applied["batch_size"] = request.batch_size
+            
+            # Build response with enhanced metadata
+            response = BulkDeleteResponse(
+                deleted_count=deleted_count,
+                campaign_id=campaign_id,
+                failed_count=len(failed_message_ids),
+                errors=[f"Failed to delete message: {msg_id}" for msg_id in failed_message_ids],
+                operation_type="campaign",
+                filters_applied=filters_applied,
+                execution_time_ms=execution_time_ms,
+                requires_confirmation=metadata.get("requires_confirmation", False),
+                events_count=metadata.get("events_count"),
+                events_deleted=metadata.get("events_deleted", 0),
+                safety_warnings=metadata.get("safety_warnings", []),
+                batch_info=metadata.get("batch_info")
+            )
+            
+            # Log successful operation for audit
+            logger.info(
+                f"User {current_user.id} bulk deleted {deleted_count} messages "
+                f"from campaign {campaign_id} in {execution_time_ms}ms "
+                f"with filters: {filters_applied}. Events deleted: {metadata.get('events_deleted', 0)}"
+            )
+            
+            return response
+            
+    except NotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
+    except Exception as e:
+        # Log error and return generic error message
+        logger.error(f"Error in bulk_delete_campaign_messages: {e}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Error performing bulk deletion: {str(e)}"
+        )
+</file>
+
 <file path="app/core/config.py">
 """
 Application settings and configuration management.
@@ -11733,233 +12085,6 @@ class Settings(BaseSettings):
 
 # Create singleton settings instance
 settings = Settings()
-</file>
-
-<file path="app/schemas/message.py">
-"""
-Pydantic schemas for message-related API operations.
-"""
-from typing import List, Optional, Dict, Any
-from datetime import datetime, timezone
-from enum import Enum
-from pydantic import BaseModel, Field, validator
-from app.schemas.campaign import CampaignResponse
-
-
-class MessageStatus(str, Enum):
-    """Possible message statuses."""
-    PENDING = "pending"
-    PROCESSED = "processed"
-    SENT = "sent"
-    DELIVERED = "delivered"
-    FAILED = "failed"
-    SCHEDULED = "scheduled"
-    CANCELLED = "cancelled"
-
-
-class MessageCreate(BaseModel):
-    """Schema for creating a new message."""
-    phone_number: str = Field(..., description="Recipient phone number in E.164 format")
-    message: str = Field(..., description="Message content")
-    scheduled_at: Optional[datetime] = Field(None, description="Schedule message for future delivery")
-    custom_id: Optional[str] = Field(None, description="Custom ID for tracking")
-    
-    @validator("phone_number")
-    def validate_phone_number(cls, v):
-        """Validate phone number format."""
-        # Basic validation - will be handled more thoroughly in the service
-        if not v or not (v.startswith("+") and len(v) >= 8):
-            raise ValueError("Phone number must be in E.164 format (e.g. +1234567890)")
-        return v
-    
-    @validator("message")
-    def validate_message(cls, v):
-        """Validate message content."""
-        if not v or len(v.strip()) == 0:
-            raise ValueError("Message cannot be empty")
-        if len(v) > 1600:  # Allow for multi-part SMS
-            raise ValueError("Message exceeds maximum length of 1600 characters")
-        return v
-
-
-class MessageResponse(BaseModel):
-    """Schema for message response."""
-    id: str = Field(..., description="Message ID")
-    custom_id: Optional[str] = Field(None, description="Custom ID if provided")
-    phone_number: str = Field(..., description="Recipient phone number")
-    message: str = Field(..., description="Message content")
-    status: MessageStatus = Field(..., description="Current message status")
-    created_at: datetime = Field(..., description="Creation timestamp")
-    updated_at: datetime = Field(..., description="Last update timestamp")
-    scheduled_at: Optional[datetime] = Field(None, description="Scheduled delivery time")
-    sent_at: Optional[datetime] = Field(None, description="Time when message was sent")
-    delivered_at: Optional[datetime] = Field(None, description="Time when message was delivered")
-    failed_at: Optional[datetime] = Field(None, description="Time when message failed")
-    reason: Optional[str] = Field(None, description="Failure reason if applicable")
-    gateway_message_id: Optional[str] = Field(None, description="ID from SMS gateway")
-    user_id: str = Field(..., description="User who sent the message")
-    meta_data: Optional[Dict[str, Any]] = Field(default={}, description="Additional metadata")
-    campaign: Optional[CampaignResponse] = Field(None, description="Campaign information if message belongs to a campaign")
-    parts_count: Optional[int] = Field(None, description="Number of SMS parts")
-
-
-    
-    class Config:
-        """Pydantic config."""
-        from_attributes = True
-
-
-class MessageStatusUpdate(BaseModel):
-    """Schema for updating message status."""
-    status: MessageStatus = Field(..., description="New message status")
-    reason: Optional[str] = Field(None, description="Reason for status change (required for FAILED)")
-    
-    @validator("reason")
-    def validate_reason(cls, v, values):
-        """Validate reason field."""
-        if values.get("status") == MessageStatus.FAILED and not v:
-            raise ValueError("Reason is required when status is FAILED")
-        return v
-
-
-class BatchOptions(BaseModel):
-    """Options for batch processing."""
-    delay_between_messages: Optional[float] = Field(0.3, description="Delay between messages in seconds")
-    fail_on_first_error: Optional[bool] = Field(False, description="Stop processing on first error")
-    retry_failed: Optional[bool] = Field(True, description="Automatically retry failed messages")
-
-
-class BatchMessageRequest(BaseModel):
-    """Schema for batch message request."""
-    messages: List[MessageCreate] = Field(..., description="List of messages to send")
-    options: Optional[BatchOptions] = Field(default=None, description="Batch processing options")
-    
-    @validator("messages")
-    def validate_messages(cls, v):
-        """Validate message list."""
-        if not v:
-            raise ValueError("Message list cannot be empty")
-        if len(v) > 1000:
-            raise ValueError("Maximum batch size is 1000 messages")
-        return v
-
-
-class BatchMessageResponse(BaseModel):
-    """Schema for batch message response."""
-    batch_id: str = Field(..., description="Batch ID for tracking")
-    total: int = Field(..., description="Total number of messages in batch")
-    processed: int = Field(..., description="Number of messages processed")
-    successful: int = Field(..., description="Number of successful messages")
-    failed: int = Field(..., description="Number of failed messages")
-    status: str = Field(..., description="Overall batch status")
-    created_at: datetime = Field(..., description="Batch creation timestamp")
-    messages: Optional[List[MessageResponse]] = Field(None, description="List of message responses")
-
-
-class CampaignBulkDeleteRequest(BaseModel):
-    """Schema for campaign-scoped bulk delete request."""
-    status: Optional[MessageStatus] = Field(None, description="Filter by message status (e.g., 'failed', 'sent')")
-    from_date: Optional[datetime] = Field(None, description="Delete messages from this date onwards (ISO format)")
-    to_date: Optional[datetime] = Field(None, description="Delete messages up to this date (ISO format)")
-    limit: int = Field(default=1000, le=10000, description="Maximum number of messages to delete (max 10,000)")
-    confirm_delete: bool = Field(default=True, description="Confirmation flag - must be true to proceed")
-    
-    @validator("limit")
-    def validate_limit(cls, v):
-        """Validate deletion limit for safety."""
-        if v <= 0:
-            raise ValueError("Limit must be greater than 0")
-        if v > 10000:
-            raise ValueError("Maximum limit is 10,000 messages per operation")
-        return v
-    
-    @validator("confirm_delete")
-    def validate_confirmation(cls, v):
-        """Ensure user confirms the bulk deletion."""
-        if not v:
-            raise ValueError("confirm_delete must be true to proceed with bulk deletion")
-        return v
-    
-    @validator("from_date", "to_date")
-    def validate_dates(cls, v):
-        """Validate date format and timezone."""
-        if v is not None:
-            # Ensure datetime is timezone-aware
-            if v.tzinfo is None:
-                raise ValueError("Date must be timezone-aware (include timezone information)")
-        return v
-
-
-class GlobalBulkDeleteRequest(BaseModel):
-    """Schema for global bulk delete request (by message IDs)."""
-    message_ids: List[str] = Field(..., description="List of message IDs to delete")
-    campaign_id: Optional[str] = Field(None, description="Optional campaign context for validation")
-    confirm_delete: bool = Field(default=True, description="Confirmation flag - must be true to proceed")
-    
-    @validator("message_ids")
-    def validate_message_ids(cls, v):
-        """Validate message ID list."""
-        if not v:
-            raise ValueError("Message IDs list cannot be empty")
-        if len(v) > 1000:
-            raise ValueError("Maximum 1,000 message IDs per global bulk operation")
-        
-        # Check for duplicates
-        if len(v) != len(set(v)):
-            raise ValueError("Duplicate message IDs found in request")
-        
-        return v
-    
-    @validator("confirm_delete")
-    def validate_confirmation(cls, v):
-        """Ensure user confirms the bulk deletion."""
-        if not v:
-            raise ValueError("confirm_delete must be true to proceed with bulk deletion")
-        return v
-
-
-class BulkDeleteResponse(BaseModel):
-    """Schema for bulk delete operation response."""
-    deleted_count: int = Field(..., description="Number of messages successfully deleted")
-    campaign_id: Optional[str] = Field(None, description="Campaign ID if campaign-scoped operation")
-    failed_count: int = Field(default=0, description="Number of messages that failed to delete")
-    errors: List[str] = Field(default=[], description="List of error messages if any failures occurred")
-    operation_type: str = Field(..., description="Type of bulk operation ('campaign' or 'global')")
-    filters_applied: Dict[str, Any] = Field(default={}, description="Filters that were applied during deletion")
-    execution_time_ms: Optional[int] = Field(None, description="Operation execution time in milliseconds")
-    
-    class Config:
-        """Pydantic config."""
-        from_attributes = True
-        schema_extra = {
-            "example": {
-                "deleted_count": 2847,
-                "campaign_id": "camp_abc123",
-                "failed_count": 0,
-                "errors": [],
-                "operation_type": "campaign",
-                "filters_applied": {
-                    "status": "failed",
-                    "from_date": "2024-01-01T00:00:00Z"
-                },
-                "execution_time_ms": 3421
-            }
-        }
-
-
-class BulkDeleteProgress(BaseModel):
-    """Schema for tracking bulk delete operation progress (future use)."""
-    operation_id: str = Field(..., description="Unique operation identifier")
-    status: str = Field(..., description="Operation status ('pending', 'processing', 'completed', 'failed')")
-    progress_percentage: int = Field(..., description="Progress percentage (0-100)")
-    messages_processed: int = Field(..., description="Number of messages processed so far")
-    total_messages: int = Field(..., description="Total number of messages to process")
-    estimated_completion: Optional[datetime] = Field(None, description="Estimated completion time")
-    errors: List[str] = Field(default=[], description="Any errors encountered during processing")
-    
-    class Config:
-        """Pydantic config."""
-        from_attributes = True
 </file>
 
 <file path="app/services/webhooks/manager.py">
@@ -12587,6 +12712,272 @@ async def fetch_registered_webhooks_from_gateway() -> List[Dict[str, Any]]:
     except Exception as e:
         logger.error(f"Error fetching registered webhooks: {e}")
         raise
+</file>
+
+<file path="app/schemas/message.py">
+"""
+Pydantic schemas for message-related API operations.
+"""
+from typing import List, Optional, Dict, Any
+from datetime import datetime, timezone
+from enum import Enum
+from pydantic import BaseModel, Field, validator
+from app.schemas.campaign import CampaignResponse
+
+
+class MessageStatus(str, Enum):
+    """Possible message statuses."""
+    PENDING = "pending"
+    PROCESSED = "processed"
+    SENT = "sent"
+    DELIVERED = "delivered"
+    FAILED = "failed"
+    SCHEDULED = "scheduled"
+    CANCELLED = "cancelled"
+
+
+class MessageCreate(BaseModel):
+    """Schema for creating a new message."""
+    phone_number: str = Field(..., description="Recipient phone number in E.164 format")
+    message: str = Field(..., description="Message content")
+    scheduled_at: Optional[datetime] = Field(None, description="Schedule message for future delivery")
+    custom_id: Optional[str] = Field(None, description="Custom ID for tracking")
+    
+    @validator("phone_number")
+    def validate_phone_number(cls, v):
+        """Validate phone number format."""
+        # Basic validation - will be handled more thoroughly in the service
+        if not v or not (v.startswith("+") and len(v) >= 8):
+            raise ValueError("Phone number must be in E.164 format (e.g. +1234567890)")
+        return v
+    
+    @validator("message")
+    def validate_message(cls, v):
+        """Validate message content."""
+        if not v or len(v.strip()) == 0:
+            raise ValueError("Message cannot be empty")
+        if len(v) > 1600:  # Allow for multi-part SMS
+            raise ValueError("Message exceeds maximum length of 1600 characters")
+        return v
+
+
+class MessageResponse(BaseModel):
+    """Schema for message response."""
+    id: str = Field(..., description="Message ID")
+    custom_id: Optional[str] = Field(None, description="Custom ID if provided")
+    phone_number: str = Field(..., description="Recipient phone number")
+    message: str = Field(..., description="Message content")
+    status: MessageStatus = Field(..., description="Current message status")
+    created_at: datetime = Field(..., description="Creation timestamp")
+    updated_at: datetime = Field(..., description="Last update timestamp")
+    scheduled_at: Optional[datetime] = Field(None, description="Scheduled delivery time")
+    sent_at: Optional[datetime] = Field(None, description="Time when message was sent")
+    delivered_at: Optional[datetime] = Field(None, description="Time when message was delivered")
+    failed_at: Optional[datetime] = Field(None, description="Time when message failed")
+    reason: Optional[str] = Field(None, description="Failure reason if applicable")
+    gateway_message_id: Optional[str] = Field(None, description="ID from SMS gateway")
+    user_id: str = Field(..., description="User who sent the message")
+    meta_data: Optional[Dict[str, Any]] = Field(default={}, description="Additional metadata")
+    campaign: Optional[CampaignResponse] = Field(None, description="Campaign information if message belongs to a campaign")
+    parts_count: Optional[int] = Field(None, description="Number of SMS parts")
+
+
+    
+    class Config:
+        """Pydantic config."""
+        from_attributes = True
+
+
+class MessageStatusUpdate(BaseModel):
+    """Schema for updating message status."""
+    status: MessageStatus = Field(..., description="New message status")
+    reason: Optional[str] = Field(None, description="Reason for status change (required for FAILED)")
+    
+    @validator("reason")
+    def validate_reason(cls, v, values):
+        """Validate reason field."""
+        if values.get("status") == MessageStatus.FAILED and not v:
+            raise ValueError("Reason is required when status is FAILED")
+        return v
+
+
+class BatchOptions(BaseModel):
+    """Options for batch processing."""
+    delay_between_messages: Optional[float] = Field(0.3, description="Delay between messages in seconds")
+    fail_on_first_error: Optional[bool] = Field(False, description="Stop processing on first error")
+    retry_failed: Optional[bool] = Field(True, description="Automatically retry failed messages")
+
+
+class BatchMessageRequest(BaseModel):
+    """Schema for batch message request."""
+    messages: List[MessageCreate] = Field(..., description="List of messages to send")
+    options: Optional[BatchOptions] = Field(default=None, description="Batch processing options")
+    
+    @validator("messages")
+    def validate_messages(cls, v):
+        """Validate message list."""
+        if not v:
+            raise ValueError("Message list cannot be empty")
+        if len(v) > 1000:
+            raise ValueError("Maximum batch size is 1000 messages")
+        return v
+
+
+class BatchMessageResponse(BaseModel):
+    """Schema for batch message response."""
+    batch_id: str = Field(..., description="Batch ID for tracking")
+    total: int = Field(..., description="Total number of messages in batch")
+    processed: int = Field(..., description="Number of messages processed")
+    successful: int = Field(..., description="Number of successful messages")
+    failed: int = Field(..., description="Number of failed messages")
+    status: str = Field(..., description="Overall batch status")
+    created_at: datetime = Field(..., description="Batch creation timestamp")
+    messages: Optional[List[MessageResponse]] = Field(None, description="List of message responses")
+
+class CampaignBulkDeleteRequest(BaseModel):
+    """Schema for campaign-scoped bulk delete request."""
+    status: Optional[MessageStatus] = Field(None, description="Filter by message status (e.g., 'failed', 'sent')")
+    from_date: Optional[datetime] = Field(None, description="Delete messages from this date onwards (ISO format)")
+    to_date: Optional[datetime] = Field(None, description="Delete messages up to this date (ISO format)")
+    limit: int = Field(default=1000, le=10000, description="Maximum number of messages to delete (max 10,000)")
+    confirm_delete: bool = Field(default=True, description="Confirmation flag - must be true to proceed")
+    force_delete: bool = Field(default=False, description="Force delete messages with delivery events")
+    confirmation_token: Optional[str] = Field(None, description="Required when force_delete=True - must be 'CONFIRM'")
+    batch_size: int = Field(default=1000, le=5000, description="Process deletions in batches for server stability")
+    
+    @validator("limit")
+    def validate_limit(cls, v):
+        """Validate deletion limit for safety."""
+        if v <= 0:
+            raise ValueError("Limit must be greater than 0")
+        if v > 10000:
+            raise ValueError("Maximum limit is 10,000 messages per operation")
+        return v
+    
+    @validator("batch_size")
+    def validate_batch_size(cls, v):
+        """Validate batch size for server stability."""
+        if v <= 0:
+            raise ValueError("Batch size must be greater than 0")
+        if v > 5000:
+            raise ValueError("Maximum batch size is 5,000 for server stability")
+        return v
+    
+    @validator("confirmation_token")
+    def validate_confirmation_token(cls, v, values):
+        """Validate confirmation token when force delete is enabled."""
+        if values.get("force_delete") and v != "CONFIRM":
+            raise ValueError("confirmation_token must be 'CONFIRM' when force_delete is true")
+        return v
+    
+    @validator("confirm_delete")
+    def validate_confirmation(cls, v):
+        """Ensure user confirms the bulk deletion."""
+        if not v:
+            raise ValueError("confirm_delete must be true to proceed with bulk deletion")
+        return v
+    
+    @validator("from_date", "to_date")
+    def validate_dates(cls, v):
+        """Validate date format and timezone."""
+        if v is not None:
+            # Ensure datetime is timezone-aware
+            if v.tzinfo is None:
+                raise ValueError("Date must be timezone-aware (include timezone information)")
+        return v
+
+class GlobalBulkDeleteRequest(BaseModel):
+    """Schema for global bulk delete request (by message IDs)."""
+    message_ids: List[str] = Field(..., description="List of message IDs to delete")
+    campaign_id: Optional[str] = Field(None, description="Optional campaign context for validation")
+    confirm_delete: bool = Field(default=True, description="Confirmation flag - must be true to proceed")
+    force_delete: bool = Field(default=False, description="Force delete messages with delivery events")
+    confirmation_token: Optional[str] = Field(None, description="Required when force_delete=True - must be 'CONFIRM'")
+    
+    @validator("message_ids")
+    def validate_message_ids(cls, v):
+        """Validate message ID list."""
+        if not v:
+            raise ValueError("Message IDs list cannot be empty")
+        if len(v) > 1000:
+            raise ValueError("Maximum 1,000 message IDs per global bulk operation")
+        
+        # Check for duplicates
+        if len(v) != len(set(v)):
+            raise ValueError("Duplicate message IDs found in request")
+        
+        return v
+    
+    @validator("confirmation_token")
+    def validate_confirmation_token(cls, v, values):
+        """Validate confirmation token when force delete is enabled."""
+        if values.get("force_delete") and v != "CONFIRM":
+            raise ValueError("confirmation_token must be 'CONFIRM' when force_delete is true")
+        return v
+    
+    @validator("confirm_delete")
+    def validate_confirmation(cls, v):
+        """Ensure user confirms the bulk deletion."""
+        if not v:
+            raise ValueError("confirm_delete must be true to proceed with bulk deletion")
+        return v
+
+
+class BulkDeleteResponse(BaseModel):
+    """Schema for bulk delete operation response."""
+    deleted_count: int = Field(..., description="Number of messages successfully deleted")
+    campaign_id: Optional[str] = Field(None, description="Campaign ID if campaign-scoped operation")
+    failed_count: int = Field(default=0, description="Number of messages that failed to delete")
+    errors: List[str] = Field(default=[], description="List of error messages if any failures occurred")
+    operation_type: str = Field(..., description="Type of bulk operation ('campaign' or 'global')")
+    filters_applied: Dict[str, Any] = Field(default={}, description="Filters that were applied during deletion")
+    execution_time_ms: Optional[int] = Field(None, description="Operation execution time in milliseconds")
+    requires_confirmation: bool = Field(default=False, description="Whether force delete is needed due to existing events")
+    events_count: Optional[int] = Field(None, description="Number of delivery events that would be deleted")
+    events_deleted: int = Field(default=0, description="Number of delivery events actually deleted")
+    safety_warnings: List[str] = Field(default=[], description="Safety warnings about delivery event deletion")
+    batch_info: Optional[Dict[str, Any]] = Field(None, description="Batch processing information for large operations")
+    
+    class Config:
+        """Pydantic config."""
+        from_attributes = True
+        schema_extra = {
+            "example": {
+                "deleted_count": 2847,
+                "campaign_id": "camp_abc123",
+                "failed_count": 0,
+                "errors": [],
+                "operation_type": "campaign",
+                "filters_applied": {
+                    "status": "failed",
+                    "from_date": "2024-01-01T00:00:00Z"
+                },
+                "execution_time_ms": 3421,
+                "requires_confirmation": False,
+                "events_count": None,
+                "events_deleted": 0,
+                "safety_warnings": [],
+                "batch_info": {
+                    "batches_processed": 3,
+                    "batch_size": 1000
+                }
+            }
+        }
+
+
+class BulkDeleteProgress(BaseModel):
+    """Schema for tracking bulk delete operation progress (future use)."""
+    operation_id: str = Field(..., description="Unique operation identifier")
+    status: str = Field(..., description="Operation status ('pending', 'processing', 'completed', 'failed')")
+    progress_percentage: int = Field(..., description="Progress percentage (0-100)")
+    messages_processed: int = Field(..., description="Number of messages processed so far")
+    total_messages: int = Field(..., description="Total number of messages to process")
+    estimated_completion: Optional[datetime] = Field(None, description="Estimated completion time")
+    errors: List[str] = Field(default=[], description="Any errors encountered during processing")
+    
+    class Config:
+        """Pydantic config."""
+        from_attributes = True
 </file>
 
 <file path="app/services/sms/sender.py">
@@ -14456,6 +14847,371 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
         result = await self.session.execute(query)
         return result.scalars().all()
     
+    async def check_events_for_messages(
+        self,
+        *,
+        message_ids: List[str],
+        user_id: str
+    ) -> Tuple[int, List[str]]:
+        """
+        Check how many delivery events exist for given messages.
+        
+        This method performs a security-conscious check to count events only for messages
+        that belong to the specified user, preventing information leakage about other
+        users' messages.
+        
+        Args:
+            message_ids: List of message IDs to check for events
+            user_id: User ID for security validation
+            
+        Returns:
+            Tuple[int, List[str]]: (total_events_count, message_ids_with_events)
+            - total_events_count: Total number of events that would be deleted
+            - message_ids_with_events: List of message IDs that have associated events
+            
+        Security:
+            - Only counts events for messages owned by the specified user
+            - Prevents cross-user information disclosure
+            
+        Performance:
+            - Uses efficient subquery for user validation
+            - Single database round-trip for both counts and message list
+        """
+        from app.models.message import MessageEvent
+        
+        # Count total events for user's messages
+        events_count_query = select(func.count(MessageEvent.id)).where(
+            and_(
+                MessageEvent.message_id.in_(message_ids),
+                # Security: ensure messages belong to user
+                MessageEvent.message_id.in_(
+                    select(Message.id).where(
+                        and_(
+                            Message.id.in_(message_ids),
+                            Message.user_id == user_id
+                        )
+                    )
+                )
+            )
+        )
+        
+        # Get distinct message IDs that have events (for user's messages only)
+        messages_with_events_query = select(MessageEvent.message_id.distinct()).where(
+            and_(
+                MessageEvent.message_id.in_(message_ids),
+                # Security: ensure messages belong to user
+                MessageEvent.message_id.in_(
+                    select(Message.id).where(
+                        and_(
+                            Message.id.in_(message_ids),
+                            Message.user_id == user_id
+                        )
+                    )
+                )
+            )
+        )
+        
+        # Execute both queries
+        events_result = await self.session.execute(events_count_query)
+        messages_result = await self.session.execute(messages_with_events_query)
+        
+        total_events = events_result.scalar_one()
+        messages_with_events = [row[0] for row in messages_result.fetchall()]
+        
+        logger.debug(
+            f"Event check for user {user_id}: {total_events} events found "
+            f"across {len(messages_with_events)} messages"
+        )
+        
+        return total_events, messages_with_events
+    
+
+    async def bulk_delete_with_batching(
+        self,
+        *,
+        message_ids: List[str],
+        user_id: str,
+        force_delete: bool = False,
+        batch_size: int = 1000
+    ) -> Tuple[int, List[str], Dict[str, Any]]:
+        """
+        Bulk delete messages with batching for server stability and event safety.
+        
+        This method processes large deletion operations in smaller batches to prevent
+        server overload, connection timeouts, and database lock contention. It handles
+        both safe deletion (messages without events) and force deletion (with events).
+        
+        Args:
+            message_ids: List of message IDs to delete
+            user_id: User ID for authorization
+            force_delete: Whether to delete messages that have delivery events
+            batch_size: Number of messages to process per batch (max 5000)
+            
+        Returns:
+            Tuple[int, List[str], Dict[str, Any]]: (total_deleted, failed_ids, batch_info)
+            - total_deleted: Total number of messages successfully deleted
+            - failed_ids: List of message IDs that failed to delete
+            - batch_info: Dictionary with batch processing statistics
+            
+        Server Stability Features:
+            - Processes deletions in configurable batch sizes
+            - Includes inter-batch delays to prevent DB overload
+            - Each batch is atomic (all succeed or all fail per batch)
+            - Graceful handling of partial failures
+            
+        Event Safety:
+            - When force_delete=False: Only deletes messages without events
+            - When force_delete=True: Deletes events first, then messages
+            - Two-phase deletion prevents foreign key violations
+        """
+        import asyncio
+        
+        total_deleted = 0
+        all_failed_ids = []
+        batches_processed = 0
+        events_deleted_total = 0
+        
+        # Validate batch size
+        if batch_size > 5000:
+            batch_size = 5000
+            logger.warning(f"Batch size capped at 5000 for stability")
+        
+        logger.info(
+            f"Starting batched deletion: {len(message_ids)} messages, "
+            f"batch_size={batch_size}, force_delete={force_delete}, user={user_id}"
+        )
+        
+        # Process in batches
+        for i in range(0, len(message_ids), batch_size):
+            batch_ids = message_ids[i:i + batch_size]
+            batches_processed += 1
+            
+            try:
+                # Process this batch
+                if force_delete:
+                    deleted, failed, events_deleted = await self._delete_batch_with_events(
+                        batch_ids, user_id
+                    )
+                    events_deleted_total += events_deleted
+                else:
+                    deleted, failed = await self._delete_batch_safe(batch_ids, user_id)
+                
+                total_deleted += deleted
+                all_failed_ids.extend(failed)
+                
+                logger.debug(
+                    f"Batch {batches_processed}: deleted {deleted}, failed {len(failed)}"
+                )
+                
+                # Small delay between batches to prevent overwhelming DB
+                if i + batch_size < len(message_ids):  # Don't delay after last batch
+                    await asyncio.sleep(0.1)
+                
+            except Exception as e:
+                logger.error(f"Batch {batches_processed} failed completely: {e}")
+                # Add all IDs from failed batch to failed list
+                all_failed_ids.extend(batch_ids)
+        
+        batch_info = {
+            "batches_processed": batches_processed,
+            "batch_size": batch_size,
+            "total_messages": len(message_ids),
+            "events_deleted": events_deleted_total
+        }
+        
+        logger.info(
+            f"Batched deletion completed: {total_deleted} deleted, "
+            f"{len(all_failed_ids)} failed, {batches_processed} batches, "
+            f"{events_deleted_total} events deleted"
+        )
+        
+        return total_deleted, all_failed_ids, batch_info
+    
+
+    async def _delete_batch_safe(
+        self,
+        message_ids: List[str],
+        user_id: str
+    ) -> Tuple[int, List[str]]:
+        """
+        Delete a batch of messages safely (only messages without delivery events).
+        
+        This method performs safe deletion by only removing messages that have no
+        associated delivery events. Messages with events are skipped and returned
+        in the failed list, allowing the caller to handle them appropriately.
+        
+        Args:
+            message_ids: List of message IDs to delete in this batch
+            user_id: User ID for authorization
+            
+        Returns:
+            Tuple[int, List[str]]: (deleted_count, failed_message_ids)
+            - deleted_count: Number of messages successfully deleted
+            - failed_message_ids: List of message IDs that have events (skipped)
+            
+        Safety Features:
+            - Only deletes messages without delivery events
+            - Preserves delivery tracking data by default
+            - Atomic transaction per batch
+            - User authorization on every message
+            
+        Performance:
+            - Single transaction per batch
+            - Efficient subquery to identify safe messages
+            - Minimal database round-trips
+        """
+        from app.models.message import MessageEvent
+        
+        try:
+            # Work within existing transaction - don't start a new one
+            # Find messages that have NO events (safe to delete)
+            messages_without_events_query = select(Message.id).where(
+                and_(
+                    Message.id.in_(message_ids),
+                    Message.user_id == user_id,
+                    # Only messages with NO events
+                    ~Message.id.in_(
+                        select(MessageEvent.message_id.distinct()).where(
+                            MessageEvent.message_id.in_(message_ids)
+                        )
+                    )
+                )
+            )
+            
+            result = await self.session.execute(messages_without_events_query)
+            safe_message_ids = [row[0] for row in result.fetchall()]
+            
+            if not safe_message_ids:
+                # All messages have events - none can be safely deleted
+                return 0, message_ids
+            
+            # Delete only the safe messages
+            delete_query = delete(Message).where(
+                and_(
+                    Message.id.in_(safe_message_ids),
+                    Message.user_id == user_id
+                )
+            )
+            
+            delete_result = await self.session.execute(delete_query)
+            deleted_count = delete_result.rowcount
+            
+            # Messages that couldn't be deleted (have events)
+            failed_ids = [mid for mid in message_ids if mid not in safe_message_ids]
+            
+            if failed_ids:
+                logger.debug(
+                    f"Safe deletion: {deleted_count} deleted, {len(failed_ids)} skipped (have events)"
+                )
+            else:
+                logger.debug(f"Safe deletion: {deleted_count} deleted, no events found")
+            
+            return deleted_count, failed_ids
+                
+        except Exception as e:
+            logger.error(f"Safe batch deletion failed: {e}")
+            return 0, message_ids  # All IDs failed
+    
+
+    async def _delete_batch_with_events(
+        self,
+        message_ids: List[str],
+        user_id: str
+    ) -> Tuple[int, List[str], int]:
+        """
+        Delete a batch of messages WITH their delivery events (force deletion).
+        
+        This method performs force deletion by removing both messages and their
+        associated delivery events in a two-phase process. Events are deleted first
+        to avoid foreign key constraint violations, then messages are deleted.
+        
+        Args:
+            message_ids: List of message IDs to delete in this batch
+            user_id: User ID for authorization
+            
+        Returns:
+            Tuple[int, List[str], int]: (deleted_count, failed_message_ids, events_deleted)
+            - deleted_count: Number of messages successfully deleted
+            - failed_message_ids: List of message IDs that failed to delete
+            - events_deleted: Number of delivery events deleted
+            
+        Force Deletion Process:
+            1. Delete all delivery events for the messages (prevents FK violations)
+            2. Delete the messages themselves
+            3. Both operations in single atomic transaction
+            
+        Data Loss Warning:
+            - This permanently destroys delivery tracking data
+            - Should only be used when explicitly confirmed by user
+            - May impact delivery analytics and compliance records
+            
+        Performance:
+            - Two-phase deletion in single transaction
+            - Efficient bulk operations with IN clauses
+            - User authorization on every operation
+        """
+        from app.models.message import MessageEvent
+        
+        try:
+            # Work within existing transaction - don't start a new one
+            # Phase 1: Delete events first (to avoid FK constraint violations)
+            events_delete_query = delete(MessageEvent).where(
+                and_(
+                    MessageEvent.message_id.in_(message_ids),
+                    # Security: only delete events for user's messages
+                    MessageEvent.message_id.in_(
+                        select(Message.id).where(
+                            and_(
+                                Message.id.in_(message_ids),
+                                Message.user_id == user_id
+                            )
+                        )
+                    )
+                )
+            )
+            
+            events_result = await self.session.execute(events_delete_query)
+            events_deleted = events_result.rowcount
+            
+            # Phase 2: Delete messages
+            messages_delete_query = delete(Message).where(
+                and_(
+                    Message.id.in_(message_ids),
+                    Message.user_id == user_id
+                )
+            )
+            
+            messages_result = await self.session.execute(messages_delete_query)
+            messages_deleted = messages_result.rowcount
+            
+            # Determine which messages failed to delete
+            if messages_deleted < len(message_ids):
+                # Query to find which messages still exist (failed to delete)
+                remaining_query = select(Message.id).where(
+                    and_(
+                        Message.id.in_(message_ids),
+                        Message.user_id == user_id
+                    )
+                )
+                
+                remaining_result = await self.session.execute(remaining_query)
+                remaining_ids = [row[0] for row in remaining_result.fetchall()]
+                failed_ids = remaining_ids
+            else:
+                failed_ids = []
+            
+            logger.info(
+                f"Force deletion batch: {messages_deleted} messages deleted, "
+                f"{events_deleted} events deleted, {len(failed_ids)} failed"
+            )
+            
+            return messages_deleted, failed_ids, events_deleted
+                
+        except Exception as e:
+            logger.error(f"Force deletion batch failed: {e}")
+            return 0, message_ids, 0  # All IDs failed, no events deleted
+    
+    
     async def bulk_delete_campaign_messages(
         self,
         *,
@@ -14464,14 +15220,16 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
         status: Optional[str] = None,
         from_date: Optional[str] = None,
         to_date: Optional[str] = None,
-        limit: int = 10000
-    ) -> Tuple[int, List[str]]:
+        limit: int = 10000,
+        force_delete: bool = False,
+        batch_size: int = 1000
+    ) -> Tuple[int, List[str], Dict[str, Any]]:
         """
-        Bulk delete messages for a campaign using single SQL query.
+        Bulk delete messages for a campaign with event safety and server stability.
         
         This method efficiently deletes multiple messages belonging to a specific campaign
-        with optional filtering by status and date range. Uses a single SQL DELETE query
-        for optimal performance with large datasets (10K-30K messages).
+        with optional filtering by status and date range. Enhanced with event safety
+        checking and batched processing for server stability under high load.
         
         Args:
             campaign_id: Campaign ID - messages must belong to this campaign
@@ -14480,54 +15238,40 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
             from_date: Optional from date filter (ISO format string)
             to_date: Optional to date filter (ISO format string)
             limit: Maximum number of messages to delete (default 10K, max 10K for safety)
+            force_delete: Whether to delete messages that have delivery events
+            batch_size: Number of messages to process per batch for stability
             
         Returns:
-            Tuple[int, List[str]]: (deleted_count, failed_message_ids)
+            Tuple[int, List[str], Dict[str, Any]]: (deleted_count, failed_ids, metadata)
             - deleted_count: Number of messages successfully deleted
-            - failed_message_ids: List of message IDs that failed to delete (usually empty)
+            - failed_ids: List of message IDs that failed to delete
+            - metadata: Dictionary with operation details including:
+                - requires_confirmation: Whether force delete is needed
+                - events_count: Number of events that would be deleted
+                - events_deleted: Number of events actually deleted
+                - batch_info: Batch processing statistics
+                - safety_warnings: List of safety warnings
             
-        Raises:
-            Exception: Database errors during bulk deletion
+        Event Safety:
+            - When force_delete=False: Returns safety warning if events exist
+            - When force_delete=True: Deletes both messages and events
+            - Two-phase deletion prevents foreign key violations
+            
+        Server Stability:
+            - Processes large operations in configurable batches
+            - Includes delays between batches to prevent DB overload
+            - Graceful handling of partial failures
             
         Performance:
-            - Handles 30K deletions in 3-5 seconds
-            - Uses single SQL query with compound WHERE clause
-            - Leverages existing database indexes for optimal performance
+            - Handles 30K deletions efficiently with batching
+            - Uses optimized queries with proper indexes
+            - Single transaction per batch for consistency
         """
         # Validate limit for safety
         if limit > 10000:
             limit = 10000
         
-        # Build the base DELETE query
-        query = delete(Message).where(
-            and_(
-                Message.campaign_id == campaign_id,
-                Message.user_id == user_id
-            )
-        )
-        
-        # Apply optional filters
-        if status:
-            query = query.where(Message.status == status)
-        
-        if from_date:
-            try:
-                from_date_obj = datetime.fromisoformat(from_date.replace('Z', '+00:00'))
-                query = query.where(Message.created_at >= from_date_obj)
-            except ValueError:
-                # Invalid date format - ignore filter
-                pass
-        
-        if to_date:
-            try:
-                to_date_obj = datetime.fromisoformat(to_date.replace('Z', '+00:00'))
-                query = query.where(Message.created_at <= to_date_obj)
-            except ValueError:
-                # Invalid date format - ignore filter
-                pass
-        
-        # Apply limit by using a subquery to get IDs first
-        # This ensures we respect the limit while maintaining referential integrity
+        # Build query to get message IDs that match criteria
         id_subquery = (
             select(Message.id)
             .where(
@@ -14539,7 +15283,7 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
             .limit(limit)
         )
         
-        # Apply same filters to subquery
+        # Apply optional filters
         if status:
             id_subquery = id_subquery.where(Message.status == status)
         
@@ -14558,62 +15302,101 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
                 pass
         
         try:
-            # Execute the deletion within a transaction
-            async with self.session.begin():
-                # First get the IDs that will be deleted
-                id_result = await self.session.execute(id_subquery)
-                message_ids = [row[0] for row in id_result.fetchall()]
-                
-                if not message_ids:
-                    return 0, []
-                
-                # Now delete using the specific IDs
-                final_delete_query = delete(Message).where(Message.id.in_(message_ids))
-                result = await self.session.execute(final_delete_query)
-                
-                deleted_count = result.rowcount
-                
-                logger.info(
-                    f"Bulk deleted {deleted_count} messages from campaign {campaign_id} "
-                    f"for user {user_id} with filters: status={status}, "
-                    f"from_date={from_date}, to_date={to_date}"
+            # Get the message IDs that match criteria
+            id_result = await self.session.execute(id_subquery)
+            message_ids = [row[0] for row in id_result.fetchall()]
+            
+            if not message_ids:
+                return 0, [], {
+                    "requires_confirmation": False,
+                    "events_count": 0,
+                    "events_deleted": 0,
+                    "batch_info": {"batches_processed": 0, "batch_size": batch_size},
+                    "safety_warnings": []
+                }
+            
+            # Check for events if not force deleting
+            if not force_delete:
+                events_count, messages_with_events = await self.check_events_for_messages(
+                    message_ids=message_ids,
+                    user_id=user_id
                 )
                 
-                return deleted_count, []
-                
+                if events_count > 0:
+                    # Return safety warning instead of proceeding
+                    return 0, [], {
+                        "requires_confirmation": True,
+                        "events_count": events_count,
+                        "events_deleted": 0,
+                        "batch_info": {"batches_processed": 0, "batch_size": batch_size},
+                        "safety_warnings": [
+                            f"Cannot delete {len(message_ids)} message(s) because {events_count} delivery/status events exist.",
+                            "Please confirm deletion to remove both message(s) and all associated events."
+                        ]
+                    }
+            
+            # Proceed with deletion using batching
+            deleted_count, failed_ids, batch_info = await self.bulk_delete_with_batching(
+                message_ids=message_ids,
+                user_id=user_id,
+                force_delete=force_delete,
+                batch_size=batch_size
+            )
+            
+            logger.info(
+                f"Campaign bulk delete completed: campaign={campaign_id}, "
+                f"deleted={deleted_count}, failed={len(failed_ids)}, "
+                f"force_delete={force_delete}, batches={batch_info.get('batches_processed', 0)}"
+            )
+            
+            return deleted_count, failed_ids, {
+                "requires_confirmation": False,
+                "events_count": 0,
+                "events_deleted": batch_info.get("events_deleted", 0),
+                "batch_info": batch_info,
+                "safety_warnings": []
+            }
+            
         except Exception as e:
             logger.error(f"Error in bulk_delete_campaign_messages: {e}")
-            # Return empty results on error - let the calling code handle the exception
             raise e
-        
 
+    
     async def bulk_delete_messages(
         self,
         *,
         message_ids: List[str],
         user_id: str,
-        campaign_id: Optional[str] = None
-    ) -> Tuple[int, List[str]]:
+        campaign_id: Optional[str] = None,
+        force_delete: bool = False
+    ) -> Tuple[int, List[str], Dict[str, Any]]:
         """
-        Global bulk delete messages by message IDs.
+        Global bulk delete messages by message IDs with event safety.
         
         This method efficiently deletes multiple messages by their specific IDs with
-        user authorization. Designed for edge cases like cross-campaign cleanup,
-        orphaned message removal, and power user operations. Uses smaller batch limits
-        for safety compared to campaign-scoped deletion.
+        user authorization and event safety checking. Designed for edge cases like
+        cross-campaign cleanup, orphaned message removal, and power user operations.
         
         Args:
             message_ids: List of message IDs to delete (max 1000 for safety)
             user_id: User ID - for authorization (messages must belong to this user)
             campaign_id: Optional campaign context for additional validation
+            force_delete: Whether to delete messages that have delivery events
             
         Returns:
-            Tuple[int, List[str]]: (deleted_count, failed_message_ids)
+            Tuple[int, List[str], Dict[str, Any]]: (deleted_count, failed_ids, metadata)
             - deleted_count: Number of messages successfully deleted
-            - failed_message_ids: List of message IDs that failed to delete
+            - failed_ids: List of message IDs that failed to delete
+            - metadata: Dictionary with operation details including:
+                - requires_confirmation: Whether force delete is needed
+                - events_count: Number of events that would be deleted
+                - events_deleted: Number of events actually deleted
+                - safety_warnings: List of safety warnings
             
-        Raises:
-            Exception: Database errors during bulk deletion
+        Event Safety:
+            - When force_delete=False: Returns safety warning if events exist
+            - When force_delete=True: Deletes both messages and events
+            - Two-phase deletion prevents foreign key violations
             
         Use Cases:
             - Cross-campaign message cleanup by power users
@@ -14626,9 +15409,15 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
             - Uses IN clause with message ID list
             - Smaller batches for safety vs campaign-scoped operations
         """
+
         # Validate input
         if not message_ids:
-            return 0, []
+            return 0, [], {
+                "requires_confirmation": False,
+                "events_count": 0,
+                "events_deleted": 0,
+                "safety_warnings": []
+            }
         
         # Safety limit - smaller than campaign-scoped for global operations
         if len(message_ids) > 1000:
@@ -14639,55 +15428,64 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
         unique_message_ids = list(dict.fromkeys(message_ids))
         
         try:
-            # Execute the deletion within a transaction
-            async with self.session.begin():
-                # Build base query - messages must belong to user
-                query = delete(Message).where(
+            # Check for events if not force deleting
+            if not force_delete:
+                events_count, messages_with_events = await self.check_events_for_messages(
+                    message_ids=unique_message_ids,
+                    user_id=user_id
+                )
+                
+                if events_count > 0:
+                    # Return safety warning instead of proceeding
+                    return 0, [], {
+                        "requires_confirmation": True,
+                        "events_count": events_count,
+                        "events_deleted": 0,
+                        "safety_warnings": [
+                            f"Cannot delete {len(unique_message_ids)} message(s) because {events_count} delivery/status events exist.",
+                            "Please confirm deletion to remove both message(s) and all associated events."
+                        ]
+                    }
+            
+            # Proceed with deletion (using smaller batches for global operations)
+            deleted_count, failed_ids, batch_info = await self.bulk_delete_with_batching(
+                message_ids=unique_message_ids,
+                user_id=user_id,
+                force_delete=force_delete,
+                batch_size=500  # Smaller batches for global operations
+            )
+            
+            # Additional campaign context validation for failed messages
+            if campaign_id and failed_ids:
+                # Filter failed IDs to only those that actually belong to the campaign
+                campaign_failed_query = select(Message.id).where(
                     and_(
-                        Message.id.in_(unique_message_ids),
-                        Message.user_id == user_id
+                        Message.id.in_(failed_ids),
+                        Message.user_id == user_id,
+                        Message.campaign_id == campaign_id
                     )
                 )
+                result = await self.session.execute(campaign_failed_query)
+                campaign_failed_ids = [row[0] for row in result.fetchall()]
                 
-                # Optional campaign context validation
-                if campaign_id:
-                    query = query.where(Message.campaign_id == campaign_id)
-                
-                # Execute deletion
-                result = await self.session.execute(query)
-                deleted_count = result.rowcount
-                
-                # Determine which messages failed to delete
-                if deleted_count < len(unique_message_ids):
-                    # Query to find which messages still exist (failed to delete)
-                    remaining_query = select(Message.id).where(
-                        and_(
-                            Message.id.in_(unique_message_ids),
-                            Message.user_id == user_id
-                        )
-                    )
-                    
-                    if campaign_id:
-                        remaining_query = remaining_query.where(Message.campaign_id == campaign_id)
-                    
-                    remaining_result = await self.session.execute(remaining_query)
-                    remaining_ids = [row[0] for row in remaining_result.fetchall()]
-                    
-                    # Failed IDs are those that were requested but still exist
-                    failed_message_ids = remaining_ids
-                else:
-                    failed_message_ids = []
-                
-                logger.info(
-                    f"Global bulk deleted {deleted_count} messages for user {user_id}. "
-                    f"Failed: {len(failed_message_ids)}. Campaign context: {campaign_id}"
-                )
-                
-                return deleted_count, failed_message_ids
-                
+                # Update failed list to only include campaign-context failures
+                failed_ids = campaign_failed_ids
+            
+            logger.info(
+                f"Global bulk delete completed: deleted={deleted_count}, "
+                f"failed={len(failed_ids)}, force_delete={force_delete}, "
+                f"campaign_context={campaign_id}, events_deleted={batch_info.get('events_deleted', 0)}"
+            )
+            
+            return deleted_count, failed_ids, {
+                "requires_confirmation": False,
+                "events_count": 0,
+                "events_deleted": batch_info.get("events_deleted", 0),
+                "safety_warnings": []
+            }
+            
         except Exception as e:
-            logger.error(f"Error in bulk_delete_messages: {e}")
-            # Return failed list as all requested IDs on error
+            logger.error(f"Error in global bulk_delete_messages: {e}")
             raise e
 </file>
 

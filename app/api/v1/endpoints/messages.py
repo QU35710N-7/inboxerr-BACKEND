@@ -29,6 +29,50 @@ from app.db.session import get_repository_context
 router = APIRouter()
 logger = logging.getLogger("inboxerr.endpoint")
 
+# ===========================
+# COLLECTION OPERATIONS
+# ===========================
+
+@router.get("/", response_model=PaginatedResponse[MessageResponse])
+async def list_messages(
+    pagination: PaginationParams = Depends(),
+    status: Optional[str] = Query(None, description="Filter by message status"),
+    phone_number: Optional[str] = Query(None, description="Filter by phone number"),
+    from_date: Optional[str] = Query(None, description="Filter from date (ISO format)"),
+    to_date: Optional[str] = Query(None, description="Filter to date (ISO format)"),
+    current_user: User = Depends(get_current_user),
+    sms_sender = Depends(get_sms_sender),
+):
+    """
+    List messages with optional filtering.
+    
+    Returns a paginated list of messages for the current user.
+    """
+    try:
+        filters = {
+            "status": status,
+            "phone_number": phone_number,
+            "from_date": from_date,
+            "to_date": to_date,
+            "user_id": current_user.id
+        }
+        
+        # Get messages with pagination
+        messages, total = await sms_sender.list_messages(
+            filters=filters,
+            skip=pagination.skip,
+            limit=pagination.limit
+        )
+        
+        # Return paginated response
+        return paginate_response(
+            items=messages,
+            total=total,
+            pagination=pagination
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error listing messages: {str(e)}")
 
 @router.post("/send", response_model=MessageResponse, status_code=202)
 async def send_message(
@@ -181,6 +225,172 @@ async def import_messages(
         raise HTTPException(status_code=500, detail=f"Error importing messages: {str(e)}")
 
 
+@router.delete("/bulk", response_model=BulkDeleteResponse)
+async def bulk_delete_messages(
+    request: GlobalBulkDeleteRequest,
+    current_user: User = Depends(get_current_user),
+    rate_limiter = Depends(get_rate_limiter),
+):
+    """
+    Global bulk delete messages by message IDs with event safety.
+    
+    This endpoint efficiently deletes multiple messages by their specific IDs across
+    campaigns or for orphaned message cleanup. Enhanced with delivery event safety
+    checking for edge cases, power user operations, and system maintenance tasks.
+    
+    **Event Safety Features:**
+    - Pre-deletion check for delivery events
+    - Requires explicit confirmation to delete tracking data
+    - Clear warnings about analytics data loss
+    - Two-phase deletion (events first, then messages)
+    
+    **Safety Features:**
+    - User authorization (can only delete own messages)
+    - Smaller batch limits (1K vs 10K for campaign-scoped)
+    - Optional campaign context validation
+    - Detailed failure reporting for partial operations
+    - Comprehensive audit logging
+    
+    **Use Cases:**
+    - Cross-campaign message cleanup by power users
+    - Frontend multi-select bulk operations
+    - Orphaned message removal during maintenance
+    - Compliance-driven deletion by specific message IDs
+    - System administration tasks
+    
+    **Performance:**
+    - Handles up to 1K message deletions efficiently
+    - Uses optimized IN clause with PostgreSQL
+    - Smaller batches for safety vs campaign operations
+    - Batched processing prevents server overload
+    
+    Args:
+        request: Global bulk delete request with message IDs, confirmation, and force options
+        current_user: Authenticated user (injected by dependency)
+        rate_limiter: Rate limiting for bulk operations (injected by dependency)
+    
+    Returns:
+        BulkDeleteResponse: Detailed results including event safety information
+        
+    Raises:
+        HTTPException 400: Invalid request or missing confirmation
+        HTTPException 403: User not authorized for specified messages
+        HTTPException 429: Rate limit exceeded
+        HTTPException 500: Database or internal server error
+    """
+    import time
+    
+    # Check rate limits for global bulk operations
+    await rate_limiter.check_rate_limit(current_user.id, "bulk_delete_global")
+    
+    start_time = time.time()
+    
+    try:
+        # Use repository context for proper connection management
+        from app.db.repositories.messages import MessageRepository
+        
+        # Perform global bulk deletion with event safety
+        async with get_repository_context(MessageRepository) as message_repo:
+            # Execute bulk deletion with enhanced safety
+            deleted_count, failed_message_ids, metadata = await message_repo.bulk_delete_messages(
+                message_ids=request.message_ids,
+                user_id=current_user.id,
+                campaign_id=request.campaign_id,
+                force_delete=request.force_delete
+            )
+            
+            # Calculate execution time
+            execution_time_ms = int((time.time() - start_time) * 1000)
+            
+            # Build applied filters for audit trail
+            filters_applied = {
+                "message_count": len(request.message_ids),
+                "unique_messages": len(set(request.message_ids)),
+                "force_delete": request.force_delete
+            }
+            if request.campaign_id:
+                filters_applied["campaign_context"] = request.campaign_id
+            
+            # Build detailed error messages for failed deletions
+            error_messages = []
+            if failed_message_ids:
+                if metadata.get("requires_confirmation"):
+                    # Failed due to event safety check
+                    error_messages = metadata.get("safety_warnings", [])
+                else:
+                    # Failed due to other reasons (not found, not owned, etc.)
+                    error_messages = [
+                        f"Failed to delete message: {msg_id} (not found or not owned by user)" 
+                        for msg_id in failed_message_ids
+                    ]
+            
+            # Build response with enhanced metadata
+            response = BulkDeleteResponse(
+                deleted_count=deleted_count,
+                campaign_id=request.campaign_id,
+                failed_count=len(failed_message_ids),
+                errors=error_messages,
+                operation_type="global",
+                filters_applied=filters_applied,
+                execution_time_ms=execution_time_ms,
+                requires_confirmation=metadata.get("requires_confirmation", False),
+                events_count=metadata.get("events_count"),
+                events_deleted=metadata.get("events_deleted", 0),
+                safety_warnings=metadata.get("safety_warnings", []),
+                batch_info=None  # Global operations use smaller fixed batches
+            )
+            
+            # Log successful operation for audit
+            logger.info(
+                f"User {current_user.id} performed global bulk delete of {deleted_count} messages "
+                f"in {execution_time_ms}ms. Failed: {len(failed_message_ids)}. "
+                f"Campaign context: {request.campaign_id}. Events deleted: {metadata.get('events_deleted', 0)}. "
+                f"Force delete: {request.force_delete}"
+            )
+            
+            return response
+            
+    except Exception as e:
+        # Log error and return generic error message
+        logger.error(f"Error in global bulk_delete_messages: {e}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Error performing global bulk deletion: {str(e)}"
+        )
+
+# ===========================
+# NESTED RESOURCES SECTION
+# ===========================
+
+@router.get("/tasks/{task_id}", response_model=dict)
+async def get_task_status(
+    task_id: str = Path(..., description="Task ID"),
+    current_user: User = Depends(get_current_user),
+    sms_sender = Depends(get_sms_sender),
+):
+    """
+    Check the status of a background task.
+    
+    Used for tracking progress of batch operations and imports.
+    """
+    try:
+        task_status = await sms_sender.get_task_status(task_id, user_id=current_user.id)
+        if not task_status:
+            raise NotFoundError(message=f"Task {task_id} not found")
+        
+        return task_status
+        
+    except NotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error retrieving task status: {str(e)}")
+    
+
+# ===========================
+# INDIVIDUAL RESOURCES (ALWAYS LAST)
+# ===========================
+
+
 @router.get("/{message_id}", response_model=MessageResponse)
 async def get_message(
     message_id: str = Path(..., description="Message ID"),
@@ -200,47 +410,6 @@ async def get_message(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error retrieving message: {str(e)}")
 
-
-@router.get("/", response_model=PaginatedResponse[MessageResponse])
-async def list_messages(
-    pagination: PaginationParams = Depends(),
-    status: Optional[str] = Query(None, description="Filter by message status"),
-    phone_number: Optional[str] = Query(None, description="Filter by phone number"),
-    from_date: Optional[str] = Query(None, description="Filter from date (ISO format)"),
-    to_date: Optional[str] = Query(None, description="Filter to date (ISO format)"),
-    current_user: User = Depends(get_current_user),
-    sms_sender = Depends(get_sms_sender),
-):
-    """
-    List messages with optional filtering.
-    
-    Returns a paginated list of messages for the current user.
-    """
-    try:
-        filters = {
-            "status": status,
-            "phone_number": phone_number,
-            "from_date": from_date,
-            "to_date": to_date,
-            "user_id": current_user.id
-        }
-        
-        # Get messages with pagination
-        messages, total = await sms_sender.list_messages(
-            filters=filters,
-            skip=pagination.skip,
-            limit=pagination.limit
-        )
-        
-        # Return paginated response
-        return paginate_response(
-            items=messages,
-            total=total,
-            pagination=pagination
-        )
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error listing messages: {str(e)}")
 
 
 @router.put("/{message_id}/status", response_model=MessageResponse)
@@ -307,141 +476,3 @@ async def delete_message(
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error deleting message: {str(e)}")
-
-
-@router.get("/tasks/{task_id}", response_model=dict)
-async def get_task_status(
-    task_id: str = Path(..., description="Task ID"),
-    current_user: User = Depends(get_current_user),
-    sms_sender = Depends(get_sms_sender),
-):
-    """
-    Check the status of a background task.
-    
-    Used for tracking progress of batch operations and imports.
-    """
-    try:
-        task_status = await sms_sender.get_task_status(task_id, user_id=current_user.id)
-        if not task_status:
-            raise NotFoundError(message=f"Task {task_id} not found")
-        
-        return task_status
-        
-    except NotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error retrieving task status: {str(e)}")
-    
-
-@router.delete("/bulk", response_model=BulkDeleteResponse)
-async def bulk_delete_messages(
-    request: GlobalBulkDeleteRequest,
-    current_user: User = Depends(get_current_user),
-    rate_limiter = Depends(get_rate_limiter),
-):
-    """
-    Global bulk delete messages by message IDs.
-    
-    This endpoint efficiently deletes multiple messages by their specific IDs across
-    campaigns or for orphaned message cleanup. Designed for edge cases, power user
-    operations, and system maintenance tasks.
-    
-    **Safety Features:**
-    - User authorization (can only delete own messages)
-    - Smaller batch limits (1K vs 10K for campaign-scoped)
-    - Optional campaign context validation
-    - Detailed failure reporting for partial operations
-    - Comprehensive audit logging
-    
-    **Use Cases:**
-    - Cross-campaign message cleanup by power users
-    - Frontend multi-select bulk operations
-    - Orphaned message removal during maintenance
-    - Compliance-driven deletion by specific message IDs
-    - System administration tasks
-    
-    **Performance:**
-    - Handles up to 1K message deletions efficiently
-    - Uses optimized IN clause with PostgreSQL
-    - Smaller batches for safety vs campaign operations
-    
-    Args:
-        request: Global bulk delete request with message IDs and confirmation
-        current_user: Authenticated user (injected by dependency)
-        rate_limiter: Rate limiting for bulk operations (injected by dependency)
-    
-    Returns:
-        BulkDeleteResponse: Detailed results including failed message IDs
-        
-    Raises:
-        HTTPException 400: Invalid request or confirmation missing
-        HTTPException 403: User not authorized for specified messages
-        HTTPException 429: Rate limit exceeded
-        HTTPException 500: Database or internal server error
-    """
-    import time
-    
-    # Check rate limits for global bulk operations
-    await rate_limiter.check_rate_limit(current_user.id, "bulk_delete_global")
-    
-    start_time = time.time()
-    
-    try:
-        # Use repository context for proper connection management
-        from app.db.repositories.messages import MessageRepository
-        
-        # Perform global bulk deletion
-        async with get_repository_context(MessageRepository) as message_repo:
-            # Execute bulk deletion
-            deleted_count, failed_message_ids = await message_repo.bulk_delete_messages(
-                message_ids=request.message_ids,
-                user_id=current_user.id,
-                campaign_id=request.campaign_id
-            )
-            
-            # Calculate execution time
-            execution_time_ms = int((time.time() - start_time) * 1000)
-            
-            # Build applied filters for audit trail
-            filters_applied = {
-                "message_count": len(request.message_ids),
-                "unique_messages": len(set(request.message_ids))
-            }
-            if request.campaign_id:
-                filters_applied["campaign_context"] = request.campaign_id
-            
-            # Build detailed error messages for failed deletions
-            error_messages = []
-            if failed_message_ids:
-                error_messages = [
-                    f"Failed to delete message: {msg_id} (not found or not owned by user)" 
-                    for msg_id in failed_message_ids
-                ]
-            
-            # Build response
-            response = BulkDeleteResponse(
-                deleted_count=deleted_count,
-                campaign_id=request.campaign_id,
-                failed_count=len(failed_message_ids),
-                errors=error_messages,
-                operation_type="global",
-                filters_applied=filters_applied,
-                execution_time_ms=execution_time_ms
-            )
-            
-            # Log successful operation for audit
-            logger.info(
-                f"User {current_user.id} performed global bulk delete of {deleted_count} messages "
-                f"in {execution_time_ms}ms. Failed: {len(failed_message_ids)}. "
-                f"Campaign context: {request.campaign_id}"
-            )
-            
-            return response
-            
-    except Exception as e:
-        # Log error and return generic error message
-        logger.error(f"Error in global bulk_delete_messages: {e}")
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Error performing global bulk deletion: {str(e)}"
-        )

@@ -117,7 +117,6 @@ class BatchMessageResponse(BaseModel):
     created_at: datetime = Field(..., description="Batch creation timestamp")
     messages: Optional[List[MessageResponse]] = Field(None, description="List of message responses")
 
-
 class CampaignBulkDeleteRequest(BaseModel):
     """Schema for campaign-scoped bulk delete request."""
     status: Optional[MessageStatus] = Field(None, description="Filter by message status (e.g., 'failed', 'sent')")
@@ -125,6 +124,9 @@ class CampaignBulkDeleteRequest(BaseModel):
     to_date: Optional[datetime] = Field(None, description="Delete messages up to this date (ISO format)")
     limit: int = Field(default=1000, le=10000, description="Maximum number of messages to delete (max 10,000)")
     confirm_delete: bool = Field(default=True, description="Confirmation flag - must be true to proceed")
+    force_delete: bool = Field(default=False, description="Force delete messages with delivery events")
+    confirmation_token: Optional[str] = Field(None, description="Required when force_delete=True - must be 'CONFIRM'")
+    batch_size: int = Field(default=1000, le=5000, description="Process deletions in batches for server stability")
     
     @validator("limit")
     def validate_limit(cls, v):
@@ -133,6 +135,22 @@ class CampaignBulkDeleteRequest(BaseModel):
             raise ValueError("Limit must be greater than 0")
         if v > 10000:
             raise ValueError("Maximum limit is 10,000 messages per operation")
+        return v
+    
+    @validator("batch_size")
+    def validate_batch_size(cls, v):
+        """Validate batch size for server stability."""
+        if v <= 0:
+            raise ValueError("Batch size must be greater than 0")
+        if v > 5000:
+            raise ValueError("Maximum batch size is 5,000 for server stability")
+        return v
+    
+    @validator("confirmation_token")
+    def validate_confirmation_token(cls, v, values):
+        """Validate confirmation token when force delete is enabled."""
+        if values.get("force_delete") and v != "CONFIRM":
+            raise ValueError("confirmation_token must be 'CONFIRM' when force_delete is true")
         return v
     
     @validator("confirm_delete")
@@ -151,12 +169,13 @@ class CampaignBulkDeleteRequest(BaseModel):
                 raise ValueError("Date must be timezone-aware (include timezone information)")
         return v
 
-
 class GlobalBulkDeleteRequest(BaseModel):
     """Schema for global bulk delete request (by message IDs)."""
     message_ids: List[str] = Field(..., description="List of message IDs to delete")
     campaign_id: Optional[str] = Field(None, description="Optional campaign context for validation")
     confirm_delete: bool = Field(default=True, description="Confirmation flag - must be true to proceed")
+    force_delete: bool = Field(default=False, description="Force delete messages with delivery events")
+    confirmation_token: Optional[str] = Field(None, description="Required when force_delete=True - must be 'CONFIRM'")
     
     @validator("message_ids")
     def validate_message_ids(cls, v):
@@ -170,6 +189,13 @@ class GlobalBulkDeleteRequest(BaseModel):
         if len(v) != len(set(v)):
             raise ValueError("Duplicate message IDs found in request")
         
+        return v
+    
+    @validator("confirmation_token")
+    def validate_confirmation_token(cls, v, values):
+        """Validate confirmation token when force delete is enabled."""
+        if values.get("force_delete") and v != "CONFIRM":
+            raise ValueError("confirmation_token must be 'CONFIRM' when force_delete is true")
         return v
     
     @validator("confirm_delete")
@@ -189,6 +215,11 @@ class BulkDeleteResponse(BaseModel):
     operation_type: str = Field(..., description="Type of bulk operation ('campaign' or 'global')")
     filters_applied: Dict[str, Any] = Field(default={}, description="Filters that were applied during deletion")
     execution_time_ms: Optional[int] = Field(None, description="Operation execution time in milliseconds")
+    requires_confirmation: bool = Field(default=False, description="Whether force delete is needed due to existing events")
+    events_count: Optional[int] = Field(None, description="Number of delivery events that would be deleted")
+    events_deleted: int = Field(default=0, description="Number of delivery events actually deleted")
+    safety_warnings: List[str] = Field(default=[], description="Safety warnings about delivery event deletion")
+    batch_info: Optional[Dict[str, Any]] = Field(None, description="Batch processing information for large operations")
     
     class Config:
         """Pydantic config."""
@@ -204,7 +235,15 @@ class BulkDeleteResponse(BaseModel):
                     "status": "failed",
                     "from_date": "2024-01-01T00:00:00Z"
                 },
-                "execution_time_ms": 3421
+                "execution_time_ms": 3421,
+                "requires_confirmation": False,
+                "events_count": None,
+                "events_deleted": 0,
+                "safety_warnings": [],
+                "batch_info": {
+                    "batches_processed": 3,
+                    "batch_size": 1000
+                }
             }
         }
 

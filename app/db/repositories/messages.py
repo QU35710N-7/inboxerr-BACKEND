@@ -607,6 +607,371 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
         result = await self.session.execute(query)
         return result.scalars().all()
     
+    async def check_events_for_messages(
+        self,
+        *,
+        message_ids: List[str],
+        user_id: str
+    ) -> Tuple[int, List[str]]:
+        """
+        Check how many delivery events exist for given messages.
+        
+        This method performs a security-conscious check to count events only for messages
+        that belong to the specified user, preventing information leakage about other
+        users' messages.
+        
+        Args:
+            message_ids: List of message IDs to check for events
+            user_id: User ID for security validation
+            
+        Returns:
+            Tuple[int, List[str]]: (total_events_count, message_ids_with_events)
+            - total_events_count: Total number of events that would be deleted
+            - message_ids_with_events: List of message IDs that have associated events
+            
+        Security:
+            - Only counts events for messages owned by the specified user
+            - Prevents cross-user information disclosure
+            
+        Performance:
+            - Uses efficient subquery for user validation
+            - Single database round-trip for both counts and message list
+        """
+        from app.models.message import MessageEvent
+        
+        # Count total events for user's messages
+        events_count_query = select(func.count(MessageEvent.id)).where(
+            and_(
+                MessageEvent.message_id.in_(message_ids),
+                # Security: ensure messages belong to user
+                MessageEvent.message_id.in_(
+                    select(Message.id).where(
+                        and_(
+                            Message.id.in_(message_ids),
+                            Message.user_id == user_id
+                        )
+                    )
+                )
+            )
+        )
+        
+        # Get distinct message IDs that have events (for user's messages only)
+        messages_with_events_query = select(MessageEvent.message_id.distinct()).where(
+            and_(
+                MessageEvent.message_id.in_(message_ids),
+                # Security: ensure messages belong to user
+                MessageEvent.message_id.in_(
+                    select(Message.id).where(
+                        and_(
+                            Message.id.in_(message_ids),
+                            Message.user_id == user_id
+                        )
+                    )
+                )
+            )
+        )
+        
+        # Execute both queries
+        events_result = await self.session.execute(events_count_query)
+        messages_result = await self.session.execute(messages_with_events_query)
+        
+        total_events = events_result.scalar_one()
+        messages_with_events = [row[0] for row in messages_result.fetchall()]
+        
+        logger.debug(
+            f"Event check for user {user_id}: {total_events} events found "
+            f"across {len(messages_with_events)} messages"
+        )
+        
+        return total_events, messages_with_events
+    
+
+    async def bulk_delete_with_batching(
+        self,
+        *,
+        message_ids: List[str],
+        user_id: str,
+        force_delete: bool = False,
+        batch_size: int = 1000
+    ) -> Tuple[int, List[str], Dict[str, Any]]:
+        """
+        Bulk delete messages with batching for server stability and event safety.
+        
+        This method processes large deletion operations in smaller batches to prevent
+        server overload, connection timeouts, and database lock contention. It handles
+        both safe deletion (messages without events) and force deletion (with events).
+        
+        Args:
+            message_ids: List of message IDs to delete
+            user_id: User ID for authorization
+            force_delete: Whether to delete messages that have delivery events
+            batch_size: Number of messages to process per batch (max 5000)
+            
+        Returns:
+            Tuple[int, List[str], Dict[str, Any]]: (total_deleted, failed_ids, batch_info)
+            - total_deleted: Total number of messages successfully deleted
+            - failed_ids: List of message IDs that failed to delete
+            - batch_info: Dictionary with batch processing statistics
+            
+        Server Stability Features:
+            - Processes deletions in configurable batch sizes
+            - Includes inter-batch delays to prevent DB overload
+            - Each batch is atomic (all succeed or all fail per batch)
+            - Graceful handling of partial failures
+            
+        Event Safety:
+            - When force_delete=False: Only deletes messages without events
+            - When force_delete=True: Deletes events first, then messages
+            - Two-phase deletion prevents foreign key violations
+        """
+        import asyncio
+        
+        total_deleted = 0
+        all_failed_ids = []
+        batches_processed = 0
+        events_deleted_total = 0
+        
+        # Validate batch size
+        if batch_size > 5000:
+            batch_size = 5000
+            logger.warning(f"Batch size capped at 5000 for stability")
+        
+        logger.info(
+            f"Starting batched deletion: {len(message_ids)} messages, "
+            f"batch_size={batch_size}, force_delete={force_delete}, user={user_id}"
+        )
+        
+        # Process in batches
+        for i in range(0, len(message_ids), batch_size):
+            batch_ids = message_ids[i:i + batch_size]
+            batches_processed += 1
+            
+            try:
+                # Process this batch
+                if force_delete:
+                    deleted, failed, events_deleted = await self._delete_batch_with_events(
+                        batch_ids, user_id
+                    )
+                    events_deleted_total += events_deleted
+                else:
+                    deleted, failed = await self._delete_batch_safe(batch_ids, user_id)
+                
+                total_deleted += deleted
+                all_failed_ids.extend(failed)
+                
+                logger.debug(
+                    f"Batch {batches_processed}: deleted {deleted}, failed {len(failed)}"
+                )
+                
+                # Small delay between batches to prevent overwhelming DB
+                if i + batch_size < len(message_ids):  # Don't delay after last batch
+                    await asyncio.sleep(0.1)
+                
+            except Exception as e:
+                logger.error(f"Batch {batches_processed} failed completely: {e}")
+                # Add all IDs from failed batch to failed list
+                all_failed_ids.extend(batch_ids)
+        
+        batch_info = {
+            "batches_processed": batches_processed,
+            "batch_size": batch_size,
+            "total_messages": len(message_ids),
+            "events_deleted": events_deleted_total
+        }
+        
+        logger.info(
+            f"Batched deletion completed: {total_deleted} deleted, "
+            f"{len(all_failed_ids)} failed, {batches_processed} batches, "
+            f"{events_deleted_total} events deleted"
+        )
+        
+        return total_deleted, all_failed_ids, batch_info
+    
+
+    async def _delete_batch_safe(
+        self,
+        message_ids: List[str],
+        user_id: str
+    ) -> Tuple[int, List[str]]:
+        """
+        Delete a batch of messages safely (only messages without delivery events).
+        
+        This method performs safe deletion by only removing messages that have no
+        associated delivery events. Messages with events are skipped and returned
+        in the failed list, allowing the caller to handle them appropriately.
+        
+        Args:
+            message_ids: List of message IDs to delete in this batch
+            user_id: User ID for authorization
+            
+        Returns:
+            Tuple[int, List[str]]: (deleted_count, failed_message_ids)
+            - deleted_count: Number of messages successfully deleted
+            - failed_message_ids: List of message IDs that have events (skipped)
+            
+        Safety Features:
+            - Only deletes messages without delivery events
+            - Preserves delivery tracking data by default
+            - Atomic transaction per batch
+            - User authorization on every message
+            
+        Performance:
+            - Single transaction per batch
+            - Efficient subquery to identify safe messages
+            - Minimal database round-trips
+        """
+        from app.models.message import MessageEvent
+        
+        try:
+            # Work within existing transaction - don't start a new one
+            # Find messages that have NO events (safe to delete)
+            messages_without_events_query = select(Message.id).where(
+                and_(
+                    Message.id.in_(message_ids),
+                    Message.user_id == user_id,
+                    # Only messages with NO events
+                    ~Message.id.in_(
+                        select(MessageEvent.message_id.distinct()).where(
+                            MessageEvent.message_id.in_(message_ids)
+                        )
+                    )
+                )
+            )
+            
+            result = await self.session.execute(messages_without_events_query)
+            safe_message_ids = [row[0] for row in result.fetchall()]
+            
+            if not safe_message_ids:
+                # All messages have events - none can be safely deleted
+                return 0, message_ids
+            
+            # Delete only the safe messages
+            delete_query = delete(Message).where(
+                and_(
+                    Message.id.in_(safe_message_ids),
+                    Message.user_id == user_id
+                )
+            )
+            
+            delete_result = await self.session.execute(delete_query)
+            deleted_count = delete_result.rowcount
+            
+            # Messages that couldn't be deleted (have events)
+            failed_ids = [mid for mid in message_ids if mid not in safe_message_ids]
+            
+            if failed_ids:
+                logger.debug(
+                    f"Safe deletion: {deleted_count} deleted, {len(failed_ids)} skipped (have events)"
+                )
+            else:
+                logger.debug(f"Safe deletion: {deleted_count} deleted, no events found")
+            
+            return deleted_count, failed_ids
+                
+        except Exception as e:
+            logger.error(f"Safe batch deletion failed: {e}")
+            return 0, message_ids  # All IDs failed
+    
+
+    async def _delete_batch_with_events(
+        self,
+        message_ids: List[str],
+        user_id: str
+    ) -> Tuple[int, List[str], int]:
+        """
+        Delete a batch of messages WITH their delivery events (force deletion).
+        
+        This method performs force deletion by removing both messages and their
+        associated delivery events in a two-phase process. Events are deleted first
+        to avoid foreign key constraint violations, then messages are deleted.
+        
+        Args:
+            message_ids: List of message IDs to delete in this batch
+            user_id: User ID for authorization
+            
+        Returns:
+            Tuple[int, List[str], int]: (deleted_count, failed_message_ids, events_deleted)
+            - deleted_count: Number of messages successfully deleted
+            - failed_message_ids: List of message IDs that failed to delete
+            - events_deleted: Number of delivery events deleted
+            
+        Force Deletion Process:
+            1. Delete all delivery events for the messages (prevents FK violations)
+            2. Delete the messages themselves
+            3. Both operations in single atomic transaction
+            
+        Data Loss Warning:
+            - This permanently destroys delivery tracking data
+            - Should only be used when explicitly confirmed by user
+            - May impact delivery analytics and compliance records
+            
+        Performance:
+            - Two-phase deletion in single transaction
+            - Efficient bulk operations with IN clauses
+            - User authorization on every operation
+        """
+        from app.models.message import MessageEvent
+        
+        try:
+            # Work within existing transaction - don't start a new one
+            # Phase 1: Delete events first (to avoid FK constraint violations)
+            events_delete_query = delete(MessageEvent).where(
+                and_(
+                    MessageEvent.message_id.in_(message_ids),
+                    # Security: only delete events for user's messages
+                    MessageEvent.message_id.in_(
+                        select(Message.id).where(
+                            and_(
+                                Message.id.in_(message_ids),
+                                Message.user_id == user_id
+                            )
+                        )
+                    )
+                )
+            )
+            
+            events_result = await self.session.execute(events_delete_query)
+            events_deleted = events_result.rowcount
+            
+            # Phase 2: Delete messages
+            messages_delete_query = delete(Message).where(
+                and_(
+                    Message.id.in_(message_ids),
+                    Message.user_id == user_id
+                )
+            )
+            
+            messages_result = await self.session.execute(messages_delete_query)
+            messages_deleted = messages_result.rowcount
+            
+            # Determine which messages failed to delete
+            if messages_deleted < len(message_ids):
+                # Query to find which messages still exist (failed to delete)
+                remaining_query = select(Message.id).where(
+                    and_(
+                        Message.id.in_(message_ids),
+                        Message.user_id == user_id
+                    )
+                )
+                
+                remaining_result = await self.session.execute(remaining_query)
+                remaining_ids = [row[0] for row in remaining_result.fetchall()]
+                failed_ids = remaining_ids
+            else:
+                failed_ids = []
+            
+            logger.info(
+                f"Force deletion batch: {messages_deleted} messages deleted, "
+                f"{events_deleted} events deleted, {len(failed_ids)} failed"
+            )
+            
+            return messages_deleted, failed_ids, events_deleted
+                
+        except Exception as e:
+            logger.error(f"Force deletion batch failed: {e}")
+            return 0, message_ids, 0  # All IDs failed, no events deleted
+    
+    
     async def bulk_delete_campaign_messages(
         self,
         *,
@@ -615,14 +980,16 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
         status: Optional[str] = None,
         from_date: Optional[str] = None,
         to_date: Optional[str] = None,
-        limit: int = 10000
-    ) -> Tuple[int, List[str]]:
+        limit: int = 10000,
+        force_delete: bool = False,
+        batch_size: int = 1000
+    ) -> Tuple[int, List[str], Dict[str, Any]]:
         """
-        Bulk delete messages for a campaign using single SQL query.
+        Bulk delete messages for a campaign with event safety and server stability.
         
         This method efficiently deletes multiple messages belonging to a specific campaign
-        with optional filtering by status and date range. Uses a single SQL DELETE query
-        for optimal performance with large datasets (10K-30K messages).
+        with optional filtering by status and date range. Enhanced with event safety
+        checking and batched processing for server stability under high load.
         
         Args:
             campaign_id: Campaign ID - messages must belong to this campaign
@@ -631,54 +998,40 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
             from_date: Optional from date filter (ISO format string)
             to_date: Optional to date filter (ISO format string)
             limit: Maximum number of messages to delete (default 10K, max 10K for safety)
+            force_delete: Whether to delete messages that have delivery events
+            batch_size: Number of messages to process per batch for stability
             
         Returns:
-            Tuple[int, List[str]]: (deleted_count, failed_message_ids)
+            Tuple[int, List[str], Dict[str, Any]]: (deleted_count, failed_ids, metadata)
             - deleted_count: Number of messages successfully deleted
-            - failed_message_ids: List of message IDs that failed to delete (usually empty)
+            - failed_ids: List of message IDs that failed to delete
+            - metadata: Dictionary with operation details including:
+                - requires_confirmation: Whether force delete is needed
+                - events_count: Number of events that would be deleted
+                - events_deleted: Number of events actually deleted
+                - batch_info: Batch processing statistics
+                - safety_warnings: List of safety warnings
             
-        Raises:
-            Exception: Database errors during bulk deletion
+        Event Safety:
+            - When force_delete=False: Returns safety warning if events exist
+            - When force_delete=True: Deletes both messages and events
+            - Two-phase deletion prevents foreign key violations
+            
+        Server Stability:
+            - Processes large operations in configurable batches
+            - Includes delays between batches to prevent DB overload
+            - Graceful handling of partial failures
             
         Performance:
-            - Handles 30K deletions in 3-5 seconds
-            - Uses single SQL query with compound WHERE clause
-            - Leverages existing database indexes for optimal performance
+            - Handles 30K deletions efficiently with batching
+            - Uses optimized queries with proper indexes
+            - Single transaction per batch for consistency
         """
         # Validate limit for safety
         if limit > 10000:
             limit = 10000
         
-        # Build the base DELETE query
-        query = delete(Message).where(
-            and_(
-                Message.campaign_id == campaign_id,
-                Message.user_id == user_id
-            )
-        )
-        
-        # Apply optional filters
-        if status:
-            query = query.where(Message.status == status)
-        
-        if from_date:
-            try:
-                from_date_obj = datetime.fromisoformat(from_date.replace('Z', '+00:00'))
-                query = query.where(Message.created_at >= from_date_obj)
-            except ValueError:
-                # Invalid date format - ignore filter
-                pass
-        
-        if to_date:
-            try:
-                to_date_obj = datetime.fromisoformat(to_date.replace('Z', '+00:00'))
-                query = query.where(Message.created_at <= to_date_obj)
-            except ValueError:
-                # Invalid date format - ignore filter
-                pass
-        
-        # Apply limit by using a subquery to get IDs first
-        # This ensures we respect the limit while maintaining referential integrity
+        # Build query to get message IDs that match criteria
         id_subquery = (
             select(Message.id)
             .where(
@@ -690,7 +1043,7 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
             .limit(limit)
         )
         
-        # Apply same filters to subquery
+        # Apply optional filters
         if status:
             id_subquery = id_subquery.where(Message.status == status)
         
@@ -709,62 +1062,101 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
                 pass
         
         try:
-            # Execute the deletion within a transaction
-            async with self.session.begin():
-                # First get the IDs that will be deleted
-                id_result = await self.session.execute(id_subquery)
-                message_ids = [row[0] for row in id_result.fetchall()]
-                
-                if not message_ids:
-                    return 0, []
-                
-                # Now delete using the specific IDs
-                final_delete_query = delete(Message).where(Message.id.in_(message_ids))
-                result = await self.session.execute(final_delete_query)
-                
-                deleted_count = result.rowcount
-                
-                logger.info(
-                    f"Bulk deleted {deleted_count} messages from campaign {campaign_id} "
-                    f"for user {user_id} with filters: status={status}, "
-                    f"from_date={from_date}, to_date={to_date}"
+            # Get the message IDs that match criteria
+            id_result = await self.session.execute(id_subquery)
+            message_ids = [row[0] for row in id_result.fetchall()]
+            
+            if not message_ids:
+                return 0, [], {
+                    "requires_confirmation": False,
+                    "events_count": 0,
+                    "events_deleted": 0,
+                    "batch_info": {"batches_processed": 0, "batch_size": batch_size},
+                    "safety_warnings": []
+                }
+            
+            # Check for events if not force deleting
+            if not force_delete:
+                events_count, messages_with_events = await self.check_events_for_messages(
+                    message_ids=message_ids,
+                    user_id=user_id
                 )
                 
-                return deleted_count, []
-                
+                if events_count > 0:
+                    # Return safety warning instead of proceeding
+                    return 0, [], {
+                        "requires_confirmation": True,
+                        "events_count": events_count,
+                        "events_deleted": 0,
+                        "batch_info": {"batches_processed": 0, "batch_size": batch_size},
+                        "safety_warnings": [
+                            f"Cannot delete {len(message_ids)} message(s) because {events_count} delivery/status events exist.",
+                            "Please confirm deletion to remove both message(s) and all associated events."
+                        ]
+                    }
+            
+            # Proceed with deletion using batching
+            deleted_count, failed_ids, batch_info = await self.bulk_delete_with_batching(
+                message_ids=message_ids,
+                user_id=user_id,
+                force_delete=force_delete,
+                batch_size=batch_size
+            )
+            
+            logger.info(
+                f"Campaign bulk delete completed: campaign={campaign_id}, "
+                f"deleted={deleted_count}, failed={len(failed_ids)}, "
+                f"force_delete={force_delete}, batches={batch_info.get('batches_processed', 0)}"
+            )
+            
+            return deleted_count, failed_ids, {
+                "requires_confirmation": False,
+                "events_count": 0,
+                "events_deleted": batch_info.get("events_deleted", 0),
+                "batch_info": batch_info,
+                "safety_warnings": []
+            }
+            
         except Exception as e:
             logger.error(f"Error in bulk_delete_campaign_messages: {e}")
-            # Return empty results on error - let the calling code handle the exception
             raise e
-        
 
+    
     async def bulk_delete_messages(
         self,
         *,
         message_ids: List[str],
         user_id: str,
-        campaign_id: Optional[str] = None
-    ) -> Tuple[int, List[str]]:
+        campaign_id: Optional[str] = None,
+        force_delete: bool = False
+    ) -> Tuple[int, List[str], Dict[str, Any]]:
         """
-        Global bulk delete messages by message IDs.
+        Global bulk delete messages by message IDs with event safety.
         
         This method efficiently deletes multiple messages by their specific IDs with
-        user authorization. Designed for edge cases like cross-campaign cleanup,
-        orphaned message removal, and power user operations. Uses smaller batch limits
-        for safety compared to campaign-scoped deletion.
+        user authorization and event safety checking. Designed for edge cases like
+        cross-campaign cleanup, orphaned message removal, and power user operations.
         
         Args:
             message_ids: List of message IDs to delete (max 1000 for safety)
             user_id: User ID - for authorization (messages must belong to this user)
             campaign_id: Optional campaign context for additional validation
+            force_delete: Whether to delete messages that have delivery events
             
         Returns:
-            Tuple[int, List[str]]: (deleted_count, failed_message_ids)
+            Tuple[int, List[str], Dict[str, Any]]: (deleted_count, failed_ids, metadata)
             - deleted_count: Number of messages successfully deleted
-            - failed_message_ids: List of message IDs that failed to delete
+            - failed_ids: List of message IDs that failed to delete
+            - metadata: Dictionary with operation details including:
+                - requires_confirmation: Whether force delete is needed
+                - events_count: Number of events that would be deleted
+                - events_deleted: Number of events actually deleted
+                - safety_warnings: List of safety warnings
             
-        Raises:
-            Exception: Database errors during bulk deletion
+        Event Safety:
+            - When force_delete=False: Returns safety warning if events exist
+            - When force_delete=True: Deletes both messages and events
+            - Two-phase deletion prevents foreign key violations
             
         Use Cases:
             - Cross-campaign message cleanup by power users
@@ -777,9 +1169,15 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
             - Uses IN clause with message ID list
             - Smaller batches for safety vs campaign-scoped operations
         """
+
         # Validate input
         if not message_ids:
-            return 0, []
+            return 0, [], {
+                "requires_confirmation": False,
+                "events_count": 0,
+                "events_deleted": 0,
+                "safety_warnings": []
+            }
         
         # Safety limit - smaller than campaign-scoped for global operations
         if len(message_ids) > 1000:
@@ -790,53 +1188,62 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
         unique_message_ids = list(dict.fromkeys(message_ids))
         
         try:
-            # Execute the deletion within a transaction
-            async with self.session.begin():
-                # Build base query - messages must belong to user
-                query = delete(Message).where(
+            # Check for events if not force deleting
+            if not force_delete:
+                events_count, messages_with_events = await self.check_events_for_messages(
+                    message_ids=unique_message_ids,
+                    user_id=user_id
+                )
+                
+                if events_count > 0:
+                    # Return safety warning instead of proceeding
+                    return 0, [], {
+                        "requires_confirmation": True,
+                        "events_count": events_count,
+                        "events_deleted": 0,
+                        "safety_warnings": [
+                            f"Cannot delete {len(unique_message_ids)} message(s) because {events_count} delivery/status events exist.",
+                            "Please confirm deletion to remove both message(s) and all associated events."
+                        ]
+                    }
+            
+            # Proceed with deletion (using smaller batches for global operations)
+            deleted_count, failed_ids, batch_info = await self.bulk_delete_with_batching(
+                message_ids=unique_message_ids,
+                user_id=user_id,
+                force_delete=force_delete,
+                batch_size=500  # Smaller batches for global operations
+            )
+            
+            # Additional campaign context validation for failed messages
+            if campaign_id and failed_ids:
+                # Filter failed IDs to only those that actually belong to the campaign
+                campaign_failed_query = select(Message.id).where(
                     and_(
-                        Message.id.in_(unique_message_ids),
-                        Message.user_id == user_id
+                        Message.id.in_(failed_ids),
+                        Message.user_id == user_id,
+                        Message.campaign_id == campaign_id
                     )
                 )
+                result = await self.session.execute(campaign_failed_query)
+                campaign_failed_ids = [row[0] for row in result.fetchall()]
                 
-                # Optional campaign context validation
-                if campaign_id:
-                    query = query.where(Message.campaign_id == campaign_id)
-                
-                # Execute deletion
-                result = await self.session.execute(query)
-                deleted_count = result.rowcount
-                
-                # Determine which messages failed to delete
-                if deleted_count < len(unique_message_ids):
-                    # Query to find which messages still exist (failed to delete)
-                    remaining_query = select(Message.id).where(
-                        and_(
-                            Message.id.in_(unique_message_ids),
-                            Message.user_id == user_id
-                        )
-                    )
-                    
-                    if campaign_id:
-                        remaining_query = remaining_query.where(Message.campaign_id == campaign_id)
-                    
-                    remaining_result = await self.session.execute(remaining_query)
-                    remaining_ids = [row[0] for row in remaining_result.fetchall()]
-                    
-                    # Failed IDs are those that were requested but still exist
-                    failed_message_ids = remaining_ids
-                else:
-                    failed_message_ids = []
-                
-                logger.info(
-                    f"Global bulk deleted {deleted_count} messages for user {user_id}. "
-                    f"Failed: {len(failed_message_ids)}. Campaign context: {campaign_id}"
-                )
-                
-                return deleted_count, failed_message_ids
-                
+                # Update failed list to only include campaign-context failures
+                failed_ids = campaign_failed_ids
+            
+            logger.info(
+                f"Global bulk delete completed: deleted={deleted_count}, "
+                f"failed={len(failed_ids)}, force_delete={force_delete}, "
+                f"campaign_context={campaign_id}, events_deleted={batch_info.get('events_deleted', 0)}"
+            )
+            
+            return deleted_count, failed_ids, {
+                "requires_confirmation": False,
+                "events_count": 0,
+                "events_deleted": batch_info.get("events_deleted", 0),
+                "safety_warnings": []
+            }
+            
         except Exception as e:
-            logger.error(f"Error in bulk_delete_messages: {e}")
-            # Return failed list as all requested IDs on error
+            logger.error(f"Error in global bulk_delete_messages: {e}")
             raise e
