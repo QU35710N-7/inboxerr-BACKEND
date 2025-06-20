@@ -198,7 +198,8 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
         *,
         user_id: str,
         name: str,
-        total: int
+        total: int,
+        batch_id: Optional[str] = None,
     ) -> MessageBatch:
         """
         Create a new message batch.
@@ -211,7 +212,7 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
         Returns:
             MessageBatch: Created batch
         """
-        batch_id = generate_prefixed_id(IDPrefix.BATCH)
+        batch_id =  batch_id or generate_prefixed_id(IDPrefix.BATCH)
         batch = MessageBatch(
             id=batch_id,
             name=name,

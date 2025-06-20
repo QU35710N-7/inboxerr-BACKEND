@@ -11,6 +11,8 @@ class IDPrefix(str, Enum):
     CAMPAIGN = "campaign"
     TEMPLATE = "template"
     WEBHOOK = "webhook"
+    IMPORT = "import"
+    TASK = "task"
 
 def generate_prefixed_id(prefix: IDPrefix) -> str:
     """

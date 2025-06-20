@@ -3,6 +3,7 @@ API endpoints for SMS message management.
 """
 import csv
 import io
+from datetime import datetime
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, UploadFile, File, Query, Path, status
 import logging
@@ -15,6 +16,7 @@ from app.schemas.message import (
     MessageResponse, 
     BatchMessageRequest, 
     BatchMessageResponse,
+    BatchOptions,
     MessageStatus,
     MessageStatusUpdate,
     GlobalBulkDeleteRequest,
@@ -74,7 +76,7 @@ async def list_messages(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error listing messages: {str(e)}")
 
-@router.post("/send", response_model=MessageResponse, status_code=202)
+@router.post("/send", response_model=dict, status_code=202)
 async def send_message(
     message: MessageCreate,
     background_tasks: BackgroundTasks,
@@ -88,31 +90,44 @@ async def send_message(
     - **phone_number**: Recipient phone number in E.164 format (e.g., +1234567890)
     - **message**: Content of the SMS message
     - **scheduled_at**: Optional timestamp to schedule the message for future delivery
+    
+    Returns 202 immediately with task_id for tracking progress.
     """
     # Check rate limits
     await rate_limiter.check_rate_limit(current_user.id, "send_message")
     
-    try:
-        # Send message asynchronously
-        result = await sms_sender.send_message(
-            phone_number=message.phone_number,
-            message_text=message.message,
-            user_id=current_user.id,
-            scheduled_at=message.scheduled_at,
-            custom_id=message.custom_id,
-        )
-        
-        return result
-        
-    except ValidationError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    except SMSGatewayError as e:
-        raise HTTPException(status_code=502, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error sending message: {str(e)}")
+    # Validate phone number early (before background task)
+    from app.utils.phone import validate_phone
+    is_valid, formatted_number, error, _ = validate_phone(message.phone_number)
+    if not is_valid:
+        raise HTTPException(status_code=422, detail=f"Invalid phone number: {error}")
+    
+    # Generate task ID for tracking
+    from app.utils.ids import generate_prefixed_id, IDPrefix
+    task_id = generate_prefixed_id(IDPrefix.TASK) # 	Merely a UUID you log so you can match logs to HTTP requests. You’re not using it elsewhere.
+    
+    # Add to background tasks - this returns immediately
+    background_tasks.add_task(
+        _send_message_background,
+        sms_sender=sms_sender,
+        phone_number=message.phone_number,
+        message_text=message.message,
+        user_id=current_user.id,
+        scheduled_at=message.scheduled_at,
+        custom_id=message.custom_id,
+        task_id=task_id
+    )
+    
+    # Return 202 immediately
+    return {
+        "status": "accepted",
+        "message": "Message queued for sending",
+        "task_id": task_id,
+        "phone_number": formatted_number
+    }
 
 
-@router.post("/batch", response_model=BatchMessageResponse, status_code=202)
+@router.post("/batch", response_model=dict, status_code=202)
 async def send_batch(
     batch: BatchMessageRequest,
     background_tasks: BackgroundTasks,
@@ -125,6 +140,8 @@ async def send_batch(
     
     - **messages**: List of messages to send
     - **options**: Optional batch processing options
+    
+    Returns 202 immediately with batch_id for tracking progress.
     """
     # Check rate limits - higher limit for batch operations
     await rate_limiter.check_rate_limit(current_user.id, "send_batch")
@@ -132,97 +149,47 @@ async def send_batch(
     if not batch.messages:
         raise ValidationError(message="Batch contains no messages")
     
-    try:
-        # Process batch asynchronously
-        result = await sms_sender.send_batch(
-            messages=batch.messages,
-            user_id=current_user.id,
-            options=batch.options,
-        )
-        
-        return result
-        
-    except ValidationError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    except SMSGatewayError as e:
-        raise HTTPException(status_code=502, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing batch: {str(e)}")
-
-
-@router.post("/import", status_code=202)
-async def import_messages(
-    file: UploadFile = File(...),
-    message_template: str = Query(..., description="Message template to send"),
-    delimiter: str = Query(",", description="CSV delimiter"),
-    has_header: bool = Query(True, description="Whether CSV has a header row"),
-    phone_column: str = Query("phone", description="Column name containing phone numbers"),
-    background_tasks: BackgroundTasks = None,
-    current_user: User = Depends(get_current_user),
-    sms_sender = Depends(get_sms_sender),
-    rate_limiter = Depends(get_rate_limiter),
-):
-    """
-    Import phone numbers from CSV and send messages.
+    # Validate messages early (before background task)
+    from app.utils.phone import validate_phone
+    invalid_numbers = []
+    for i, msg in enumerate(batch.messages):
+        is_valid, _, error, _ = validate_phone(msg.phone_number)
+        if not is_valid:
+            invalid_numbers.append(f"Message {i}: {error}")
     
-    - **file**: CSV file with phone numbers
-    - **message_template**: Template for the message to send
-    - **delimiter**: CSV delimiter character
-    - **has_header**: Whether the CSV has a header row
-    - **phone_column**: Column name containing phone numbers (if has_header=True)
-    """
-    # Check rate limits
-    await rate_limiter.check_rate_limit(current_user.id, "import_messages")
-    
-    try:
-        # Read CSV file
-        contents = await file.read()
-        csv_file = io.StringIO(contents.decode('utf-8'))
-        
-        # Parse CSV
-        csv_reader = csv.reader(csv_file, delimiter=delimiter)
-        
-        # Skip header if present
-        if has_header:
-            header = next(csv_reader)
-            try:
-                phone_index = header.index(phone_column)
-            except ValueError:
-                raise ValidationError(
-                    message=f"Column '{phone_column}' not found in CSV header",
-                    details={"available_columns": header}
-                )
-        else:
-            phone_index = 0  # Assume first column has phone numbers
-        
-        # Extract phone numbers
-        phone_numbers = []
-        for row in csv_reader:
-            if row and len(row) > phone_index:
-                phone = row[phone_index].strip()
-                if phone:
-                    phone_numbers.append(phone)
-        
-        if not phone_numbers:
-            raise ValidationError(message="No valid phone numbers found in CSV")
-        
-        # Process in background
-        task_id = await sms_sender.schedule_batch_from_numbers(
-            phone_numbers=phone_numbers,
-            message_text=message_template,
-            user_id=current_user.id,
+    if invalid_numbers:
+        raise HTTPException(
+            status_code=422, 
+            detail=f"Invalid phone numbers: {'; '.join(invalid_numbers[:3])}"
         )
-        
-        return {
-            "status": "accepted",
-            "message": f"Processing {len(phone_numbers)} messages",
-            "task_id": task_id,
-        }
-        
-    except ValidationError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error importing messages: {str(e)}")
+    
+    # Generate batch/task ID for tracking
+    from app.utils.ids import generate_prefixed_id, IDPrefix
+    batch_id = generate_prefixed_id(IDPrefix.BATCH)
+    task_id = generate_prefixed_id(IDPrefix.TASK) #	Merely a UUID you log so you can match logs to HTTP requests. You’re not using it elsewhere.
+    
+    # Add to background tasks - this returns immediately
+    background_tasks.add_task(
+        _send_batch_background,
+        sms_sender=sms_sender,
+        messages=batch.messages,
+        user_id=current_user.id,
+        options=batch.options,
+        batch_id=batch_id,
+        task_id=task_id
+    )
+    
+    # Return 202 immediately
+    return {
+        "status": "accepted", 
+        "message": f"Batch of {len(batch.messages)} messages queued for processing",
+        "batch_id": batch_id,
+        "task_id": task_id,
+        "total": len(batch.messages),
+        "processed": 0,
+        "successful": 0,
+        "failed": 0
+    }
 
 
 @router.delete("/bulk", response_model=BulkDeleteResponse)
@@ -476,3 +443,51 @@ async def delete_message(
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error deleting message: {str(e)}")
+
+
+# Background task functions
+async def _send_message_background(
+    sms_sender,
+    phone_number: str,
+    message_text: str,
+    user_id: str,
+    scheduled_at: Optional[datetime] = None,
+    custom_id: Optional[str] = None,
+    task_id: Optional[str] = None
+):
+    """
+    Background task for sending a single message.
+    """
+    try:
+        result = await sms_sender.send_message(
+            phone_number=phone_number,
+            message_text=message_text,
+            user_id=user_id,
+            scheduled_at=scheduled_at,
+            custom_id=custom_id,
+        )
+        logger.info(f"Background message send completed for task {task_id}: {result.get('id', 'unknown')}")
+    except Exception as e:
+        logger.error(f"Background message send failed for task {task_id}: {str(e)}")
+
+async def _send_batch_background(
+    sms_sender,
+    messages: List[MessageCreate],
+    user_id: str,
+    options: Optional[BatchOptions] = None,
+    batch_id: Optional[str] = None,
+    task_id: Optional[str] = None,
+):
+    """
+    Background task for sending a batch of messages.
+    """
+    try:
+        result = await sms_sender.send_batch(
+            messages=messages,
+            user_id=user_id,
+            options=options,
+            batch_id=batch_id
+        )
+        logger.info(f"Background batch send completed for task {task_id} (batch {batch_id}): {result.get('batch_id', 'unknown')}")
+    except Exception as e:
+        logger.error(f"Background batch send failed for task {task_id} (batch {batch_id}): {str(e)}")

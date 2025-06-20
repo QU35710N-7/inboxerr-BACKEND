@@ -1,4 +1,11 @@
-CSV import can exhaust memory on large files
+1.Title: Clarify /tasks/{id} vs real batch tracking
+Note: Current endpoint actually returns MessageBatch progress (batch-…) but route name implies background task. Rename or add real task tracker later so status polling for big sends (e.g., 50 k messages) is accurate.
+
+
+
+
+
+2.CSV import can exhaust memory on large files
 await file.read() loads the entire upload into RAM. For big CSVs (> ~50 MB) this will block the event-loop and may kill small instances.
 
 

@@ -214,7 +214,8 @@ class SMSSender:
         messages: List[MessageCreate],
         user_id: str,
         options: Optional[BatchOptions] = None,
-        campaign_id: Optional[str] = None
+        campaign_id: Optional[str] = None,
+        batch_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Send a batch of SMS messages.
@@ -248,7 +249,8 @@ class SMSSender:
             batch = await repo.create_batch(
                 user_id=user_id,
                 name=f"Batch {datetime.now(timezone.utc).isoformat()}",
-                total=len(messages)
+                total=len(messages),
+                batch_id=batch_id
             )
             
             # Process in background
