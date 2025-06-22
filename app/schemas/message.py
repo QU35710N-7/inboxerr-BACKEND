@@ -261,3 +261,48 @@ class BulkDeleteProgress(BaseModel):
     class Config:
         """Pydantic config."""
         from_attributes = True
+
+
+
+class MessageSendAcceptedResponse(BaseModel):
+    """Schema for message send accepted response (202)."""
+    status: str = Field(..., description="Request status", example="accepted")
+    message: str = Field(..., description="Human-readable status message")
+    task_id: str = Field(..., description="Task ID for tracking progress")
+    phone_number: str = Field(..., description="Formatted recipient phone number")
+    
+    class Config:
+        """Pydantic config."""
+        schema_extra = {
+            "example": {
+                "status": "accepted",
+                "message": "Message queued for sending",
+                "task_id": "msg-abc123def456",
+                "phone_number": "+1234567890"
+            }
+        }
+
+
+class BatchSendAcceptedResponse(BaseModel):
+    """Schema for batch send accepted response (202)."""
+    status: str = Field(..., description="Request status", example="accepted")
+    message: str = Field(..., description="Human-readable status message")
+    batch_id: str = Field(..., description="Batch ID for tracking progress")
+    total: int = Field(..., description="Total number of messages in batch")
+    processed: int = Field(0, description="Number of messages processed (initially 0)")
+    successful: int = Field(0, description="Number of successful messages (initially 0)")
+    failed: int = Field(0, description="Number of failed messages (initially 0)")
+    
+    class Config:
+        """Pydantic config."""
+        schema_extra = {
+            "example": {
+                "status": "accepted",
+                "message": "Batch of 5 messages queued for processing",
+                "batch_id": "batch-abc123def456",
+                "total": 5,
+                "processed": 0,
+                "successful": 0,
+                "failed": 0
+            }
+        }

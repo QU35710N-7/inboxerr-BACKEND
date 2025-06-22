@@ -14,6 +14,8 @@ from app.core.exceptions import ValidationError, SMSGatewayError, NotFoundError
 from app.schemas.message import (
     MessageCreate,
     MessageResponse, 
+    MessageSendAcceptedResponse,
+    BatchSendAcceptedResponse,
     BatchMessageRequest, 
     BatchMessageResponse,
     BatchOptions,
@@ -76,7 +78,7 @@ async def list_messages(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error listing messages: {str(e)}")
 
-@router.post("/send", response_model=dict, status_code=202)
+@router.post("/send", response_model=MessageSendAcceptedResponse, status_code=202)
 async def send_message(
     message: MessageCreate,
     background_tasks: BackgroundTasks,
@@ -127,7 +129,7 @@ async def send_message(
     }
 
 
-@router.post("/batch", response_model=dict, status_code=202)
+@router.post("/batch", response_model=BatchSendAcceptedResponse, status_code=202)
 async def send_batch(
     batch: BatchMessageRequest,
     background_tasks: BackgroundTasks,
