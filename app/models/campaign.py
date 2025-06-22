@@ -32,6 +32,10 @@ class Campaign(Base):
     
     # Campaign settings
     settings = Column(JSON, nullable=True, default=dict)  # Store campaign-specific settings
+
+    # NEW: Personalization fields
+    message_content = Column(Text, nullable=True)  # Actual message content for personalization
+    template_id = Column(String, ForeignKey("messagetemplate.id"), nullable=True, index=True)  # Reference to template used
     
     # Ownership
     user_id = Column(String, ForeignKey("user.id"), nullable=False, index=True)
@@ -40,6 +44,8 @@ class Campaign(Base):
     user = relationship("User")
     # In Campaign model:
     messages = relationship("Message", back_populates="campaign", cascade="all, delete-orphan")
+    template = relationship("MessageTemplate")  #Reference to template used
+
     
     # Helper properties
     @property

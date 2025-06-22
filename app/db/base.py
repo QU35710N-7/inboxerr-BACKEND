@@ -13,4 +13,8 @@ from app.models.webhook import Webhook, WebhookDelivery, WebhookEvent
 # Metrics Models
 from app.models.metrics import UserMetrics
 
+# NEW: Import pipeline models
+from app.models.import_job import ImportJob
+from app.models.contact import Contact
+
 # This allows alembic to auto-discover all models when creating migrations

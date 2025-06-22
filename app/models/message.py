@@ -33,7 +33,12 @@ class Message(Base):
     reason = Column(String, nullable=True)
     gateway_message_id = Column(String, nullable=True, index=True)
     user_id = Column(String, ForeignKey("user.id"), nullable=False, index=True)
-    meta_data = Column(JSON, nullable=True)  # Changed from 'metadata' to 'meta_data'
+    meta_data = Column(JSON, nullable=True)  # Changed from 'metadata' to 'meta_data' SQLAlchemy reserves metadata
+
+    # Personalization and import tracking
+    variables = Column(JSON, nullable=True)  # Store personalization variables as JSONB
+    import_id = Column(String, ForeignKey("importjob.id"), nullable=True, index=True)  # Reference to import job
+    
     
     # SMS parts tracking
     parts_count = Column(Integer, default=1, nullable=False)
@@ -43,6 +48,8 @@ class Message(Base):
     events = relationship("MessageEvent", back_populates="message", cascade="all, delete-orphan")
     batch_id = Column(String, ForeignKey("messagebatch.id"), nullable=True, index=True)
     batch = relationship("MessageBatch", back_populates="messages")
+    import_job = relationship("ImportJob")  # NEW: Reference to import job
+
 
 
 class MessageEvent(Base):

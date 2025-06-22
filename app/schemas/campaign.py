@@ -30,6 +30,9 @@ class CampaignBase(BaseModel):
     scheduled_start_at: Optional[datetime] = Field(None, description="Scheduled start time")
     scheduled_end_at: Optional[datetime] = Field(None, description="Scheduled end time")
     settings: Optional[Dict[str, Any]] = Field(default={}, description="Campaign settings")
+    # Personalization fields
+    message_content: Optional[str] = Field(None, description="Message content for personalization")
+    template_id: Optional[str] = Field(None, description="Template ID if using a template")
 
 
 class CampaignCreate(CampaignBase):
@@ -54,6 +57,9 @@ class CampaignUpdate(BaseModel):
     scheduled_start_at: Optional[datetime] = Field(None, description="Scheduled start time")
     scheduled_end_at: Optional[datetime] = Field(None, description="Scheduled end time")
     settings: Optional[Dict[str, Any]] = Field(None, description="Campaign settings")
+    #Personalization fields
+    message_content: Optional[str] = Field(None, description="Message content for personalization")
+    template_id: Optional[str] = Field(None, description="Template ID if using a template")
 
 
 class CampaignResponse(CampaignBase):
@@ -69,6 +75,11 @@ class CampaignResponse(CampaignBase):
     started_at: Optional[datetime] = Field(None, description="Start timestamp")
     completed_at: Optional[datetime] = Field(None, description="Completion timestamp")
     user_id: str = Field(..., description="User ID")
+
+    # Personalization fields
+    message_content: Optional[str] = Field(None, description="Message content for personalization")
+    template_id: Optional[str] = Field(None, description="Template ID if using a template")
+    
     
     # Add computed fields
     progress_percentage: float = Field(0, description="Progress percentage")

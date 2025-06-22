@@ -25,6 +25,8 @@ class MessageCreate(BaseModel):
     message: str = Field(..., description="Message content")
     scheduled_at: Optional[datetime] = Field(None, description="Schedule message for future delivery")
     custom_id: Optional[str] = Field(None, description="Custom ID for tracking")
+    variables: Optional[Dict[str, Any]] = Field(None, description="Variables for message personalization")
+
     
     @validator("phone_number")
     def validate_phone_number(cls, v):
@@ -61,6 +63,10 @@ class MessageResponse(BaseModel):
     gateway_message_id: Optional[str] = Field(None, description="ID from SMS gateway")
     user_id: str = Field(..., description="User who sent the message")
     meta_data: Optional[Dict[str, Any]] = Field(default={}, description="Additional metadata")
+    
+    # Personalization variables  
+    variables: Optional[Dict[str, Any]] = Field(None, description="Variables used for message personalization")
+    
     campaign: Optional[CampaignResponse] = Field(None, description="Campaign information if message belongs to a campaign")
     parts_count: Optional[int] = Field(None, description="Number of SMS parts")
 
