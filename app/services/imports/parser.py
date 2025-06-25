@@ -1,4 +1,17 @@
 """
+polish for future 
+Minor polish you could consider (not blockers):
+
+Single-pass initial scan – while hashing, also sniff delimiter + sample rows; then you only reopen the file once more for chunking (2 passes total).
+
+Generator for contact_dicts in _bulk_insert_contacts to avoid a temporary list copy.
+
+Store only unexpected errors in ImportError after the first 5 000 to keep the JSONB column slim.
+
+If you ever move the job off the main process, switch the file reads to aiofiles so the event loop isn’t blocked.
+"""
+
+"""
 Enhanced Streaming CSV parser service for import pipeline.
 
 This module provides memory-efficient CSV parsing with intelligent column detection,
@@ -10,6 +23,7 @@ PRODUCTION ENHANCEMENTS:
 - User feedback for low-confidence detections
 - Enhanced error handling and recovery suggestions
 - Optimized progress events with new ImportProgressV1 schema
+- UPDATED: Now uses ImportService static methods instead of instance dependency
 """
 import csv
 import hashlib
@@ -20,22 +34,18 @@ from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, AsyncGenerator, Tuple
 from pathlib import Path
 
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
-from sqlalchemy import select, func
-
-from app.models.import_job import ImportJob, ImportStatus
 from app.models.contact import Contact
 from app.schemas.contact import ContactCreate
 from app.schemas.import_job import ImportError
 from app.core.exceptions import ValidationError
 from app.utils.phone import validate_phone
-from app.db.session import get_repository_context
 from app.utils.ids import generate_prefixed_id, IDPrefix
 from app.services.imports.events import (
     ImportProgressV1, ImportEventType, ImportErrorV1, 
     create_progress_event, create_completion_event, create_failure_event
 )
+# Import the service for static method calls
+from app.services.imports.service import ImportService, BatchResult
 
 logger = logging.getLogger("inboxerr.parser")
 
@@ -266,7 +276,7 @@ class CSVParseResult:
         self.processed_rows = 0
         self.successful_contacts = 0
         self.errors: List[ImportError] = []
-        self.status = ImportStatus.PROCESSING
+        self.status = None  # Will be set by ImportService
         self.sha256_hash = ""
         self.column_detection: ColumnDetectionResult = ColumnDetectionResult()
         
@@ -315,16 +325,16 @@ class StreamingCSVParser:
     
     This parser processes large CSV files in chunks while maintaining constant
     memory usage and providing intelligent column detection with confidence scoring.
+    
+    UPDATED: Now uses ImportService static methods instead of instance dependency.
     """
     
-    def __init__(self, session: AsyncSession):
+    def __init__(self):
         """
         Initialize the enhanced CSV parser.
         
-        Args:
-            session: Async database session for operations
+        No longer requires ImportService instance - uses static methods.
         """
-        self.session = session
         self.config = CSVParserConfig()
         self._last_progress_update = 0
         
@@ -359,13 +369,6 @@ class StreamingCSVParser:
             await self._validate_file(file_path)
             result.sha256_hash = await self._calculate_file_hash(file_path)
             
-            # Update import job with initial status
-            await self._update_import_job(import_job_id, {
-                'status': ImportStatus.PROCESSING,
-                'sha256': result.sha256_hash,
-                'started_at': result.start_time
-            })
-            
             # Phase 2: File format detection
             encoding, delimiter = await self._detect_file_format(file_path)
             logger.info(f"Detected encoding: {encoding}, delimiter: '{delimiter}'")
@@ -373,7 +376,7 @@ class StreamingCSVParser:
             # Phase 3: Enhanced column detection
             headers = await self._parse_headers(file_path, encoding, delimiter)
             result.column_detection = await self._enhanced_column_detection(
-                file_path, encoding, delimiter, headers
+                file_path, encoding, delimiter, headers, import_job_id
             )
             
             # Check if manual review is needed
@@ -390,31 +393,48 @@ class StreamingCSVParser:
                     f"File has {result.total_rows:,} rows, maximum allowed is {self.config.MAX_ROWS:,}"
                 )
             
-            # Update import job with detection results
-            await self._update_import_job(import_job_id, {
-                'rows_total': result.total_rows,
-                'detected_columns': result.column_detection.detected_columns
-            })
+            # Initialize import job with detection results
+            metadata = {
+                'sha256': result.sha256_hash,
+                'detected_columns': result.column_detection.detected_columns,
+                'column_detection': {
+                    'quality': result.column_detection.detection_quality,
+                    'phone_confidence': result.column_detection.phone_confidence,
+                    'name_confidence': result.column_detection.name_confidence,
+                    'primary_phone_column': result.column_detection.primary_phone_column,
+                    'name_column': result.column_detection.name_column,
+                    'user_guidance': result.column_detection.user_guidance
+                }
+            }
+            await ImportService.initialize_import(import_job_id, result.total_rows, metadata)
             
             # Phase 5: Enhanced streaming processing
+            batch_number = 0
+            total_batches = (result.total_rows + self.config.BULK_INSERT_SIZE - 1) // self.config.BULK_INSERT_SIZE
+            
             async for chunk_result in self._enhanced_process_csv_chunks(
                 file_path, encoding, delimiter, import_job_id, result
             ):
+                batch_number += 1
+                
+                # Process batch through service
+                batch_result = await ImportService.process_contact_batch(
+                    import_job_id,
+                    chunk_result['contacts'],
+                    batch_number,
+                    total_batches
+                )
+                
+                # Update result statistics
                 result.processed_rows += chunk_result['processed']
-                result.successful_contacts += chunk_result['successful']
-                result.errors.extend(chunk_result['errors'])
+                result.successful_contacts += batch_result.success_count
+                result.errors.extend(batch_result.errors)
                 result.processing_rate = chunk_result.get('processing_rate', 0)
                 result.memory_usage_mb = chunk_result.get('memory_usage_mb', 0.0)
                 
                 # Enhanced progress reporting with rate limiting
                 current_time = datetime.now(timezone.utc).timestamp()
                 if (current_time - self._last_progress_update) >= self.config.PROGRESS_UPDATE_INTERVAL:
-                    
-                    # Update database
-                    await self._update_import_job(import_job_id, {
-                        'rows_processed': result.processed_rows,
-                        'errors': [error.dict() for error in result.errors[:self.config.ERROR_SAMPLE_SIZE]]
-                    })
                     
                     # Enhanced progress callback
                     if progress_callback:
@@ -425,7 +445,7 @@ class StreamingCSVParser:
                                 column=error.column,
                                 message=error.message,
                                 value=error.value
-                            ) for error in chunk_result["errors"]
+                            ) for error in batch_result.errors
                         ]
                         
                         progress_event = create_progress_event(
@@ -448,28 +468,23 @@ class StreamingCSVParser:
                 # Check for critical errors
                 if result.has_critical_errors:
                     logger.warning(f"Too many errors ({result.error_count}), stopping import")
-                    result.status = ImportStatus.FAILED
-                    break
+                    raise ValidationError(f"Too many errors: {result.error_count}")
             
-            # Phase 6: Final status determination
-            if result.status == ImportStatus.PROCESSING:
-                if result.error_count == 0:
-                    result.status = ImportStatus.SUCCESS
-                elif result.successful_contacts > 0:
-                    result.status = ImportStatus.SUCCESS  # Partial success
-                else:
-                    result.status = ImportStatus.FAILED
-            
-            # Final import job update
+            # Phase 6: Complete import successfully
             end_time = datetime.now(timezone.utc)
             total_time = (end_time - result.start_time).total_seconds()
             
-            await self._update_import_job(import_job_id, {
-                'status': result.status,
-                'rows_processed': result.processed_rows,
-                'completed_at': end_time,
-                'errors': [error.dict() for error in result.errors[:self.config.ERROR_SAMPLE_SIZE]]
-            })
+            summary_stats = {
+                'total_rows': result.total_rows,
+                'processed_rows': result.processed_rows,
+                'successful_contacts': result.successful_contacts,
+                'error_count': result.error_count,
+                'processing_time': total_time,
+                'average_rate': result.processing_rate,
+                'column_detection': result.column_detection.detected_columns
+            }
+            
+            await ImportService.complete_import(import_job_id, summary_stats)
             
             logger.info(
                 f"Enhanced CSV parse complete for job {import_job_id}: "
@@ -479,14 +494,14 @@ class StreamingCSVParser:
             
         except Exception as e:
             logger.error(f"Enhanced CSV parse failed for job {import_job_id}: {str(e)}")
-            result.status = ImportStatus.FAILED
             
-            # Update import job with failure
-            await self._update_import_job(import_job_id, {
-                'status': ImportStatus.FAILED,
-                'completed_at': datetime.now(timezone.utc),
-                'errors': [{'row': 0, 'column': None, 'message': str(e), 'value': None}]
-            })
+            # Mark import as failed
+            error_context = {
+                'error_type': type(e).__name__,
+                'rows_processed': result.processed_rows,
+                'partial_success': result.successful_contacts > 0
+            }
+            await ImportService.fail_import(import_job_id, e, error_context)
             
             raise
         
@@ -494,12 +509,12 @@ class StreamingCSVParser:
     
 
     async def parse_file_with_mapping(
-    self,
-    file_path: Path,
-    import_job_id: str,
-    mapping_config: Dict[str, Any],
-    progress_callback: Optional[callable] = None
-) -> CSVParseResult:
+        self,
+        file_path: Path,
+        import_job_id: str,
+        mapping_config: Dict[str, Any],
+        progress_callback: Optional[callable] = None
+    ) -> CSVParseResult:
         """
         Parse CSV file with explicit user-provided column mapping.
         
@@ -519,15 +534,9 @@ class StreamingCSVParser:
         result.start_time = datetime.now(timezone.utc)
         
         try:
-            # Phase 1: File validation and setup (same as before)
+            # Phase 1: File validation and setup
             await self._validate_file(file_path)
             result.sha256_hash = await self._calculate_file_hash(file_path)
-            
-            await self._update_import_job(import_job_id, {
-                'status': ImportStatus.PROCESSING,
-                'sha256': result.sha256_hash,
-                'started_at': result.start_time
-            })
             
             # Phase 2: File format detection
             encoding, delimiter = await self._detect_file_format(file_path)
@@ -560,54 +569,90 @@ class StreamingCSVParser:
                     f"File has {result.total_rows:,} rows, maximum allowed is {self.config.MAX_ROWS:,}"
                 )
             
+            # Initialize import with mapping info
+            metadata = {
+                'sha256': result.sha256_hash,
+                'user_mapped': True,
+                'column_mapping': mapping_config,
+                'detected_columns': result.column_detection.detected_columns
+            }
+            await ImportService.initialize_import(import_job_id, result.total_rows, metadata)
+            
             # Phase 6: Process with mapped columns
+            batch_number = 0
+            total_batches = (result.total_rows + self.config.BULK_INSERT_SIZE - 1) // self.config.BULK_INSERT_SIZE
+            
             async for chunk_result in self._process_csv_chunks_with_mapping(
                 file_path, encoding, delimiter, import_job_id, mapping_config, result
             ):
+                batch_number += 1
+                
+                # Process batch through service
+                batch_result = await ImportService.process_contact_batch(
+                    import_job_id,
+                    chunk_result['contacts'],
+                    batch_number,
+                    total_batches
+                )
+                
+                # Update result statistics
                 result.processed_rows += chunk_result['processed']
-                result.successful_contacts += chunk_result['successful']
-                result.errors.extend(chunk_result['errors'])
+                result.successful_contacts += batch_result.success_count
+                result.errors.extend(batch_result.errors)
                 result.processing_rate = chunk_result.get('processing_rate', 0)
                 result.memory_usage_mb = chunk_result.get('memory_usage_mb', 0.0)
                 
-                # Progress reporting (same as before)
+                # Progress reporting
                 current_time = datetime.now(timezone.utc).timestamp()
                 if (current_time - self._last_progress_update) >= self.config.PROGRESS_UPDATE_INTERVAL:
-                    await self._update_import_job(import_job_id, {
-                        'rows_processed': result.processed_rows,
-                        'errors': [error.dict() for error in result.errors[:self.config.ERROR_SAMPLE_SIZE]]
-                    })
-                    
                     if progress_callback:
-                        # Same progress callback logic as before
-                        pass
+                        # Same progress callback logic
+                        error_events = [
+                            ImportErrorV1(
+                                row=error.row,
+                                column=error.column,
+                                message=error.message,
+                                value=error.value
+                            ) for error in batch_result.errors
+                        ]
+                        
+                        progress_event = create_progress_event(
+                            job_id=import_job_id,
+                            processed=result.processed_rows,
+                            successful=result.successful_contacts,
+                            total_rows=result.total_rows,
+                            errors=error_events,
+                            error_count=result.error_count,
+                            has_critical_errors=result.has_critical_errors,
+                            estimated_completion=result.estimated_completion_time,
+                            processing_rate=int(result.processing_rate),
+                            memory_usage_mb=result.memory_usage_mb
+                        )
+                        
+                        await progress_callback(progress_event)
                     
                     self._last_progress_update = current_time
                 
                 if result.has_critical_errors:
                     logger.warning(f"Too many errors ({result.error_count}), stopping import")
-                    result.status = ImportStatus.FAILED
-                    break
+                    raise ValidationError(f"Too many errors: {result.error_count}")
             
-            # Phase 7: Final status determination (same as before)
-            if result.status == ImportStatus.PROCESSING:
-                if result.error_count == 0:
-                    result.status = ImportStatus.SUCCESS
-                elif result.successful_contacts > 0:
-                    result.status = ImportStatus.SUCCESS
-                else:
-                    result.status = ImportStatus.FAILED
-            
-            # Final update
+            # Complete import
             end_time = datetime.now(timezone.utc)
             total_time = (end_time - result.start_time).total_seconds()
             
-            await self._update_import_job(import_job_id, {
-                'status': result.status,
-                'rows_processed': result.processed_rows,
-                'completed_at': end_time,
-                'errors': [error.dict() for error in result.errors[:self.config.ERROR_SAMPLE_SIZE]]
-            })
+            summary_stats = {
+                'total_rows': result.total_rows,
+                'processed_rows': result.processed_rows,
+                'successful_contacts': result.successful_contacts,
+                'error_count': result.error_count,
+                'processing_time': total_time,
+                'average_rate': result.processing_rate,
+                'user_mapped': True,
+                'column_mapping': mapping_config
+            }
+            
+            await ImportService.complete_import(import_job_id, summary_stats)
             
             logger.info(
                 f"Mapped CSV parse complete for job {import_job_id}: "
@@ -617,13 +662,15 @@ class StreamingCSVParser:
             
         except Exception as e:
             logger.error(f"Mapped CSV parse failed for job {import_job_id}: {str(e)}")
-            result.status = ImportStatus.FAILED
             
-            await self._update_import_job(import_job_id, {
-                'status': ImportStatus.FAILED,
-                'completed_at': datetime.now(timezone.utc),
-                'errors': [{'row': 0, 'column': None, 'message': str(e), 'value': None}]
-            })
+            # Mark import as failed
+            error_context = {
+                'error_type': type(e).__name__,
+                'rows_processed': result.processed_rows,
+                'partial_success': result.successful_contacts > 0,
+                'mapping_used': mapping_config
+            }
+            await ImportService.fail_import(import_job_id, e, error_context)
             
             raise
         
@@ -634,7 +681,8 @@ class StreamingCSVParser:
         file_path: Path,
         encoding: str,
         delimiter: str,
-        headers: List[str]
+        headers: List[str],
+        import_job_id: str
     ) -> ColumnDetectionResult:
         """
         Enhanced column detection with confidence scoring and user guidance.
@@ -644,6 +692,7 @@ class StreamingCSVParser:
             encoding: File encoding
             delimiter: CSV delimiter
             headers: Parsed headers
+            import_job_id: Import job ID for storing detection metadata
             
         Returns:
             ColumnDetectionResult: Comprehensive detection results with confidence scores
@@ -714,6 +763,16 @@ class StreamingCSVParser:
         logger.info(f"Column detection complete: {result.detection_quality} confidence")
         logger.info(f"Primary phone: {result.primary_phone_column} ({result.phone_confidence:.1f})")
         logger.info(f"Name column: {result.name_column} ({result.name_confidence:.1f})")
+        
+        # Store detection results in service
+        await ImportService.update_detection_metadata(import_job_id, {
+            'quality': result.detection_quality,
+            'phone_confidence': result.phone_confidence,
+            'name_confidence': result.name_confidence,
+            'primary_phone_column': result.primary_phone_column,
+            'name_column': result.name_column,
+            'user_guidance': result.user_guidance
+        })
         
         return result
     
@@ -817,8 +876,6 @@ class StreamingCSVParser:
                 
                 # Process chunk when full
                 if (row_number - 1) % self.config.BULK_INSERT_SIZE == 0:
-                    successful = await self._bulk_insert_contacts(chunk_contacts)
-                    
                     # Calculate performance metrics
                     chunk_end_time = datetime.now(timezone.utc)
                     chunk_duration = (chunk_end_time - chunk_start_time).total_seconds()
@@ -826,32 +883,33 @@ class StreamingCSVParser:
                     
                     yield {
                         'processed': self.config.BULK_INSERT_SIZE,
-                        'successful': successful,
+                        'contacts': chunk_contacts,
                         'errors': chunk_errors,
                         'processing_rate': processing_rate,
                         'memory_usage_mb': self._get_memory_usage_mb()
                     }
                     
                     # Reset for next chunk
-                    chunk_contacts.clear()
-                    chunk_errors.clear()
+                    chunk_contacts = []
+                    chunk_errors = []
                     chunk_start_time = chunk_end_time
                     
                     # Brief pause to prevent database overwhelming
                     await asyncio.sleep(0.01)
             
             # Process final chunk
-            if chunk_contacts or chunk_errors:
-                successful = await self._bulk_insert_contacts(chunk_contacts)
+            if chunk_contacts or chunk_errors or row_number > 1:
                 remainder = (row_number - 1) % self.config.BULK_INSERT_SIZE
+                if remainder == 0:
+                    remainder = self.config.BULK_INSERT_SIZE
                 
                 chunk_end_time = datetime.now(timezone.utc)
                 chunk_duration = (chunk_end_time - chunk_start_time).total_seconds()
                 processing_rate = remainder / chunk_duration if chunk_duration > 0 else 0
                 
                 yield {
-                    'processed': remainder or self.config.BULK_INSERT_SIZE,
-                    'successful': successful,
+                    'processed': remainder,
+                    'contacts': chunk_contacts,
                     'errors': chunk_errors,
                     'processing_rate': processing_rate,
                     'memory_usage_mb': self._get_memory_usage_mb()
@@ -1013,159 +1071,6 @@ class StreamingCSVParser:
             row_count = sum(1 for _ in f)
         
         return row_count
-    
-    async def _bulk_insert_contacts(self, contacts: List[Contact]) -> int:
-        """
-        Enhanced bulk insert with better error handling and performance monitoring.
-        
-        Args:
-            contacts: List of Contact objects to insert
-            
-        Returns:
-            int: Number of contacts successfully inserted (excludes duplicates)
-        """
-        if not contacts:
-            return 0
-        
-        insert_start_time = datetime.now(timezone.utc)
-        
-        try:
-            # Use PostgreSQL's efficient UPSERT with VALUES clause
-            from sqlalchemy.dialects.postgresql import insert
-            from sqlalchemy import select
-            
-            # Prepare contact data for bulk operation
-            contact_values = []
-            for contact in contacts:
-                # Generate ID if not set
-                if not contact.id:
-                    contact.id = generate_prefixed_id(IDPrefix.CONTACT)
-                
-                contact_values.append({
-                    'id': contact.id,
-                    'import_id': contact.import_id,
-                    'phone': contact.phone,
-                    'name': contact.name,
-                    'tags': contact.tags,
-                    'csv_row_number': contact.csv_row_number,
-                    'raw_data': contact.raw_data,
-                })
-            
-            # Single UPSERT operation - PostgreSQL optimized
-            insert_stmt = insert(Contact.__table__)
-            upsert_stmt = insert_stmt.on_conflict_do_nothing(
-                index_elements=['import_id', 'phone']  # Uses existing unique constraint
-            )
-            
-            # Execute bulk upsert
-            result = await self.session.execute(upsert_stmt, contact_values)
-            
-            # Count successful insertions
-            count_query = select(func.count(Contact.id)).where(
-                Contact.id.in_([contact['id'] for contact in contact_values])
-            )
-            count_result = await self.session.execute(count_query)
-            successful_count = count_result.scalar() or 0
-            
-            # Performance logging
-            insert_duration = (datetime.now(timezone.utc) - insert_start_time).total_seconds()
-            rate = len(contacts) / insert_duration if insert_duration > 0 else 0
-            
-            duplicate_count = len(contacts) - successful_count
-            if duplicate_count > 0:
-                logger.debug(
-                    f"Bulk inserted {successful_count}/{len(contacts)} contacts "
-                    f"({duplicate_count} duplicates skipped) in {insert_duration:.2f}s ({rate:.1f} contacts/sec)"
-                )
-            else:
-                logger.debug(
-                    f"Bulk inserted {successful_count} contacts in {insert_duration:.2f}s ({rate:.1f} contacts/sec)"
-                )
-            
-            return successful_count
-            
-        except SQLAlchemyError as e:
-            logger.error(f"Bulk insert failed: {str(e)}")
-            # Fallback to individual inserts for error analysis
-            logger.warning("Falling back to individual insert mode for error analysis")
-            return await self._bulk_insert_contacts_fallback(contacts)
-        
-        except Exception as e:
-            logger.error(f"Unexpected error in bulk insert: {str(e)}")
-            raise
-
-    async def _bulk_insert_contacts_fallback(self, contacts: List[Contact]) -> int:
-        """
-        Enhanced fallback method with better error tracking.
-        
-        Args:
-            contacts: List of Contact objects to insert
-            
-        Returns:
-            int: Number of contacts successfully inserted
-        """
-        successful_count = 0
-        
-        logger.info(f"Processing {len(contacts)} contacts individually for error analysis")
-        
-        for contact in contacts:
-            try:
-                # Check if contact already exists
-                existing = await self.session.execute(
-                    select(Contact).where(
-                        Contact.import_id == contact.import_id,
-                        Contact.phone == contact.phone
-                    )
-                )
-                
-                if existing.scalar_one_or_none():
-                    logger.debug(f"Skipping duplicate contact: {contact.phone}")
-                    continue
-                
-                # Generate ID if not set
-                if not contact.id:
-                    contact.id = generate_prefixed_id(IDPrefix.CONTACT)
-                
-                # Insert individual contact
-                self.session.add(contact)
-                successful_count += 1
-                
-            except SQLAlchemyError as e:
-                logger.error(f"Failed to insert contact {contact.phone}: {str(e)}")
-            
-            except Exception as e:
-                logger.error(f"Unexpected error inserting contact {contact.phone}: {str(e)}")
-        
-        logger.info(f"Fallback processing completed: {successful_count} contacts inserted")
-        return successful_count
-    
-    async def _update_import_job(self, import_job_id: str, updates: Dict[str, Any]) -> None:
-        """Enhanced import job updates with better error handling."""
-        try:
-            # Get import job
-            result = await self.session.execute(
-                select(ImportJob).where(ImportJob.id == import_job_id)
-            )
-            import_job = result.scalar_one_or_none()
-            
-            if not import_job:
-                logger.error(f"Import job not found: {import_job_id}")
-                return
-            
-            # Apply updates
-            for key, value in updates.items():
-                if hasattr(import_job, key):
-                    setattr(import_job, key, value)
-                else:
-                    logger.warning(f"Unknown import job field: {key}")
-            
-            # Always update the updated_at timestamp
-            import_job.updated_at = datetime.now(timezone.utc)
-            
-        except SQLAlchemyError as e:
-            logger.error(f"Failed to update import job {import_job_id}: {str(e)}")
-        except Exception as e:
-            logger.error(f"Unexpected error updating import job {import_job_id}: {str(e)}")
 
     def _create_detection_from_mapping(self, mapping_config: Dict[str, Any], headers: List[str]) -> ColumnDetectionResult:
         """
@@ -1209,7 +1114,6 @@ class StreamingCSVParser:
         }
         
         return result
-
 
     async def _process_csv_chunks_with_mapping(
         self,
@@ -1263,44 +1167,42 @@ class StreamingCSVParser:
                             value=str(row)
                         ))
                 
-                # Process chunk when full (same as before)
+                # Process chunk when full
                 if (row_number - 1) % self.config.BULK_INSERT_SIZE == 0:
-                    successful = await self._bulk_insert_contacts(chunk_contacts)
-                    
                     chunk_end_time = datetime.now(timezone.utc)
                     chunk_duration = (chunk_end_time - chunk_start_time).total_seconds()
                     processing_rate = self.config.BULK_INSERT_SIZE / chunk_duration if chunk_duration > 0 else 0
                     
                     yield {
                         'processed': self.config.BULK_INSERT_SIZE,
-                        'successful': successful,
+                        'contacts': chunk_contacts,
                         'errors': chunk_errors,
                         'processing_rate': processing_rate,
                         'memory_usage_mb': self._get_memory_usage_mb()
                     }
                     
-                    chunk_contacts.clear()
-                    chunk_errors.clear()
+                    chunk_contacts = []
+                    chunk_errors = []
                     chunk_start_time = chunk_end_time
                     await asyncio.sleep(0.01)
             
             # Process final chunk
-            if chunk_contacts or chunk_errors:
-                successful = await self._bulk_insert_contacts(chunk_contacts)
+            if chunk_contacts or chunk_errors or row_number > 1:
                 remainder = (row_number - 1) % self.config.BULK_INSERT_SIZE
+                if remainder == 0:
+                    remainder = self.config.BULK_INSERT_SIZE
                 
                 chunk_end_time = datetime.now(timezone.utc)
                 chunk_duration = (chunk_end_time - chunk_start_time).total_seconds()
                 processing_rate = remainder / chunk_duration if chunk_duration > 0 else 0
                 
                 yield {
-                    'processed': remainder or self.config.BULK_INSERT_SIZE,
-                    'successful': successful,
+                    'processed': remainder,
+                    'contacts': chunk_contacts,
                     'errors': chunk_errors,
                     'processing_rate': processing_rate,
                     'memory_usage_mb': self._get_memory_usage_mb()
                 }
-
 
     async def _parse_contact_row_with_mapping(
         self,
@@ -1363,6 +1265,8 @@ class StreamingCSVParser:
         )
         
         return contact
+
+
 # Enhanced utility functions for backward compatibility
 def extract_phone_columns(headers: List[str]) -> List[str]:
     """

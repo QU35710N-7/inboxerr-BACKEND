@@ -1,9 +1,9 @@
 # app/services/imports/service.py
 """
-Import Service - Centralized transaction management for CSV imports.
+Import Service - Stateless coordinator for CSV imports.
 
-This service owns the database session lifecycle and ensures all import operations
-are properly transactional. One instance per import job, disposed after completion.
+This service coordinates import operations using the repository pattern with short-lived sessions.
+Follows the existing codebase architecture for consistency and proper connection management.
 """
 import os
 import logging
@@ -11,11 +11,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime, timezone
 from dataclasses import dataclass
 
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
-from sqlalchemy import select, func
-
-from app.db.session import get_session
+from app.db.session import get_repository_context
 from app.db.repositories.import_jobs import ImportJobRepository
 from app.db.repositories.contacts import ContactRepository
 from app.models.import_job import ImportJob, ImportStatus
@@ -41,98 +37,60 @@ class BatchResult:
 
 class ImportService:
     """
-    Centralized service for managing import operations with proper transaction boundaries.
+    Stateless coordinator for import operations following repository pattern.
     
-    One instance per import job. Owns the database session for the entire import lifecycle.
-    All database operations go through this service to ensure consistent transaction management.
+    Uses short-lived sessions through get_repository_context() for each operation.
+    No session lifecycle management - follows existing codebase architecture.
     """
     
-    def __init__(self, job_id: str):
-        """
-        Initialize import service for a specific job.
-        
-        Args:
-            job_id: Import job identifier
-        """
-        self.job_id = job_id
-        self.session: Optional[AsyncSession] = None
-        self.import_repo: Optional[ImportJobRepository] = None
-        self.contact_repo: Optional[ContactRepository] = None
-        self._job: Optional[ImportJob] = None
-        self._start_time = datetime.now(timezone.utc)
-        self._last_milestone = 0
-        
-    async def __aenter__(self):
-        """Context manager entry - creates session and repositories."""
-        # Create session using the proper context manager
-        self.session = await get_session().__aenter__()
-        
-        # Create repositories with the session
-        self.import_repo = ImportJobRepository(self.session)
-        self.contact_repo = ContactRepository(self.session)
-        
-        # Load the import job
-        self._job = await self.import_repo.get_by_id(self.job_id)
-        if not self._job:
-            raise ValueError(f"Import job {self.job_id} not found")
-            
-        logger.info(f"ImportService initialized for job {self.job_id}")
-        return self
-        
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit - ensures session cleanup."""
-        try:
-            if exc_type is not None:
-                # Exception occurred, rollback any pending transaction
-                if self.session and self.session.in_transaction():
-                    await self.session.rollback()
-                    logger.warning(f"Rolled back transaction for job {self.job_id} due to exception")
-            
-            # Clean up session
-            if self.session:
-                await self.session.close()
-                logger.debug(f"Closed session for import job {self.job_id}")
-                
-        except Exception as e:
-            logger.error(f"Error cleaning up ImportService for job {self.job_id}: {str(e)}")
-        finally:
-            self.session = None
-            self.import_repo = None
-            self.contact_repo = None
-            
-    async def initialize_import(self, total_rows: int, metadata: Optional[Dict[str, Any]] = None) -> None:
+    @staticmethod
+    async def initialize_import(
+        job_id: str, 
+        total_rows: int, 
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> None:
         """
         Initialize import job with starting state.
         
         Args:
+            job_id: Import job identifier
             total_rows: Total number of rows to process
             metadata: Optional metadata to store with job
         """
         try:
-            async with self.session.begin():
-                self._job.status = ImportStatus.PROCESSING
-                self._job.rows_total = total_rows
-                self._job.started_at = self._start_time
+            async with get_repository_context(ImportJobRepository) as import_repo:
+                # Get the job
+                job = await import_repo.get_by_id(job_id)
+                if not job:
+                    raise ValueError(f"Import job {job_id} not found")
+                
+                # Update job with initialization data
+                update_data = {
+                    "status": ImportStatus.PROCESSING,
+                    "rows_total": total_rows,
+                    "started_at": datetime.now(timezone.utc)
+                }
                 
                 # Store metadata in errors array (following existing pattern)
                 if metadata:
-                    self._job.errors = [{
+                    update_data["errors"] = [{
                         "row": 0,
                         "column": "_metadata",
                         "message": "Import initialization",
                         "value": metadata
                     }]
                 
-                self.session.add(self._job)
+                await import_repo.update(id=job_id, obj_in=update_data)
                 
-            logger.info(f"Initialized import job {self.job_id} with {total_rows} total rows")
+            logger.info(f"Initialized import job {job_id} with {total_rows} total rows")
             
         except Exception as e:
-            logger.error(f"Failed to initialize import job {self.job_id}: {str(e)}")
+            logger.error(f"Failed to initialize import job {job_id}: {str(e)}")
             raise
             
+    @staticmethod
     async def process_contact_batch(
-        self,
+        job_id: str,
         contacts: List[Contact],
         batch_number: int,
         total_batches: int
@@ -140,9 +98,10 @@ class ImportService:
         """
         Process a batch of contacts with atomic transaction handling.
         
-        All operations in this method are atomic - either all succeed or all fail.
+        Uses single repository context for atomic operation.
         
         Args:
+            job_id: Import job identifier
             contacts: List of contacts to insert
             batch_number: Current batch number (1-based)
             total_batches: Total number of batches expected
@@ -163,20 +122,28 @@ class ImportService:
             return result
             
         try:
-            # Single transaction for the entire batch
-            async with self.session.begin():
-                # 1. Bulk insert contacts
-                success_count = await self._bulk_insert_contacts(contacts)
+            # Use dual repository context for atomic batch processing
+            async with get_repository_context(ImportJobRepository) as import_repo, \
+                       get_repository_context(ContactRepository) as contact_repo:
+                
+                # 1. Get current job state
+                job = await import_repo.get_by_id(job_id)
+                if not job:
+                    raise ValueError(f"Import job {job_id} not found")
+                
+                # 2. Bulk insert contacts
+                success_count = await ImportService._bulk_insert_contacts(
+                    contact_repo, contacts
+                )
                 result.success_count = success_count
                 result.error_count = len(contacts) - success_count
                 
-                # 2. Update import job progress
-                self._job.rows_processed += len(contacts)
+                # 3. Update import job progress
+                new_rows_processed = job.rows_processed + len(contacts)
+                update_data = {"rows_processed": new_rows_processed}
                 
-                # 3. Store any errors (if needed)
+                # 4. Store batch errors if any
                 if result.error_count > 0:
-                    # For now, we'll track that some contacts failed
-                    # In the future, we might want to identify specific failures
                     error = ImportError(
                         row=batch_number * IMPORT_BATCH_SIZE,
                         column="batch",
@@ -184,16 +151,26 @@ class ImportService:
                         value=None
                     )
                     result.errors.append(error)
+                    
+                    # Add to job errors
+                    current_errors = job.errors or []
+                    current_errors.append({
+                        "row": batch_number * IMPORT_BATCH_SIZE,
+                        "column": "batch",
+                        "message": f"Batch {batch_number}: {result.error_count} contacts failed",
+                        "value": None
+                    })
+                    update_data["errors"] = current_errors
                 
-                # Add job to session for update
-                self.session.add(self._job)
+                # Update job
+                await import_repo.update(id=job_id, obj_in=update_data)
                 
             # Calculate processing time
             end_time = datetime.now(timezone.utc)
             result.processing_time_ms = (end_time - start_time).total_seconds() * 1000
             
-            # Log progress and check for milestones
-            await self._log_progress(batch_number, total_batches)
+            # Log progress
+            await ImportService._log_progress(job_id, batch_number, total_batches)
             
             logger.debug(
                 f"Batch {batch_number}/{total_batches} completed: "
@@ -201,127 +178,178 @@ class ImportService:
                 f"{result.processing_time_ms:.1f}ms"
             )
             
-        except IntegrityError as e:
-            # Specific handling for duplicate contacts
-            logger.warning(f"Batch {batch_number} had integrity errors (likely duplicates): {str(e)}")
-            result.error_count = len(contacts)
-            result.errors.append(ImportError(
-                row=batch_number * IMPORT_BATCH_SIZE,
-                column="batch",
-                message="Batch failed due to duplicate contacts",
-                value=str(e)
-            ))
-            
-        except SQLAlchemyError as e:
-            # Database-specific errors
-            logger.error(f"Database error processing batch {batch_number}: {str(e)}")
-            result.error_count = len(contacts)
-            result.errors.append(ImportError(
-                row=batch_number * IMPORT_BATCH_SIZE,
-                column="batch",
-                message=f"Database error: {str(e)}",
-                value=None
-            ))
-            raise
-            
         except Exception as e:
-            # Unexpected errors
-            logger.error(f"Unexpected error processing batch {batch_number}: {str(e)}")
+            # Handle various error types
+            logger.error(f"Error processing batch {batch_number} for job {job_id}: {str(e)}")
             result.error_count = len(contacts)
             result.errors.append(ImportError(
                 row=batch_number * IMPORT_BATCH_SIZE,
                 column="batch",
-                message=f"Unexpected error: {str(e)}",
+                message=f"Batch processing failed: {str(e)}",
                 value=None
             ))
             raise
             
         return result
         
-    async def complete_import(self, summary_stats: Dict[str, Any]) -> None:
+    @staticmethod
+    async def complete_import(job_id: str, summary_stats: Dict[str, Any]) -> None:
         """
         Mark import as successfully completed with final statistics.
         
         Args:
+            job_id: Import job identifier
             summary_stats: Final import statistics and metadata
         """
         try:
-            async with self.session.begin():
-                self._job.status = ImportStatus.SUCCESS
-                self._job.completed_at = datetime.now(timezone.utc)
+            async with get_repository_context(ImportJobRepository) as import_repo:
+                # Get current job
+                job = await import_repo.get_by_id(job_id)
+                if not job:
+                    raise ValueError(f"Import job {job_id} not found")
                 
-                # Add summary to errors array (following existing pattern)
-                if self._job.errors is None:
-                    self._job.errors = []
-                    
-                self._job.errors.append({
+                # Prepare completion data
+                current_errors = job.errors or []
+                current_errors.append({
                     "row": 0,
                     "column": "_summary",
                     "message": "Import completed successfully",
                     "value": summary_stats
                 })
                 
-                self.session.add(self._job)
+                update_data = {
+                    "status": ImportStatus.SUCCESS,
+                    "completed_at": datetime.now(timezone.utc),
+                    "errors": current_errors
+                }
                 
-            total_time = (datetime.now(timezone.utc) - self._start_time).total_seconds()
-            logger.info(
-                f"Import job {self.job_id} completed successfully: "
-                f"{self._job.rows_processed} rows in {total_time:.1f}s"
-            )
-            
+                await import_repo.update(id=job_id, obj_in=update_data)
+                
+            # Calculate total time from job data
+            async with get_repository_context(ImportJobRepository) as import_repo:
+                final_job = await import_repo.get_by_id(job_id)
+                if final_job and final_job.started_at:
+                    total_time = (datetime.now(timezone.utc) - final_job.started_at).total_seconds()
+                    logger.info(
+                        f"Import job {job_id} completed successfully: "
+                        f"{final_job.rows_processed} rows in {total_time:.1f}s"
+                    )
+                
         except Exception as e:
-            logger.error(f"Failed to complete import job {self.job_id}: {str(e)}")
+            logger.error(f"Failed to complete import job {job_id}: {str(e)}")
             raise
             
-    async def fail_import(self, error: Exception, error_context: Dict[str, Any]) -> None:
+    @staticmethod
+    async def fail_import(job_id: str, error: Exception, error_context: Dict[str, Any]) -> None:
         """
         Mark import as failed with error context.
         
         Args:
+            job_id: Import job identifier
             error: The exception that caused the failure
             error_context: Additional context about the failure
         """
         try:
-            async with self.session.begin():
-                self._job.status = ImportStatus.FAILED
-                self._job.completed_at = datetime.now(timezone.utc)
+            async with get_repository_context(ImportJobRepository) as import_repo:
+                # Get current job
+                job = await import_repo.get_by_id(job_id)
+                if not job:
+                    logger.warning(f"Import job {job_id} not found during failure handling")
+                    return
                 
-                # Store failure information
-                if self._job.errors is None:
-                    self._job.errors = []
-                    
-                self._job.errors.append({
+                # Prepare failure data
+                current_errors = job.errors or []
+                current_errors.append({
                     "row": 0,
                     "column": "_failure",
                     "message": str(error),
                     "value": error_context
                 })
                 
-                self.session.add(self._job)
+                update_data = {
+                    "status": ImportStatus.FAILED,
+                    "completed_at": datetime.now(timezone.utc),
+                    "errors": current_errors
+                }
                 
-            logger.error(
-                f"Import job {self.job_id} failed after processing "
-                f"{self._job.rows_processed}/{self._job.rows_total} rows: {str(error)}"
-            )
+                await import_repo.update(id=job_id, obj_in=update_data)
+                
+            logger.error(f"Import job {job_id} marked as failed: {str(error)}")
             
         except Exception as e:
-            logger.error(f"Failed to mark import job {self.job_id} as failed: {str(e)}")
+            logger.error(f"Failed to mark import job {job_id} as failed: {str(e)}")
             # Don't raise here - we're already in error handling
             
-    async def get_current_progress(self) -> Tuple[int, int]:
+    @staticmethod
+    async def get_current_progress(job_id: str) -> Tuple[int, int]:
         """
         Get current progress (processed, total).
         
+        Args:
+            job_id: Import job identifier
+            
         Returns:
             Tuple of (rows_processed, rows_total)
         """
-        return (self._job.rows_processed, self._job.rows_total)
+        try:
+            async with get_repository_context(ImportJobRepository) as import_repo:
+                job = await import_repo.get_by_id(job_id)
+                if not job:
+                    return (0, 0)
+                return (job.rows_processed, job.rows_total)
+        except Exception as e:
+            logger.error(f"Failed to get progress for job {job_id}: {str(e)}")
+            return (0, 0)
         
-    async def _bulk_insert_contacts(self, contacts: List[Contact]) -> int:
+    @staticmethod
+    async def update_detection_metadata(job_id: str, detection_data: Dict[str, Any]) -> None:
         """
-        Bulk insert contacts using PostgreSQL's ON CONFLICT DO NOTHING.
+        Update import job with column detection metadata.
         
         Args:
+            job_id: Import job identifier
+            detection_data: Column detection results
+        """
+        try:
+            async with get_repository_context(ImportJobRepository) as import_repo:
+                # Get current job
+                job = await import_repo.get_by_id(job_id)
+                if not job:
+                    raise ValueError(f"Import job {job_id} not found")
+                
+                current_errors = job.errors or []
+                
+                # Find and update or add detection metadata
+                detection_updated = False
+                for error in current_errors:
+                    if error.get("column") == "_metadata":
+                        if "value" not in error:
+                            error["value"] = {}
+                        error["value"]["column_detection"] = detection_data
+                        detection_updated = True
+                        break
+                        
+                if not detection_updated:
+                    current_errors.append({
+                        "row": 0,
+                        "column": "_metadata",
+                        "message": "Column detection",
+                        "value": {"column_detection": detection_data}
+                    })
+                    
+                await import_repo.update(id=job_id, obj_in={"errors": current_errors})
+                
+        except Exception as e:
+            logger.error(f"Failed to update detection metadata for job {job_id}: {str(e)}")
+            raise
+            
+    @staticmethod
+    async def _bulk_insert_contacts(contact_repo: ContactRepository, contacts: List[Contact]) -> int:
+        """
+        Bulk insert contacts using repository method.
+        
+        Args:
+            contact_repo: Contact repository instance
             contacts: List of contacts to insert
             
         Returns:
@@ -334,82 +362,44 @@ class ImportService:
         for contact in contacts:
             if not contact.id:
                 contact.id = generate_prefixed_id(IDPrefix.CONTACT)
-                
-        # Prepare contact data for bulk insert
-        contact_dicts = [
-            {
-                'id': contact.id,
-                'import_id': contact.import_id,
-                'phone': contact.phone,
-                'name': contact.name,
-                'tags': contact.tags,
-                'csv_row_number': contact.csv_row_number,
-                'raw_data': contact.raw_data,
-            }
-            for contact in contacts
-        ]
         
-        # Use PostgreSQL's INSERT ... ON CONFLICT DO NOTHING
-        from sqlalchemy.dialects.postgresql import insert
-        
-        stmt = insert(Contact.__table__).values(contact_dicts)
-        stmt = stmt.on_conflict_do_nothing(
-            index_elements=['import_id', 'phone']  # Unique constraint
-        )
-        
-        # Execute the insert
-        result = await self.session.execute(stmt)
-        
-        # Count how many were actually inserted
-        # PostgreSQL's INSERT returns rowcount of inserted rows (excluding conflicts)
-        return result.rowcount
-        
-    async def _log_progress(self, batch_number: int, total_batches: int) -> None:
-        """Log progress and emit milestone events."""
-        if self._job.rows_total == 0:
-            return
-            
-        progress_percent = (self._job.rows_processed / self._job.rows_total) * 100
-        
-        # Check for 10% milestones
-        milestone = int(progress_percent // 10) * 10
-        if milestone > self._last_milestone and milestone > 0:
-            self._last_milestone = milestone
-            logger.info(
-                f"Import {self.job_id} reached {milestone}% "
-                f"({self._job.rows_processed:,}/{self._job.rows_total:,} rows)"
-            )
-            
-    async def update_detection_metadata(self, detection_data: Dict[str, Any]) -> None:
-        """
-        Update import job with column detection metadata.
-        
-        Args:
-            detection_data: Column detection results
-        """
+        # Use repository's bulk insert method
         try:
-            async with self.session.begin():
-                if self._job.errors is None:
-                    self._job.errors = []
-                    
-                # Find and update or add detection metadata
-                detection_updated = False
-                for error in self._job.errors:
-                    if error.get("column") == "_metadata":
-                        error["value"].update({"column_detection": detection_data})
-                        detection_updated = True
-                        break
-                        
-                if not detection_updated:
-                    self._job.errors.append({
-                        "row": 0,
-                        "column": "_metadata",
-                        "message": "Column detection",
-                        "value": {"column_detection": detection_data}
-                    })
-                    
-                self.session.add(self._job)
-                
+            created_count, skipped_count, error_phones = await contact_repo.bulk_create_contacts(
+                contacts, ignore_duplicates=True
+            )
+            return created_count
         except Exception as e:
-            logger.error(f"Failed to update detection metadata for job {self.job_id}: {str(e)}")
-            raise
+            logger.error(f"Bulk insert failed: {str(e)}")
+            # Fallback: try individual inserts
+            success_count = 0
+            for contact in contacts:
+                try:
+                    await contact_repo.create(contact)
+                    success_count += 1
+                except Exception as individual_error:
+                    logger.debug(f"Individual contact insert failed: {str(individual_error)}")
+                    continue
+            return success_count
+        
+    @staticmethod
+    async def _log_progress(job_id: str, batch_number: int, total_batches: int) -> None:
+        """Log progress and emit milestone events."""
+        try:
+            async with get_repository_context(ImportJobRepository) as import_repo:
+                job = await import_repo.get_by_id(job_id)
+                if not job or job.rows_total == 0:
+                    return
+                    
+                progress_percent = (job.rows_processed / job.rows_total) * 100
+                
+                # Log milestone progress
+                milestone = int(progress_percent // 10) * 10
+                if milestone > 0 and milestone % 10 == 0:
+                    logger.info(
+                        f"Import {job_id} reached {milestone}% "
+                        f"({job.rows_processed:,}/{job.rows_total:,} rows)"
+                    )
+        except Exception as e:
+            logger.debug(f"Progress logging failed for job {job_id}: {str(e)}")
+            # Don't raise - progress logging is not critical

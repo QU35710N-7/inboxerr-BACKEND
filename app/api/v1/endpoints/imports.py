@@ -32,11 +32,13 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query, 
 from fastapi.responses import JSONResponse
 
 # Core dependencies
+
 from app.api.v1.dependencies import get_current_user, get_rate_limiter
 from app.core.exceptions import ValidationError, NotFoundError, InboxerrException
 from app.schemas.user import User
 from app.schemas.import_job import ImportJobResponse, ImportJobSummary, ImportStatus, ImportPreviewResponse, ColumnInfo, MappingSuggestion, ProcessImportRequest, ColumnMapping
 from app.schemas.contact import ContactResponse
+from app.services.imports.service import ImportService
 from app.services.imports.parser import StreamingCSVParser, CSVParseResult, ColumnDetectionResult
 from app.services.imports.events import (
     ImportProgressV1, ImportEventType, ImportErrorV1,
@@ -235,19 +237,22 @@ async def upload_csv_file(
                 # Run quick detection to determine confidence
                 try:
                     from app.services.imports.parser import StreamingCSVParser
-                    from app.db.session import get_session
+                    '''
+                    Quick column detection to determine processing confidence.
+                    Uses the refactored parser and stores metadata via repository context.
+                    '''                    
+                    # Create parser without service dependency
+                    parser = StreamingCSVParser()
+                    detection_result = await parser._enhanced_column_detection(
+                        Path(temp_path), 'utf-8', delimiter, headers, import_job_id
+                    )
+                    confidence_level = detection_result.detection_quality
                     
-                    async with get_session() as session:
-                        parser = StreamingCSVParser(session)
-                        detection_result = await parser._enhanced_column_detection(
-                            Path(temp_path), 'utf-8', delimiter, headers
-                        )
-                        confidence_level = detection_result.detection_quality
-                        
-                        # Auto-process only for high confidence
-                        should_auto_process = (confidence_level == "high")
-                        
-                        # Store detection info for preview
+                    # Auto-process only for high confidence
+                    should_auto_process = (confidence_level == "high")
+                    
+                    # Store detection info for preview using repository context
+                    async with get_repository_context(ImportJobRepository) as import_repo:
                         await import_repo.update(
                             id=import_job_id,
                             obj_in={
@@ -272,6 +277,7 @@ async def upload_csv_file(
                     logger.warning(f"Quick detection failed, defaulting to manual mapping: {str(e)}")
                     should_auto_process = False
                     confidence_level = "low"
+                    
             else:
                 # Use explicit user preference
                 should_auto_process = auto_process
@@ -899,7 +905,7 @@ async def process_csv_background(job_id: str, temp_file_path: str) -> None:
     Enhanced background task to process CSV file using the new StreamingCSVParser.
     
     **PRODUCTION ENHANCEMENTS:**
-    - Uses enhanced column detection with confidence scoring
+    - Uses ImportService static methods for database operations
     - Provides detailed progress updates with performance metrics
     - Better error handling with user-friendly messages
     - Memory monitoring for large file processing
@@ -912,141 +918,49 @@ async def process_csv_background(job_id: str, temp_file_path: str) -> None:
     logger.info(f"Starting enhanced background processing for import job {job_id}")
     
     try:
-        # PRODUCTION: Use direct session management for background tasks
-        from app.db.session import get_session
+        # Create parser
+        parser = StreamingCSVParser()
         
-        # Process CSV with enhanced parser
-        result = None
-        async with get_session() as session:
-            # Create enhanced parser with session
-            parser = StreamingCSVParser(session)
-            
-            # Enhanced progress callback with structured events
-            async def enhanced_progress_callback(progress_event: ImportProgressV1):
-                """Enhanced progress callback with detailed logging and potential WebSocket broadcasting."""
-                try:
-                    # Log progress with enhanced details
-                    logger.info(
-                        f"Import {job_id}: {progress_event['percent']:.1f}% "
-                        f"({progress_event['processed']}/{progress_event['total_rows']}) "
-                        f"✓{progress_event['successful']} ✗{progress_event['error_count']} "
-                        f"Rate: {progress_event.get('processing_rate', 0)} rows/sec "
-                        f"ETA: {progress_event.get('estimated_completion', 'Unknown')}"
-                    )
-                    
-                    # Here you could broadcast to WebSockets for real-time frontend updates
-                    # await websocket_manager.broadcast_to_user(user_id, progress_event)
-                    
-                    # Store detailed progress in cache for API polling
-                    # await redis_client.setex(f"import_progress:{job_id}", 300, json.dumps(progress_event))
-                    
-                except Exception as e:
-                    logger.warning(f"Progress callback error for job {job_id}: {str(e)}")
-            
-            # Process the CSV file with enhanced progress tracking
-            result = await parser.parse_file(
-                file_path=Path(temp_file_path),
-                import_job_id=job_id,
-                progress_callback=enhanced_progress_callback
-            )
-            
-            logger.info(f"Enhanced CSV parsing completed for job {job_id}")
-        
-        # Enhanced completion handling using repository pattern
-        async with get_repository_context(ImportJobRepository) as import_repo:
-            # Determine final status with enhanced logic
-            if result.status == ImportStatus.PROCESSING:
-                if result.error_count == 0:
-                    final_status = ImportStatus.SUCCESS
-                elif result.has_critical_errors:
-                    final_status = ImportStatus.FAILED
-                else:
-                    final_status = ImportStatus.SUCCESS  # Partial success
-            else:
-                final_status = result.status
-            
-            # Enhanced completion data
-            # Create enhanced error list with additional metadata
-            enhanced_errors = []
-            for error in result.errors[:100]:  # Limit stored errors
-                enhanced_error = {
-                    "row": error.row,
-                    "column": error.column,
-                    "message": error.message,
-                    "value": error.value
-                }
-                enhanced_errors.append(enhanced_error)
-            
-            # Add summary information to the first error entry for metadata storage
-            if enhanced_errors or final_status == ImportStatus.SUCCESS:
-                summary_error = {
-                    "row": 0,
-                    "column": "_metadata",
-                    "message": "Import summary",
-                    "value": {
-                        "successful_contacts": result.successful_contacts,
-                        "total_errors": result.error_count,
-                        "processing_rate": result.processing_rate,
-                        "memory_peak_mb": result.memory_usage_mb,
-                        "column_detection": {
-                            "quality": result.column_detection.detection_quality,
-                            "phone_confidence": result.column_detection.phone_confidence,
-                            "name_confidence": result.column_detection.name_confidence,
-                            "primary_phone_column": result.column_detection.primary_phone_column,
-                            "name_column": result.column_detection.name_column,
-                            "user_guidance": result.column_detection.user_guidance
-                        }
-                    }
-                }
-                enhanced_errors.insert(0, summary_error)
-            
-            # Update job with correct parameters
-            await import_repo.complete_job(
-                job_id=job_id,
-                status=final_status,
-                rows_processed=result.processed_rows,
-                errors=enhanced_errors
-            )
-            
-            
-            # Send completion event (for WebSocket broadcasting)
-            if result.start_time:
-                total_time = (datetime.now(timezone.utc) - result.start_time).total_seconds()
-                completion_event = create_completion_event(
-                    job_id=job_id,
-                    total_rows=result.total_rows,
-                    successful_contacts=result.successful_contacts,
-                    error_count=result.error_count,
-                    processing_time=total_time,
-                    average_rate=result.processing_rate,
-                    peak_memory=result.memory_usage_mb,
-                    sha256_verified=True,  # You have the hash from result
-                    detected_columns=result.column_detection.detected_columns,
-                    error_summary=[
-                        ImportErrorV1(
-                            row=error.row,
-                            column=error.column,
-                            message=error.message,
-                            value=error.value
-                        ) for error in result.errors[:10]  # Sample for event
-                    ],
-                    started_at=result.start_time,
-                    completed_at=datetime.now(timezone.utc)
+        # Enhanced progress callback with structured events
+        async def enhanced_progress_callback(progress_event: ImportProgressV1):
+            """Enhanced progress callback with detailed logging and potential WebSocket broadcasting."""
+            try:
+                # Log progress with enhanced details
+                logger.info(
+                    f"Import {job_id}: {progress_event['percent']:.1f}% "
+                    f"({progress_event['processed']}/{progress_event['total_rows']}) "
+                    f"✓{progress_event['successful']} ✗{progress_event['error_count']} "
+                    f"Rate: {progress_event.get('processing_rate', 0)} rows/sec "
+                    f"ETA: {progress_event.get('estimated_completion', 'Unknown')}"
                 )
                 
-                # Broadcast completion event
-                # await websocket_manager.broadcast_completion(completion_event)
-            
-            # Enhanced logging with performance metrics
-            logger.info(
-                f"Enhanced processing completed for import job {job_id}: "
-                f"Status={final_status.value}, "
-                f"Contacts={result.successful_contacts}/{result.total_rows}, "
-                f"Errors={result.error_count}, "
-                f"Detection={result.column_detection.detection_quality}, "
-                f"Rate={result.processing_rate:.1f} rows/sec, "
-                f"Memory={result.memory_usage_mb:.1f}MB"
-            )
+                # Here you could broadcast to WebSockets for real-time frontend updates
+                # await websocket_manager.broadcast_to_user(user_id, progress_event)
+                
+                # Store detailed progress in cache for API polling
+                # await redis_client.setex(f"import_progress:{job_id}", 300, json.dumps(progress_event))
+                
+            except Exception as e:
+                logger.warning(f"Progress callback error for job {job_id}: {str(e)}")
+        
+        # Process the CSV file with enhanced progress tracking
+        result = await parser.parse_file(
+            file_path=Path(temp_file_path),
+            import_job_id=job_id,
+            progress_callback=enhanced_progress_callback
+        )
+        
+        logger.info(f"Enhanced CSV parsing completed for job {job_id}")
+        
+        # Log the final metrics
+        logger.info(
+            f"Import job {job_id} completed: "
+            f"Contacts={result.successful_contacts}/{result.total_rows}, "
+            f"Errors={result.error_count}, "
+            f"Detection={result.column_detection.detection_quality}, "
+            f"Rate={result.processing_rate:.1f} rows/sec, "
+            f"Memory={result.memory_usage_mb:.1f}MB"
+        )
             
     except FileNotFoundError:
         logger.error(f"Temporary file not found for import job {job_id}: {temp_file_path}")
@@ -1088,7 +1002,6 @@ async def process_csv_background(job_id: str, temp_file_path: str) -> None:
         # CRITICAL: Always clean up temporary file
         await _cleanup_temp_file(temp_file_path)
 
-
 async def process_csv_with_mapping_background(
     job_id: str, 
     temp_file_path: str,
@@ -1107,32 +1020,33 @@ async def process_csv_with_mapping_background(
     logger.info(f"Starting mapped processing for import job {job_id}")
     
     try:
-        from app.db.session import get_session
+        # Create parser 
+        parser = StreamingCSVParser()
         
-        async with get_session() as session:
-            # Create parser with explicit mapping
-            parser = StreamingCSVParser(session)
-            
-            # Create mapping config for parser
-            mapping_config = {
-                "phone_columns": column_mapping.phone_columns,
-                "name_column": column_mapping.name_column,
-                "skip_columns": column_mapping.skip_columns,
-                "tag_columns": column_mapping.tag_columns,
-                "skip_invalid_phones": options.get("skip_invalid_phones", True),
-                "phone_country_default": options.get("phone_country_default", "US")
-            }
-            
-            # Process with explicit mapping
-            result = await parser.parse_file_with_mapping(
-                file_path=Path(temp_file_path),
-                import_job_id=job_id,
-                mapping_config=mapping_config,
-                progress_callback=None  # You can add progress callback here
-            )
-            
-            # Rest of processing is same as original...
-            # (Copy the completion handling from process_csv_background)
+        # Create mapping config for parser
+        mapping_config = {
+            "phone_columns": column_mapping.phone_columns,
+            "name_column": column_mapping.name_column,
+            "skip_columns": column_mapping.skip_columns,
+            "tag_columns": column_mapping.tag_columns,
+            "skip_invalid_phones": options.get("skip_invalid_phones", True),
+            "phone_country_default": options.get("phone_country_default", "US")
+        }
+        
+        # Process with explicit mapping
+        result = await parser.parse_file_with_mapping(
+            file_path=Path(temp_file_path),
+            import_job_id=job_id,
+            mapping_config=mapping_config,
+            progress_callback=None  # You can add progress callback here
+        )
+        
+        # Log completion
+        logger.info(
+            f"Mapped import job {job_id} completed: "
+            f"Contacts={result.successful_contacts}/{result.total_rows}, "
+            f"Errors={result.error_count}"
+        )
             
     except Exception as e:
         logger.error(f"Error in mapped processing for job {job_id}: {str(e)}")
@@ -1143,6 +1057,7 @@ async def process_csv_with_mapping_background(
             temp_file_path
         )
     finally:
+        # Clean Files
         await _cleanup_temp_file(temp_file_path)
 
 async def _handle_enhanced_processing_error(
