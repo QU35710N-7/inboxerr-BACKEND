@@ -25,6 +25,47 @@ class PhoneValidationError(Exception):
         super().__init__(message)
 
 
+def cleanup_phone_number(raw: str) -> str:
+    """
+    Clean up a raw phone number string before validation/parsing.
+
+    - Removes common formatting characters: spaces, dashes, dots, parentheses.
+    - Removes extension info (e.g., "x123", "ext 456", "#789").
+    - Strips out any characters except digits and leading '+'.
+    - Converts Unicode digits to ASCII.
+    - Returns a cleaned number string, ready for phonenumbers.parse().
+
+    Args:
+        raw (str): The raw phone number input.
+
+    Returns:
+        str: The cleaned phone number.
+    """
+    if not isinstance(raw, str):
+        return ""
+
+    # Convert full-width/Unicode digits to ASCII
+    raw = raw.translate(str.maketrans('０１２３４５６７８９', '0123456789'))
+
+    # Normalize leading 001/00/etc to + preserve following digits
+    raw = re.sub(r'^\s*(?:00|001)[\s\-\.]*', '+', raw)
+
+
+    # Remove common extension patterns (x123, ext. 456, #789, extension 101)
+    raw = re.sub(r'(ext\.?|x|extension|#)\s*\d+', '', raw, flags=re.IGNORECASE)
+
+    # Remove spaces, dashes, dots, and parentheses
+    raw = re.sub(r'[\s\-\.\(\)]', '', raw)
+
+    # Keep only digits and leading +
+    if raw.startswith('+'):
+        cleaned = '+' + re.sub(r'[^\d]', '', raw[1:])
+    else:
+        cleaned = re.sub(r'[^\d]', '', raw)
+
+    return cleaned
+
+
 def validate_phone_basic(number: str) -> Tuple[bool, str, Optional[str]]:
     """
     Basic phone number validation without external libraries.
@@ -35,6 +76,9 @@ def validate_phone_basic(number: str) -> Tuple[bool, str, Optional[str]]:
     Returns:
         Tuple[bool, str, str]: (is_valid, formatted_number, error_message)
     """
+    # Use the unified cleanup logic
+    cleaned = cleanup_phone_number(number)
+
     # Remove common formatting characters
     cleaned = re.sub(r'[\s\-\(\)\.]+', '', number)
     
@@ -54,13 +98,13 @@ def validate_phone_basic(number: str) -> Tuple[bool, str, Optional[str]]:
     
     return True, cleaned, None
 
-
-def validate_phone_advanced(number: str) -> Tuple[bool, str, Optional[str], Optional[Dict[str, Any]]]:
+def validate_phone_advanced(number: str, default_country: Optional[str] = "US") -> Tuple[bool, str, Optional[str], Optional[Dict[str, Any]]]:
     """
     Advanced phone number validation using the phonenumbers library.
     
     Args:
         number: Phone number to validate
+        default_country: The default region for non-E.164 numbers (e.g., "US", "CA")
         
     Returns:
         Tuple[bool, str, str, dict]: (is_valid, formatted_number, error_message, metadata)
@@ -70,7 +114,13 @@ def validate_phone_advanced(number: str) -> Tuple[bool, str, Optional[str], Opti
     try:
         # Parse the phone number
         try:
-            parsed = phonenumbers.parse(number, None)
+            cleaned_number = cleanup_phone_number(number)
+            # If already in E.164 (+...), parse as is; otherwise, parse as US (covers both US and Canada)
+            if cleaned_number.startswith('+1'):
+                parsed = phonenumbers.parse(cleaned_number, None)
+            else:
+                parsed = phonenumbers.parse(cleaned_number, default_country or "US")
+
         except NumberParseException as e:
             return False, number, f"Parse error: {str(e)}", None
         
@@ -107,7 +157,7 @@ def validate_phone_advanced(number: str) -> Tuple[bool, str, Optional[str], Opti
         return False, number, f"Validation error: {str(e)}", None
 
 
-def validate_phone(number: str, strict: bool = False) -> Tuple[bool, str, Optional[str], Optional[Dict]]:
+def validate_phone(number: str, strict: bool = False, default_country: str = "US") -> Tuple[bool, str, Optional[str], Optional[Dict]]:
     """
     Validate and format a phone number.
     
@@ -121,7 +171,7 @@ def validate_phone(number: str, strict: bool = False) -> Tuple[bool, str, Option
         Tuple[bool, str, str, dict]: (is_valid, formatted_number, error_message, metadata)
     """
     if PHONENUMBERS_AVAILABLE:
-        return validate_phone_advanced(number)
+        return validate_phone_advanced(number, default_country)
     else:
         is_valid, formatted, error = validate_phone_basic(number)
         return is_valid, formatted, error, None
@@ -225,3 +275,7 @@ def extract_phone_numbers(text: str) -> List[str]:
     
     # Deduplicate and return
     return list(set(results))
+
+
+
+

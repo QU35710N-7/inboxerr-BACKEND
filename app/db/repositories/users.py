@@ -65,8 +65,7 @@ class UserRepository(BaseRepository[User, UserCreate, UserUpdate]):
         )
         
         self.session.add(db_obj)
-        await self.session.commit()
-        await self.session.refresh(db_obj)
+
         
         return db_obj
     
@@ -125,8 +124,6 @@ class UserRepository(BaseRepository[User, UserCreate, UserUpdate]):
         )
         
         self.session.add(api_key)
-        await self.session.commit()
-        await self.session.refresh(api_key)
         
         return api_key
     
@@ -190,7 +187,6 @@ class UserRepository(BaseRepository[User, UserCreate, UserUpdate]):
         )
         
         result = await self.session.execute(query)
-        await self.session.commit()
         
         return result.rowcount > 0
     
@@ -209,7 +205,6 @@ class UserRepository(BaseRepository[User, UserCreate, UserUpdate]):
             return False
             
         await self.session.delete(api_key)
-        await self.session.commit()
         
         return True
     
@@ -229,6 +224,5 @@ class UserRepository(BaseRepository[User, UserCreate, UserUpdate]):
             
         api_key.is_active = False
         self.session.add(api_key)
-        await self.session.commit()
         
         return True

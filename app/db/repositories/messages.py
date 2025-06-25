@@ -99,11 +99,6 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
                     # Log but don't fail the message creation if campaign update fails
                     logger.error(f"Error updating campaign {campaign_id} message count: {e}")
         
-        # Commit the outer transaction
-        await self.session.commit()
-        
-        # Refresh message
-        await self.session.refresh(message)
         
         return message
 
@@ -185,11 +180,6 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
                 logger.error(f"Error updating message status: {e}")
                 return None
         
-        # Complete the outer transaction
-        await self.session.commit()
-        
-        # Refresh the message
-        await self.session.refresh(message)
         
         return message
 
@@ -227,7 +217,6 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
         async with self.session.begin():
             self.session.add(batch)
         
-        await self.session.refresh(batch)
         
         return batch
 

@@ -56,8 +56,6 @@ class CampaignRepository(BaseRepository[Campaign, Dict[str, Any], Dict[str, Any]
         )
         
         self.session.add(campaign)
-        await self.session.commit()
-        await self.session.refresh(campaign)
         
         return campaign
     
@@ -159,8 +157,7 @@ class CampaignRepository(BaseRepository[Campaign, Dict[str, Any], Dict[str, Any]
                     }
                 )
             
-            # No explicit commit needed - will be committed at the end of the context manager
-            await self.session.refresh(campaign)
+            
             
             return campaign
 
@@ -200,8 +197,6 @@ class CampaignRepository(BaseRepository[Campaign, Dict[str, Any], Dict[str, Any]
             campaign.completed_at = datetime.now(timezone.utc)
         
         self.session.add(campaign)
-        await self.session.commit()
-        await self.session.refresh(campaign)
         
         return campaign
     
@@ -304,6 +299,5 @@ class CampaignRepository(BaseRepository[Campaign, Dict[str, Any], Dict[str, Any]
         if added_count > 0:
             campaign.total_messages += added_count
             self.session.add(campaign)
-            await self.session.commit()
         
         return added_count

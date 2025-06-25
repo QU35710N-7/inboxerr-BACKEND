@@ -60,8 +60,6 @@ class WebhookRepository(BaseRepository[Webhook, Dict[str, Any], Dict[str, Any]])
         )
         
         self.session.add(webhook)
-        await self.session.commit()
-        await self.session.refresh(webhook)
         
         return webhook
     
@@ -140,8 +138,6 @@ class WebhookRepository(BaseRepository[Webhook, Dict[str, Any], Dict[str, Any]])
             delivery.next_retry_at = datetime.now(timezone.utc) + timedelta(minutes=backoff)
         
         self.session.add(delivery)
-        await self.session.commit()
-        await self.session.refresh(delivery)
         
         # Update webhook stats
         await self._update_webhook_stats(
@@ -179,7 +175,6 @@ class WebhookRepository(BaseRepository[Webhook, Dict[str, Any], Dict[str, Any]])
             webhook.failure_count += 1
         
         self.session.add(webhook)
-        await self.session.commit()
     
     async def get_pending_retries(
         self,
@@ -250,8 +245,6 @@ class WebhookRepository(BaseRepository[Webhook, Dict[str, Any], Dict[str, Any]])
             delivery.next_retry_at = None
         
         self.session.add(delivery)
-        await self.session.commit()
-        await self.session.refresh(delivery)
         
         # Update webhook stats
         await self._update_webhook_stats(
@@ -295,8 +288,6 @@ class WebhookRepository(BaseRepository[Webhook, Dict[str, Any], Dict[str, Any]])
         )
         
         self.session.add(event)
-        await self.session.commit()
-        await self.session.refresh(event)
         
         return event
     
@@ -324,8 +315,6 @@ class WebhookRepository(BaseRepository[Webhook, Dict[str, Any], Dict[str, Any]])
         event.error_message = error_message
         
         self.session.add(event)
-        await self.session.commit()
-        await self.session.refresh(event)
         
         return event
     

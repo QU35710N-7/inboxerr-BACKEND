@@ -1,8 +1,6 @@
 # app/api/v1/endpoints/campaigns.py
-import csv
-import io
-from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, UploadFile, File, Query, Path, status
+from typing import List, Optional, Dict, Any
+from fastapi import APIRouter, Depends, HTTPException, Query, Path, status
 from fastapi.responses import JSONResponse
 import logging
 
@@ -10,21 +8,27 @@ from app.api.v1.dependencies import get_current_user, get_rate_limiter
 from app.core.exceptions import ValidationError, NotFoundError
 from app.schemas.campaign import (
     CampaignCreate,
-    CampaignCreateFromCSV,
     CampaignUpdate,
     CampaignResponse,
     CampaignStatus,
 )
 from app.schemas.user import User
 from app.schemas.message import MessageResponse, CampaignBulkDeleteRequest, BulkDeleteResponse
+from app.schemas.import_job import ImportJobResponse, ImportStatus
 from app.utils.pagination import PaginationParams, paginate_response, PaginatedResponse, PageInfo
 from app.services.campaigns.processor import get_campaign_processor
 from app.db.session import get_repository_context
+from app.utils.ids import generate_prefixed_id, IDPrefix
+from app.utils.datetime import utc_now
+
+# Import Repository classes
+from app.db.repositories.campaigns import CampaignRepository
+from app.db.repositories.messages import MessageRepository  
+from app.db.repositories.import_jobs import ImportJobRepository
+from app.db.repositories.contacts import ContactRepository
 
 router = APIRouter()
 logger = logging.getLogger("inboxerr.endpoint")
-
-
 
 @router.post("/", response_model=CampaignResponse, status_code=status.HTTP_201_CREATED)
 async def create_campaign(
@@ -61,96 +65,168 @@ async def create_campaign(
         raise HTTPException(status_code=500, detail=f"Error creating campaign: {str(e)}")
 
 
-@router.post("/from-csv", response_model=CampaignResponse, status_code=status.HTTP_201_CREATED)
-async def create_campaign_from_csv(
-    file: UploadFile = File(...),
-    campaign_data: str = Query(..., description="Campaign data as JSON string"),
-    delimiter: str = Query(",", description="CSV delimiter"),
-    has_header: bool = Query(True, description="Whether CSV has a header row"),
-    phone_column: str = Query("phone", description="Column name containing phone numbers"),
+@router.post("/from-import/{import_job_id}", response_model=CampaignResponse, status_code=status.HTTP_201_CREATED)
+async def create_campaign_from_import(
+    import_job_id: str,
+    campaign: CampaignCreate,
+    message_template: str = Query(..., description="Message template for the campaign"),
     current_user: User = Depends(get_current_user),
     rate_limiter = Depends(get_rate_limiter),
-):
+) -> CampaignResponse:
     """
-    Create a campaign and add phone numbers from CSV.
+    Create a campaign from an existing successful import job.
+
+    **Phase 2A Workflow:**
+    1. Upload CSV: POST /imports/upload (automatic processing)
+    2. Monitor Progress: GET /imports/jobs/{job_id}  
+    3. Create Campaign: POST /campaigns/from-import/{import_job_id} (this endpoint)
     
-    This creates a campaign and immediately adds all phone numbers from the CSV.
-    The campaign will remain in draft status until explicitly started.
+    This is the recommended approach for creating campaigns from CSV data.
+
     """
-    import json
-    
     # Check rate limits
     await rate_limiter.check_rate_limit(current_user.id, "create_campaign")
     
     try:
-        # Parse campaign data
-        campaign_dict = json.loads(campaign_data)
-        campaign_data = CampaignCreateFromCSV(**campaign_dict)
+        async with get_repository_context(ImportJobRepository) as import_repo:
+            # Verify import job exists and is successful
+            import_job = await import_repo.get_by_id(import_job_id)
+            if not import_job:
+                raise NotFoundError(f"Import job {import_job_id} not found")
+            
+            # Check ownership
+            if import_job.owner_id != current_user.id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Not authorized to use this import job"
+                )
+            
+            # Check import job status
+            if import_job.status != ImportStatus.SUCCESS:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Import job must be in SUCCESS status, currently {import_job.status.value}"
+                )
         
-        # Use repository context for proper connection management
-        from app.db.repositories.campaigns import CampaignRepository
+        async with get_repository_context(ContactRepository) as contact_repo:
+            # Count contacts from import
+            contact_count = await contact_repo.get_contacts_count_by_import(import_job_id)
+            
+            if contact_count == 0:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Import job has no contacts to create campaign from"
+                )
         
         async with get_repository_context(CampaignRepository) as campaign_repo:
-            # Create campaign
-            campaign = await campaign_repo.create_campaign(
-                name=campaign_data.name,
-                description=campaign_data.description,
+            # Create campaign with import reference
+            new_campaign = await campaign_repo.create_campaign(
+                name=campaign.name,
+                description=campaign.description,
+                message_content=message_template,
                 user_id=current_user.id,
-                scheduled_start_at=campaign_data.scheduled_start_at,
-                scheduled_end_at=campaign_data.scheduled_end_at,
-                settings=campaign_data.settings
+                scheduled_start_at=campaign.scheduled_start_at,
+                scheduled_end_at=campaign.scheduled_end_at,
+                settings={
+                    **campaign.settings,
+                    "import_job_id": import_job_id,
+                    "created_from_import": True
+                },
+                total_messages=contact_count
             )
-            
-            # Read CSV file
-            contents = await file.read()
-            csv_file = io.StringIO(contents.decode('utf-8'))
-            
-            # Parse CSV
-            csv_reader = csv.reader(csv_file, delimiter=delimiter)
-            
-            # Skip header if present
-            if has_header:
-                header = next(csv_reader)
-                try:
-                    phone_index = header.index(phone_column)
-                except ValueError:
-                    raise ValidationError(
-                        message=f"Column '{phone_column}' not found in CSV header",
-                        details={"available_columns": header}
-                    )
-            else:
-                phone_index = 0  # Assume first column has phone numbers
-            
-            # Extract phone numbers
-            phone_numbers = []
-            for row in csv_reader:
-                if row and len(row) > phone_index:
-                    phone = row[phone_index].strip()
-                    if phone:
-                        phone_numbers.append(phone)
-            
-            if not phone_numbers:
-                raise ValidationError(message="No valid phone numbers found in CSV")
-            
-            # Add phone numbers to campaign
-            added_count = await campaign_repo.add_messages_to_campaign(
-                campaign_id=campaign.id,
-                phone_numbers=phone_numbers,
-                message_text=campaign_data.message_template,
-                user_id=current_user.id
-            )
-            
-            # Refresh campaign
-            campaign = await campaign_repo.get_by_id(campaign.id)
-            
-            return campaign
         
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Invalid campaign data JSON")
-    except ValidationError as e:
-        raise HTTPException(status_code=422, detail=str(e))
+        # Create messages from contacts using separate context
+        async with get_repository_context() as session:
+            await create_messages_from_contacts(
+                session, new_campaign.id, import_job_id, message_template, current_user.id
+            )
+            await session.commit()
+        
+        # Get updated campaign
+        async with get_repository_context(CampaignRepository) as campaign_repo:
+            updated_campaign = await campaign_repo.get_by_id(new_campaign.id)
+        
+        logger.info(
+            f"Created campaign {new_campaign.id} from import job {import_job_id} "
+            f"with {contact_count} contacts"
+        )
+        
+        return updated_campaign
+        
+    except NotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error creating campaign: {str(e)}")
+        logger.error(f"Error creating campaign from import: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error creating campaign from import: {str(e)}"
+        )
+
+
+@router.get("/{campaign_id}/import-status", status_code=status.HTTP_200_OK)
+async def get_campaign_import_status(
+    campaign_id: str = Path(..., description="Campaign ID"),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """
+    Get import status for a campaign created from CSV.
+    """
+    try:
+        async with get_repository_context(CampaignRepository) as campaign_repo:
+            # Get campaign
+            campaign = await campaign_repo.get_by_id(campaign_id)
+            if not campaign:
+                raise NotFoundError(f"Campaign {campaign_id} not found")
+            
+            # Check ownership
+            if campaign.user_id != current_user.id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Not authorized to access this campaign"
+                )
+            
+            # Check if campaign was created from import
+            import_job_id = campaign.settings.get("import_job_id") if campaign.settings else None
+            if not import_job_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Campaign was not created from CSV import"
+                )
+        
+        async with get_repository_context(ImportJobRepository) as import_repo:
+            # Get import job status
+            import_job = await import_repo.get_by_id(import_job_id)
+            if not import_job:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Associated import job not found"
+                )
+            
+            return {
+                "campaign_id": campaign_id,
+                "import_job_id": import_job_id,
+                "import_status": import_job.status.value,
+                "progress_percentage": import_job.progress_percentage,
+                "rows_total": import_job.rows_total,
+                "rows_processed": import_job.rows_processed,
+                "error_count": import_job.error_count,
+                "has_errors": import_job.has_errors,
+                "created_from_csv": campaign.settings.get("created_from_csv", False),
+                "import_started_at": import_job.started_at.isoformat() if import_job.started_at else None,
+                "import_completed_at": import_job.completed_at.isoformat() if import_job.completed_at else None
+            }
+            
+    except NotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error getting campaign import status: {str(e)}"
+        )
 
 
 @router.get("/", response_model=PaginatedResponse[CampaignResponse])
@@ -631,3 +707,75 @@ async def bulk_delete_campaign_messages(
             status_code=500, 
             detail=f"Error performing bulk deletion: {str(e)}"
         )
+    
+async def create_messages_from_contacts(
+    session,
+    campaign_id: str,
+    import_job_id: str,
+    message_template: str,
+    user_id: Optional[str] = None
+) -> int:
+    """
+    Create messages from imported contacts.
+    
+    **Phase 2A Pattern:** This function creates campaign messages from contacts
+    that were already imported via the /imports/upload pipeline.
+    """
+    try:
+        # Use proper repository classes
+        contact_repo = ContactRepository(session)
+        message_repo = MessageRepository(session)
+        
+        # Get all contacts from import
+        contacts, _ = await contact_repo.get_by_import_id(import_job_id, limit=10000)
+        
+        if not contacts:
+            logger.warning(f"No contacts found for import job {import_job_id}")
+            return 0
+        
+        # Get user_id from campaign if not provided
+        if not user_id:
+            from app.models.campaign import Campaign
+            from sqlalchemy import select
+            campaign_result = await session.execute(
+                select(Campaign.user_id).where(Campaign.id == campaign_id)
+            )
+            user_id = campaign_result.scalar()
+        
+        # Create messages with personalization
+        messages_created = 0
+        
+        for contact in contacts:
+            # Create personalized message using simple template substitution
+            personalized_message = message_template
+            
+            # Variable substitution
+            if contact.name:
+                personalized_message = personalized_message.replace("{{name}}", contact.name)
+                personalized_message = personalized_message.replace("{{contact_name}}", contact.name)
+            
+            personalized_message = personalized_message.replace("{{phone}}", contact.phone)
+            
+            # Create message using repository
+            await message_repo.create_message(
+                phone_number=contact.phone,
+                message_text=personalized_message,
+                user_id=user_id,
+                campaign_id=campaign_id,
+                metadata={
+                    "contact_name": contact.name,
+                    "import_job_id": import_job_id,
+                    "contact_tags": contact.tags or []
+                }
+            )
+            messages_created += 1
+        
+        logger.info(
+            f"Created {messages_created} messages from {len(contacts)} contacts "
+            f"for campaign {campaign_id}"
+        )
+        return messages_created
+        
+    except Exception as e:
+        logger.error(f"Error creating messages from contacts: {str(e)}")
+        raise

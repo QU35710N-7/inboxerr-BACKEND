@@ -1,7 +1,7 @@
 """
 Pydantic schemas for import job-related API operations.
 """
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Literal
 from datetime import datetime
 from enum import Enum
 from pydantic import BaseModel, Field, validator
@@ -123,5 +123,95 @@ class ImportError(BaseModel):
                 "column": "phone_number",
                 "message": "Invalid phone number format",
                 "value": "123-456-7890"
+            }
+        }
+
+
+class ColumnInfo(BaseModel):
+    """Information about a CSV column for preview."""
+    name: str = Field(..., description="Column name from CSV header")
+    index: int = Field(..., description="Column index (0-based)")
+    sample_values: List[str] = Field(..., description="Sample non-empty values from this column")
+    empty_count: int = Field(..., description="Number of empty cells in sample")
+    detected_type: str = Field(..., description="Detected data type (phone, name, email, text, number)")
+    
+class MappingSuggestion(BaseModel):
+    """Suggestion for column mapping."""
+    column: str = Field(..., description="Column name")
+    confidence: float = Field(..., description="Confidence score (0-100)")
+    reason: str = Field(..., description="Why this column was suggested")
+
+class ImportPreviewResponse(BaseModel):
+    """Response schema for import job preview."""
+    job_id: str = Field(..., description="Import job ID")
+    file_info: Dict[str, Any] = Field(..., description="File metadata")
+    columns: List[ColumnInfo] = Field(..., description="Column information")
+    preview_rows: List[Dict[str, str]] = Field(..., description="First 5 rows of data")
+    suggestions: Dict[str, List[MappingSuggestion]] = Field(
+        ..., 
+        description="Mapping suggestions for phone, name, etc."
+    )
+    confidence_level: Literal["high", "medium", "low"] = Field(
+        ..., 
+        description="Overall confidence in auto-detection"
+    )
+    auto_process_recommended: bool = Field(
+        ...,
+        description="Whether auto-processing is recommended based on confidence"
+    )
+    messages: List[str] = Field(
+        default=[],
+        description="User guidance messages"
+    )
+
+class ColumnMapping(BaseModel):
+    """Schema for explicit column mapping."""
+    phone_columns: List[str] = Field(
+        ..., 
+        description="Column names containing phone numbers",
+        min_items=1
+    )
+    name_column: Optional[str] = Field(
+        None,
+        description="Column name containing contact names"
+    )
+    skip_columns: List[str] = Field(
+        default=[],
+        description="Columns to ignore during import"
+    )
+    tag_columns: List[str] = Field(
+        default=[],
+        description="Columns to import as tags"
+    )
+
+class ProcessImportRequest(BaseModel):
+    """Request schema for processing import with mapping."""
+    column_mapping: ColumnMapping = Field(
+        ...,
+        description="How to map CSV columns to contact fields"
+    )
+    options: Dict[str, Any] = Field(
+        default={
+            "skip_invalid_phones": True,
+            "merge_duplicate_phones": True,
+            "phone_country_default": "US"
+        },
+        description="Processing options"
+    )
+    
+    class Config:
+        """Pydantic config."""
+        schema_extra = {
+            "example": {
+                "column_mapping": {
+                    "phone_columns": ["Phone 1", "Phone 2"],
+                    "name_column": "First Name",
+                    "skip_columns": ["Index"],
+                    "tag_columns": ["Company", "Source"]
+                },
+                "options": {
+                    "skip_invalid_phones": True,
+                    "phone_country_default": "US"
+                }
             }
         }

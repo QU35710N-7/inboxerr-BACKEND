@@ -66,8 +66,6 @@ class MetricsRepository(BaseRepository[UserMetrics, Dict[str, Any], Dict[str, An
         )
         
         self.session.add(metrics)
-        await self.session.commit()
-        await self.session.refresh(metrics)
         
         return metrics
     
@@ -104,8 +102,6 @@ class MetricsRepository(BaseRepository[UserMetrics, Dict[str, Any], Dict[str, An
                 metrics.quota_used += increment
             
             self.session.add(metrics)
-            await self.session.commit()
-            await self.session.refresh(metrics)
             
             return metrics
         
@@ -359,7 +355,5 @@ class MetricsRepository(BaseRepository[UserMetrics, Dict[str, Any], Dict[str, An
                 self.session.add(metrics)
                 updates_count += 1
         
-        # Commit all changes
-        await self.session.commit()
         
         return updates_count

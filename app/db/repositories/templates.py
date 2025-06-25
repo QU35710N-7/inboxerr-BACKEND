@@ -69,8 +69,6 @@ class TemplateRepository(BaseRepository[MessageTemplate, MessageTemplateCreate, 
         )
         
         self.session.add(template)
-        await self.session.commit()
-        await self.session.refresh(template)
 
         # Publish template created event
         try:

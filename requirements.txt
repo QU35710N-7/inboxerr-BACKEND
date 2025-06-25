@@ -29,6 +29,7 @@ packaging==25.0
 passlib==1.7.4
 phonenumbers==9.0.3
 pluggy==1.5.0
+psutil=7.0.0
 psycopg2-binary==2.9.10
 pyasn1==0.4.8
 pycparser==2.22

@@ -134,8 +134,6 @@ class BaseRepository(Generic[ModelType, CreateSchemaType, UpdateSchemaType]):
         
         # Add to session
         self.session.add(db_obj)
-        await self.session.commit()
-        await self.session.refresh(db_obj)
         
         return db_obj
     
@@ -173,8 +171,6 @@ class BaseRepository(Generic[ModelType, CreateSchemaType, UpdateSchemaType]):
         
         # Save changes
         self.session.add(db_obj)
-        await self.session.commit()
-        await self.session.refresh(db_obj)
         
         return db_obj
     
@@ -194,9 +190,7 @@ class BaseRepository(Generic[ModelType, CreateSchemaType, UpdateSchemaType]):
             return False
         
         # Delete record
-        await self.session.delete(db_obj)
-        await self.session.commit()
-        
+        await self.session.delete(db_obj)        
         return True
     
     async def count(self, *, filters: Optional[Dict[str, Any]] = None) -> int:
