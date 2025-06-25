@@ -25,17 +25,23 @@ class CampaignRepository(BaseRepository[Campaign, Dict[str, Any], Dict[str, Any]
         name: str,
         user_id: str,
         description: Optional[str] = None,
+        message_content: Optional[str] = None,
+        template_id: Optional[str] = None,
+        total_messages: Optional[int] = None,
         scheduled_start_at: Optional[datetime] = None,
         scheduled_end_at: Optional[datetime] = None,
         settings: Optional[Dict[str, Any]] = None
     ) -> Campaign:
         """
         Create a new campaign.
-        
+
         Args:
             name: Campaign name
             user_id: User ID
             description: Optional campaign description
+            message_content: Optional message template content
+            template_id: Optional template ID reference
+            total_messages: Optional total message count for virtual campaigns
             scheduled_start_at: Optional scheduled start time
             scheduled_end_at: Optional scheduled end time
             settings: Optional campaign settings
@@ -48,6 +54,9 @@ class CampaignRepository(BaseRepository[Campaign, Dict[str, Any], Dict[str, Any]
             id=campaign_id,
             name=name,
             description=description,
+            message_content=message_content,
+            template_id=template_id,
+            total_messages=total_messages or 0,
             status="draft",
             user_id=user_id,
             scheduled_start_at=scheduled_start_at,

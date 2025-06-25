@@ -12,6 +12,7 @@ from app.schemas.message import MessageStatus
 from app.services.event_bus.bus import get_event_bus
 from app.services.event_bus.events import EventType
 from app.services.sms.sender import SMSSender, get_sms_sender
+from app.services.campaigns.virtual_sender import VirtualCampaignSender, get_virtual_campaign_sender
 from app.db.session import get_repository_context
 
 logger = logging.getLogger("inboxerr.campaigns")
@@ -23,11 +24,12 @@ class CampaignProcessor:
     Manages campaign execution, chunked processing, and status tracking.
     Uses context managers for database operations to prevent connection leaks.
     """
-    
+
     def __init__(
         self,
         sms_sender: SMSSender,
-        event_bus: Any
+        event_bus: Any,
+        virtual_sender: VirtualCampaignSender
     ):
         """
         Initialize campaign processor with required dependencies.
@@ -38,9 +40,11 @@ class CampaignProcessor:
         Args:
             sms_sender: SMS sender service
             event_bus: Event bus for publishing events
+            virtual_sender: Virtual campaign sender for template-based campaigns
         """
         self.sms_sender = sms_sender
         self.event_bus = event_bus
+        self.virtual_sender = virtual_sender
         self._processing_campaigns = set()
         self._chunk_size = settings.BATCH_SIZE  # Default from settings
         self._semaphore = asyncio.Semaphore(5)  # Limit concurrent campaigns
@@ -172,6 +176,9 @@ class CampaignProcessor:
         """
         Process a campaign in the background.
         
+        Detects if campaign is virtual (template-based) or traditional (pre-created messages)
+        and routes to appropriate processing method.
+        
         Args:
             campaign_id: Campaign ID
         """
@@ -183,15 +190,25 @@ class CampaignProcessor:
         self._processing_campaigns.add(campaign_id)
         
         try:
-            # Check campaign status with context manager
+            # Check campaign status and type
+            is_virtual = False
             async with get_repository_context(CampaignRepository) as campaign_repository:
                 campaign = await campaign_repository.get_by_id(campaign_id)
                 if not campaign or campaign.status != "active":
                     return
+                
+                # Check if this is a virtual campaign
+                is_virtual = campaign.settings.get("virtual_messaging", False)
+                logger.info(f"Processing campaign {campaign_id} - Virtual: {is_virtual}")
             
-            # Process in chunks until complete
+            # Route to appropriate processor
             async with self._semaphore:
-                await self._process_campaign_chunks(campaign_id)
+                if is_virtual:
+                    # Use virtual sender for template-based campaigns
+                    await self.virtual_sender.process_virtual_campaign(campaign_id)
+                else:
+                    # Use traditional method for pre-created message campaigns
+                    await self._process_campaign_chunks(campaign_id)
                 
         except Exception as e:
             logger.error(f"Error processing campaign {campaign_id}: {e}", exc_info=True)
@@ -342,8 +359,10 @@ async def get_campaign_processor():
     
     sms_sender = await get_sms_sender()
     event_bus = get_event_bus()
+    virtual_sender = await get_virtual_campaign_sender()
     
     return CampaignProcessor(
         sms_sender=sms_sender,
-        event_bus=event_bus
+        event_bus=event_bus,
+        virtual_sender=virtual_sender
     )

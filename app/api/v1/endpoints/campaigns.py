@@ -26,9 +26,11 @@ from app.db.repositories.campaigns import CampaignRepository
 from app.db.repositories.messages import MessageRepository  
 from app.db.repositories.import_jobs import ImportJobRepository
 from app.db.repositories.contacts import ContactRepository
+from app.db.repositories.templates import TemplateRepository
+
 
 router = APIRouter()
-logger = logging.getLogger("inboxerr.endpoint")
+logger = logging.getLogger("inboxerr.campaign.endpoint")
 
 @router.post("/", response_model=CampaignResponse, status_code=status.HTTP_201_CREATED)
 async def create_campaign(
@@ -118,40 +120,43 @@ async def create_campaign_from_import(
                     detail="Import job has no contacts to create campaign from"
                 )
         
+        # Step 1: Create template for the campaign
+        template = None
+        async with get_repository_context(TemplateRepository) as template_repo:
+            template = await template_repo.create_template(
+                name=f"{campaign.name} - Template",
+                content=message_template,
+                description=f"Auto-generated template for campaign {campaign.name}",
+                user_id=current_user.id,
+                is_active=True
+            )
+        
+        # Step 2: Create campaign with template reference (virtual messaging)
         async with get_repository_context(CampaignRepository) as campaign_repo:
-            # Create campaign with import reference
             new_campaign = await campaign_repo.create_campaign(
                 name=campaign.name,
                 description=campaign.description,
                 message_content=message_template,
+                template_id=template.id,
+                total_messages=contact_count,
                 user_id=current_user.id,
                 scheduled_start_at=campaign.scheduled_start_at,
                 scheduled_end_at=campaign.scheduled_end_at,
                 settings={
                     **campaign.settings,
                     "import_job_id": import_job_id,
-                    "created_from_import": True
-                },
-                total_messages=contact_count
+                    "created_from_import": True,
+                    "virtual_messaging": True  # Flag for virtual messaging
+                }
             )
         
-        # Create messages from contacts using separate context
-        async with get_repository_context() as session:
-            await create_messages_from_contacts(
-                session, new_campaign.id, import_job_id, message_template, current_user.id
-            )
-            await session.commit()
-        
-        # Get updated campaign
-        async with get_repository_context(CampaignRepository) as campaign_repo:
-            updated_campaign = await campaign_repo.get_by_id(new_campaign.id)
-        
+        # No more physical message creation - they'll be generated on-demand during sending
         logger.info(
-            f"Created campaign {new_campaign.id} from import job {import_job_id} "
-            f"with {contact_count} contacts"
+            f"Created virtual campaign {new_campaign.id} from import job {import_job_id} "
+            f"with template {template.id} for {contact_count} contacts (no pre-created messages)"
         )
         
-        return updated_campaign
+        return new_campaign
         
     except NotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
