@@ -42,6 +42,8 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
         """
         Create a new message with related objects in a single transaction.
         """
+
+
         # Set initial status based on scheduling
         initial_status = MessageStatus.SCHEDULED if scheduled_at else MessageStatus.PENDING
         
@@ -542,6 +544,47 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
         
         return messages, total
     
+    async def count_messages_for_campaign(self, campaign_id: str) -> int:
+        """
+        Return an exact count of messages that belong to one campaign.
+        """
+        result = await self.session.execute(
+            select(func.count()).select_from(Message)
+            .where(Message.campaign_id == campaign_id)
+        )
+        return result.scalar_one()
+    
+
+    async def get_message_by_campaign_and_phone(
+    self, 
+    campaign_id: str, 
+    phone_number: str
+) -> Optional[Message]:
+        """
+        Check if a message already exists for this campaign + phone combination.
+        
+        Industry standard: Idempotency check to prevent duplicate sends.
+        Used by virtual sender to avoid double-sends to same recipient.
+        
+        Args:
+            campaign_id: Campaign ID
+            phone_number: Phone number to check
+            
+        Returns:
+            Message: Existing message if found, None if safe to send
+        """
+        query = select(Message).where(
+            and_(
+                Message.campaign_id == campaign_id,
+                Message.phone_number == phone_number
+            )
+        ).limit(1)  # We only need to know if ANY message exists
+        
+        result = await self.session.execute(query)
+        message = result.scalar_one_or_none()
+        
+        return message
+
     async def get_by_id(self, id: str) -> Optional[Message]:
         """
         Get a message by ID with eager loading of relationships.

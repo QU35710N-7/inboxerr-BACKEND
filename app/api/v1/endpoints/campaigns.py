@@ -112,7 +112,7 @@ async def create_campaign_from_import(
         
         async with get_repository_context(ContactRepository) as contact_repo:
             # Count contacts from import
-            contact_count = await contact_repo.get_contacts_count_by_import(import_job_id)
+            contact_count = await contact_repo.get_processable_contacts_count(import_job_id)
             
             if contact_count == 0:
                 raise HTTPException(
@@ -153,7 +153,7 @@ async def create_campaign_from_import(
         # No more physical message creation - they'll be generated on-demand during sending
         logger.info(
             f"Created virtual campaign {new_campaign.id} from import job {import_job_id} "
-            f"with template {template.id} for {contact_count} contacts (no pre-created messages)"
+            f"with template {template.id} for {contact_count} processable contacts"
         )
         
         return new_campaign
@@ -444,6 +444,76 @@ async def cancel_campaign(
        
    except Exception as e:
        raise HTTPException(status_code=500, detail=f"Error cancelling campaign: {str(e)}")
+
+@router.post("/{campaign_id}/restart", response_model=CampaignResponse)
+async def restart_campaign(
+    campaign_id: str = Path(..., description="Campaign ID"),
+    current_user: User = Depends(get_current_user),
+    campaign_processor = Depends(get_campaign_processor),
+    rate_limiter = Depends(get_rate_limiter),
+):
+    """
+    Restart a campaign that is **paused** or **failed**.
+
+    • If the campaign is **paused**: simply call start.  
+    • If the campaign is **failed**: reset `status → paused` and clear `completed_at`,
+      then start.  
+    • Active, completed, or cancelled campaigns are rejected.
+
+    NOTE ─ Restarting a virtual-messaging campaign re-processes *all* contacts
+    that were **not** previously sent (because sent_count is respected inside the
+    stats update). If you paused midway, duplicates are avoided; if you failed
+    early, you get a clean second run.
+    """
+    # ➋ protect against hammering
+    await rate_limiter.check_rate_limit(current_user.id, "restart_campaign")
+
+    try:
+        # 1 Fetch campaign and verify ownership
+        async with get_repository_context(CampaignRepository) as campaign_repo:
+            campaign = await campaign_repo.get_by_id(campaign_id)
+            if not campaign:
+                raise HTTPException(status_code=404, detail="Campaign not found")
+            if campaign.user_id != current_user.id:
+                raise HTTPException(status_code=403, detail="Not authorized")
+
+            # 2 Check allowed states
+            if campaign.status not in ("paused", "failed"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Restart allowed only for paused/failed campaigns (current: {campaign.status})",
+                )
+
+            # 3 If previously failed, move to paused first
+            if campaign.status == "failed":
+                await campaign_repo.update_campaign_status(
+                    campaign_id=campaign_id,
+                    status="paused",
+                    completed_at=None,
+                )
+
+        # 4 Start the campaign (uses its own context managers)
+        started = await campaign_processor.start_campaign(
+            campaign_id=campaign_id,
+            user_id=current_user.id,
+        )
+        
+        if not started:
+            # Another worker is already processing → conflict
+            raise HTTPException(
+                status_code=409,
+                detail="Campaign is already being processed or could not be restarted",
+            )
+
+        # 5 Return fresh campaign data
+        async with get_repository_context(CampaignRepository) as campaign_repo:
+            return await campaign_repo.get_by_id(campaign_id)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error restarting campaign {campaign_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error restarting campaign: {str(e)}")
 
 
 @router.get("/{campaign_id}/messages", response_model=PaginatedResponse[MessageResponse])

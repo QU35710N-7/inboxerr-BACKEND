@@ -91,6 +91,7 @@ app/schemas/template.py
 app/schemas/user.py
 app/scripts/create_admin.py
 app/services/campaigns/processor.py
+app/services/campaigns/virtual_sender.py
 app/services/event_bus/bus.py
 app/services/event_bus/events.py
 app/services/imports/events.py
@@ -2057,6 +2058,335 @@ async def create_admin_user():
 
 if __name__ == "__main__":
     asyncio.run(create_admin_user())
+</file>
+
+<file path="app/services/campaigns/virtual_sender.py">
+# app/services/campaigns/virtual_sender.py
+import asyncio
+import logging
+from datetime import datetime, timezone
+from typing import List, Dict, Any, Optional, AsyncGenerator
+import uuid
+import re
+
+from app.core.config import settings
+from app.db.repositories.campaigns import CampaignRepository
+from app.db.repositories.contacts import ContactRepository
+from app.db.repositories.templates import TemplateRepository
+from app.db.repositories.messages import MessageRepository
+from app.schemas.message import MessageStatus
+from app.services.event_bus.bus import get_event_bus
+from app.services.event_bus.events import EventType
+from app.services.sms.sender import SMSSender, get_sms_sender
+from app.db.session import get_repository_context
+
+logger = logging.getLogger("inboxerr.virtual_sender")
+
+class VirtualMessage:
+    """Virtual message object for on-demand generation."""
+    
+    def __init__(
+        self,
+        phone_number: str,
+        message_text: str,
+        contact_name: Optional[str] = None,
+        contact_data: Optional[Dict[str, Any]] = None,
+        campaign_id: Optional[str] = None,
+        user_id: Optional[str] = None
+    ):
+        self.phone_number = phone_number
+        self.message_text = message_text
+        self.contact_name = contact_name
+        self.contact_data = contact_data or {}
+        self.campaign_id = campaign_id
+        self.user_id = user_id
+        self.custom_id = str(uuid.uuid4())
+
+class VirtualCampaignSender:
+    """
+    Service for sending campaigns using virtual messaging approach.
+    
+    Generates messages on-demand from templates and contacts without
+    pre-creating message records in the database.
+    """
+    
+    def __init__(self, sms_sender: SMSSender, event_bus: Any):
+        """Initialize with SMS sender and event bus."""
+        self.sms_sender = sms_sender
+        self.event_bus = event_bus
+        self._chunk_size = settings.BATCH_SIZE or 100
+        self._semaphore = asyncio.Semaphore(5)
+    
+    async def process_virtual_campaign(self, campaign_id: str) -> bool:
+        """
+        Process a virtual campaign by generating messages on-demand.
+        
+        Args:
+            campaign_id: Campaign ID
+            
+        Returns:
+            bool: True if processing started successfully
+        """
+        try:
+            # Get campaign details
+            async with get_repository_context(CampaignRepository) as campaign_repo:
+                campaign = await campaign_repo.get_by_id(campaign_id)
+                if not campaign or campaign.status != "active":
+                    return False
+                
+                # Check if this is a virtual campaign
+                is_virtual = campaign.settings.get("virtual_messaging", False)
+                if not is_virtual:
+                    logger.warning(f"Campaign {campaign_id} is not a virtual campaign")
+                    return False
+                
+                import_job_id = campaign.settings.get("import_job_id")
+                if not import_job_id:
+                    logger.error(f"Campaign {campaign_id} missing import_job_id")
+                    return False
+            
+            # Process in chunks with semaphore
+            async with self._semaphore:
+                await self._process_virtual_campaign_chunks(
+                    campaign_id, import_job_id, campaign.template_id, campaign.user_id
+                )
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error processing virtual campaign {campaign_id}: {e}", exc_info=True)
+            # Update campaign status to failed
+            try:
+                async with get_repository_context(CampaignRepository) as campaign_repo:
+                    await campaign_repo.update_campaign_status(
+                        campaign_id=campaign_id,
+                        status="failed",
+                        completed_at=datetime.now(timezone.utc)
+                    )
+            except Exception as update_error:
+                logger.error(f"Failed to update campaign status: {update_error}")
+            return False
+    
+    async def _process_virtual_campaign_chunks(
+        self, 
+        campaign_id: str, 
+        import_job_id: str, 
+        template_id: str,
+        user_id: str
+    ) -> None:
+        """Process virtual campaign in chunks."""
+        
+        # Get template content
+        template_content = None
+        async with get_repository_context(TemplateRepository) as template_repo:
+            template = await template_repo.get_by_id(template_id)
+            if not template:
+                raise ValueError(f"Template {template_id} not found")
+            template_content = template.content
+        
+        # Process contacts in chunks
+        offset = 0
+        total_sent = 0
+        total_failed = 0
+        
+        while True:
+            # Check if campaign is still active
+            async with get_repository_context(CampaignRepository) as campaign_repo:
+                campaign = await campaign_repo.get_by_id(campaign_id)
+                if not campaign or campaign.status != "active":
+                    logger.info(f"Campaign {campaign_id} no longer active, stopping")
+                    return
+            
+            # Get next chunk of contacts
+            contacts = []
+            async with get_repository_context(ContactRepository) as contact_repo:
+                contacts, _ = await contact_repo.get_by_import_id(
+                    import_job_id, skip=offset, limit=self._chunk_size
+                )
+            
+            if not contacts:
+                logger.info(f"No more contacts for campaign {campaign_id}")
+                # ── Count the real number of messages once ───────────────────────────
+                async with get_repository_context(MessageRepository) as msg_repo:
+                    real_total = await msg_repo.count_messages_for_campaign(campaign_id)
+
+                # Mark campaign as completed
+                async with get_repository_context(CampaignRepository) as campaign_repo:
+                    # Re-read (FOR UPDATE) in case another worker finished first
+                    campaign = await campaign_repo.get_by_id(campaign_id)
+                    if campaign and campaign.status != "completed":
+                        await campaign_repo.update(
+                            id=campaign_id,
+                            obj_in={
+                                "status": "completed",
+                                "completed_at": datetime.now(timezone.utc),
+                                "total_messages": real_total
+                            }
+                        )
+                        logger.info(
+                            "Campaign %s completed · sent=%d · total_messages=%d",
+                            campaign_id, campaign.sent_count, real_total
+                        )
+
+                return
+            
+            # Generate and send virtual messages for this chunk
+            chunk_sent, chunk_failed = await self._process_contact_chunk(
+                contacts, template_content, campaign_id, user_id
+            )
+            
+            total_sent += chunk_sent
+            total_failed += chunk_failed
+            
+            # Update campaign statistics
+            async with get_repository_context(CampaignRepository) as campaign_repo:
+                await campaign_repo.update_campaign_stats(
+                    campaign_id=campaign_id,
+                    increment_sent=chunk_sent,
+                    increment_failed=chunk_failed
+                )
+            
+            # Move to next chunk
+            offset += len(contacts)
+            
+            # Small delay between chunks
+            await asyncio.sleep(0.5)
+    
+    async def _process_contact_chunk(
+        self, 
+        contacts: List[Any], 
+        template_content: str,
+        campaign_id: str,
+        user_id: str
+    ) -> tuple[int, int]:
+        """Process a chunk of contacts and send virtual messages."""
+        
+        sent_count = 0
+        failed_count = 0
+        
+        for contact in contacts:
+            try:
+                # Generate virtual message
+                virtual_message = self._generate_virtual_message(
+                    contact, template_content, campaign_id, user_id
+                )
+                
+                # Send message using SMS sender
+                result = await self.sms_sender._send_to_gateway(
+                    phone_number=virtual_message.phone_number,
+                    message_text=virtual_message.message_text,
+                    custom_id=virtual_message.custom_id
+                )
+                
+                # Create message record after successful send
+                await self._create_message_record(
+                    virtual_message, result, MessageStatus.SENT
+                )
+                
+                sent_count += 1
+                
+                # Delay between messages
+                await asyncio.sleep(settings.DELAY_BETWEEN_SMS)
+                
+            except Exception as e:
+                logger.error(f"Error sending virtual message to {contact.phone}: {e}")
+                
+                # Create failed message record
+                try:
+                    virtual_message = self._generate_virtual_message(
+                        contact, template_content, campaign_id, user_id
+                    )
+                    await self._create_message_record(
+                        virtual_message, {"error": str(e)}, MessageStatus.FAILED
+                    )
+                except Exception as record_error:
+                    logger.error(f"Failed to create failed message record: {record_error}")
+                
+                failed_count += 1
+        
+        logger.info(f"Processed chunk: {sent_count} sent, {failed_count} failed")
+        return sent_count, failed_count
+    
+    def _generate_virtual_message(
+        self, 
+        contact: Any, 
+        template_content: str,
+        campaign_id: str,
+        user_id: str
+    ) -> VirtualMessage:
+        """Generate a virtual message from contact and template."""
+        
+        # Perform template substitution
+        personalized_message = template_content
+        
+        # Replace variables
+        if contact.name:
+            personalized_message = personalized_message.replace("{{name}}", contact.name)
+            personalized_message = personalized_message.replace("{{contact_name}}", contact.name)
+        
+        personalized_message = personalized_message.replace("{{phone}}", contact.phone)
+        
+        # Additional contact data substitution if available
+        if hasattr(contact, 'custom_fields') and contact.custom_fields:
+            for key, value in contact.custom_fields.items():
+                personalized_message = personalized_message.replace(f"{{{{{key}}}}}", str(value))
+        
+        return VirtualMessage(
+            phone_number=contact.phone,
+            message_text=personalized_message,
+            contact_name=contact.name,
+            contact_data={
+                "name": contact.name,
+                "tags": contact.tags or []
+            },
+            campaign_id=campaign_id,
+            user_id=user_id
+        )
+    
+    async def _create_message_record(
+        self, 
+        virtual_message: VirtualMessage, 
+        send_result: Dict[str, Any],
+        status: MessageStatus
+    ) -> None:
+        """Create message record after sending (for tracking/analytics)."""
+        
+        try:
+            async with get_repository_context(MessageRepository) as message_repo:
+                #insert – repo auto-sets PENDING/SCHEDULED
+                message = await message_repo.create_message(
+                    phone_number=virtual_message.phone_number,
+                    message_text=virtual_message.message_text,
+                    user_id=virtual_message.user_id,
+                    campaign_id=virtual_message.campaign_id,
+                    custom_id=virtual_message.custom_id,
+                    metadata={
+                        "contact_name": virtual_message.contact_name,
+                        "contact_data": virtual_message.contact_data,
+                        "virtual_generated": True,
+                        "send_result": send_result
+                    }
+                )
+
+                # 2) bump status so dashboards are current
+                await message_repo.update_message_status(
+                    message_id=message.id,
+                    status=status,
+                    event_type="virtual_send",
+                    gateway_message_id=send_result.get("gateway_message_id"),
+                    data=send_result,
+                )
+
+        except Exception as e:
+            logger.error(f"Failed to create message record: {e}")
+            # Don't fail the whole operation if record creation fails
+
+# Dependency injection
+async def get_virtual_campaign_sender() -> VirtualCampaignSender:
+    """Get virtual campaign sender service instance."""
+    sms_sender = await get_sms_sender()
+    event_bus = get_event_bus()
+    return VirtualCampaignSender(sms_sender, event_bus)
 </file>
 
 <file path="app/services/imports/events.py">
@@ -27832,358 +28162,6 @@ class APIKeyCreate(BaseModel):
     permissions: Optional[List[str]] = Field(default=[], description="List of permissions")
 </file>
 
-<file path="app/services/campaigns/processor.py">
-# app/services/campaigns/processor.py
-import asyncio
-import logging
-from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional
-import uuid
-
-from app.core.config import settings
-from app.db.repositories.campaigns import CampaignRepository
-from app.db.repositories.messages import MessageRepository
-from app.schemas.message import MessageStatus
-from app.services.event_bus.bus import get_event_bus
-from app.services.event_bus.events import EventType
-from app.services.sms.sender import SMSSender, get_sms_sender
-from app.db.session import get_repository_context
-
-logger = logging.getLogger("inboxerr.campaigns")
-
-class CampaignProcessor:
-    """
-    Service for processing SMS campaigns.
-    
-    Manages campaign execution, chunked processing, and status tracking.
-    Uses context managers for database operations to prevent connection leaks.
-    """
-    
-    def __init__(
-        self,
-        sms_sender: SMSSender,
-        event_bus: Any
-    ):
-        """
-        Initialize campaign processor with required dependencies.
-        
-        Removed repository dependencies to prevent long-lived connections.
-        The repositories will be created as needed using context managers.
-        
-        Args:
-            sms_sender: SMS sender service
-            event_bus: Event bus for publishing events
-        """
-        self.sms_sender = sms_sender
-        self.event_bus = event_bus
-        self._processing_campaigns = set()
-        self._chunk_size = settings.BATCH_SIZE  # Default from settings
-        self._semaphore = asyncio.Semaphore(5)  # Limit concurrent campaigns
-    
-    async def start_campaign(self, campaign_id: str, user_id: str) -> bool:
-        """
-        Start a campaign.
-        
-        Args:
-            campaign_id: Campaign ID
-            user_id: User ID for authorization
-            
-        Returns:
-            bool: True if campaign was started, False otherwise
-        """
-        # Use context manager for repository access
-        async with get_repository_context(CampaignRepository) as campaign_repository:
-            # Get campaign
-            campaign = await campaign_repository.get_by_id(campaign_id)
-            if not campaign:
-                return False
-            
-            # Validate ownership
-            if campaign.user_id != user_id:
-                return False
-            
-            # Check if campaign can be started
-            if campaign.status != "draft" and campaign.status != "paused":
-                return False
-            
-            # Update status to active
-            updated = await campaign_repository.update_campaign_status(
-                campaign_id=campaign_id,
-                status="active",
-                started_at=datetime.now(timezone.utc)
-            )
-            
-            if not updated:
-                return False
-            
-            # Get total_messages for the event
-            total_messages = campaign.total_messages
-        
-        # Start processing in background
-        asyncio.create_task(self._process_campaign(campaign_id))
-        
-        # Publish event
-        await self.event_bus.publish(
-            EventType.BATCH_CREATED,
-            {
-                "campaign_id": campaign_id,
-                "user_id": user_id,
-                "total_messages": total_messages
-            }
-        )
-        
-        return True
-    
-    async def pause_campaign(self, campaign_id: str, user_id: str) -> bool:
-        """
-        Pause a campaign.
-        
-        Args:
-            campaign_id: Campaign ID
-            user_id: User ID for authorization
-            
-        Returns:
-            bool: True if campaign was paused, False otherwise
-        """
-        # Use context manager for repository access
-        async with get_repository_context(CampaignRepository) as campaign_repository:
-            # Get campaign
-            campaign = await campaign_repository.get_by_id(campaign_id)
-            if not campaign:
-                return False
-            
-            # Validate ownership
-            if campaign.user_id != user_id:
-                return False
-            
-            # Check if campaign can be paused
-            if campaign.status != "active":
-                return False
-            
-            # Update status to paused
-            updated = await campaign_repository.update_campaign_status(
-                campaign_id=campaign_id,
-                status="paused"
-            )
-            
-            return updated is not None
-    
-    async def cancel_campaign(self, campaign_id: str, user_id: str) -> bool:
-        """
-        Cancel a campaign.
-        
-        Args:
-            campaign_id: Campaign ID
-            user_id: User ID for authorization
-            
-        Returns:
-            bool: True if campaign was cancelled, False otherwise
-        """
-        # Use context manager for repository access
-        async with get_repository_context(CampaignRepository) as campaign_repository:
-            # Get campaign
-            campaign = await campaign_repository.get_by_id(campaign_id)
-            if not campaign:
-                return False
-            
-            # Validate ownership
-            if campaign.user_id != user_id:
-                return False
-            
-            # Check if campaign can be cancelled
-            if campaign.status in ["completed", "cancelled", "failed"]:
-                return False
-            
-            # Update status to cancelled
-            updated = await campaign_repository.update_campaign_status(
-                campaign_id=campaign_id,
-                status="cancelled",
-                completed_at=datetime.now(timezone.utc)
-            )
-            
-            return updated is not None
-    
-    async def _process_campaign(self, campaign_id: str) -> None:
-        """
-        Process a campaign in the background.
-        
-        Args:
-            campaign_id: Campaign ID
-        """
-        if campaign_id in self._processing_campaigns:
-            logger.warning(f"Campaign {campaign_id} is already being processed")
-            return
-        
-        # Mark as processing
-        self._processing_campaigns.add(campaign_id)
-        
-        try:
-            # Check campaign status with context manager
-            async with get_repository_context(CampaignRepository) as campaign_repository:
-                campaign = await campaign_repository.get_by_id(campaign_id)
-                if not campaign or campaign.status != "active":
-                    return
-            
-            # Process in chunks until complete
-            async with self._semaphore:
-                await self._process_campaign_chunks(campaign_id)
-                
-        except Exception as e:
-            logger.error(f"Error processing campaign {campaign_id}: {e}", exc_info=True)
-            # Update campaign status to failed with a new context manager
-            try:
-                async with get_repository_context(CampaignRepository) as campaign_repository:
-                    await campaign_repository.update_campaign_status(
-                        campaign_id=campaign_id,
-                        status="failed",
-                        completed_at=datetime.now(timezone.utc)
-                    )
-            except Exception as update_error:
-                logger.error(f"Failed to update campaign status: {update_error}")
-        finally:
-            # Remove from processing set
-            self._processing_campaigns.remove(campaign_id)
-    
-    async def _process_campaign_chunks(self, campaign_id: str) -> None:
-        """
-        Process campaign messages in chunks.
-        
-        Args:
-            campaign_id: Campaign ID
-        """
-        # Query pending messages in chunks
-        offset = 0
-        
-        while True:
-            # Check if campaign is still active with context manager
-            campaign = None
-            async with get_repository_context(CampaignRepository) as campaign_repository:
-                campaign = await campaign_repository.get_by_id(campaign_id)
-                if not campaign or campaign.status != "active":
-                    logger.info(f"Campaign {campaign_id} is no longer active, stopping processing")
-                    return
-            
-            # Get next chunk of messages with context manager
-            messages = []
-            total = 0
-            async with get_repository_context(MessageRepository) as message_repository:
-                messages, total = await message_repository.get_messages_for_campaign(
-                    campaign_id=campaign_id,
-                    status=MessageStatus.PENDING,
-                    skip=offset,
-                    limit=self._chunk_size
-                )
-            
-            # If no more messages, campaign is complete
-            if not messages:
-                logger.info(f"No more pending messages for campaign {campaign_id}")
-                async with get_repository_context(CampaignRepository) as campaign_repository:
-                    await campaign_repository.update_campaign_status(
-                        campaign_id=campaign_id,
-                        status="completed",
-                        completed_at=datetime.now(timezone.utc)
-                    )
-                return
-            
-            # Process this chunk
-            await self._process_message_chunk(campaign_id, messages)
-            
-            # Update offset for next chunk
-            offset += len(messages)
-            
-            # Small delay between chunks to avoid overloading
-            await asyncio.sleep(0.5)
-    
-    async def _process_message_chunk(self, campaign_id: str, messages: List[Any]) -> None:
-        """
-        Process a chunk of messages with proper context management.
-        
-        Args:
-            campaign_id: Campaign ID
-            messages: List of message objects
-        """
-        # Process each message in the chunk
-        success_count = 0
-        fail_count = 0
-        
-        for message in messages:
-            try:
-                # Use SMS sender to send the message
-                result = await self.sms_sender._send_to_gateway(
-                    phone_number=message.phone_number,
-                    message_text=message.message,
-                    custom_id=message.custom_id or str(uuid.uuid4())
-                )
-                
-                # Update message status with context manager
-                async with get_repository_context(MessageRepository) as message_repository:
-                    await message_repository.update_message_status(
-                        message_id=message.id,
-                        status=result.get("status", MessageStatus.PENDING),
-                        event_type="campaign_process",
-                        gateway_message_id=result.get("gateway_message_id"),
-                        data=result
-                    )
-                
-                success_count += 1
-                
-                # Add delay between messages to avoid overloading gateway
-                await asyncio.sleep(settings.DELAY_BETWEEN_SMS)
-                
-            except Exception as e:
-                logger.error(f"Error processing message {message.id}: {e}")
-                
-                # Update message status to failed with context manager
-                try:
-                    async with get_repository_context(MessageRepository) as message_repository:
-                        await message_repository.update_message_status(
-                            message_id=message.id,
-                            status=MessageStatus.FAILED,
-                            event_type="campaign_process_error",
-                            reason=str(e),
-                            data={"error": str(e)}
-                        )
-                except Exception as update_error:
-                    logger.error(f"Failed to update message status: {update_error}")
-                
-                fail_count += 1
-        
-        # Update campaign stats with context manager
-        if success_count > 0 or fail_count > 0:
-            try:
-                async with get_repository_context(CampaignRepository) as campaign_repository:
-                    await campaign_repository.update_campaign_stats(
-                        campaign_id=campaign_id,
-                        increment_sent=success_count,
-                        increment_failed=fail_count
-                    )
-            except Exception as update_error:
-                logger.error(f"Failed to update campaign stats: {update_error}")
-        
-        logger.info(f"Processed chunk for campaign {campaign_id}: {success_count} sent, {fail_count} failed")
-
-
-# Dependency injection function
-async def get_campaign_processor():
-    """
-    Get campaign processor service instance.
-    
-    Uses the SMS sender with its dedicated context management but doesn't create
-    long-lived repository instances. Each operation in the processor will
-    create repositories within context managers as needed.
-    """
-    from app.services.event_bus.bus import get_event_bus
-    from app.services.sms.sender import get_sms_sender
-    
-    sms_sender = await get_sms_sender()
-    event_bus = get_event_bus()
-    
-    return CampaignProcessor(
-        sms_sender=sms_sender,
-        event_bus=event_bus
-    )
-</file>
-
 <file path="app/utils/ids.py">
 # app/utils/ids.py
 
@@ -29358,312 +29336,6 @@ from app.models.contact import Contact
 # This allows alembic to auto-discover all models when creating migrations
 </file>
 
-<file path="app/db/repositories/campaigns.py">
-# app/db/repositories/campaigns.py
-from datetime import datetime, timezone
-from typing import List, Optional, Dict, Any, Tuple
-from app.utils.ids import generate_prefixed_id, IDPrefix
-
-
-from sqlalchemy import select, update, and_, or_, desc, func
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.db.repositories.base import BaseRepository
-from app.models.campaign import Campaign
-from app.models.message import Message
-
-
-class CampaignRepository(BaseRepository[Campaign, Dict[str, Any], Dict[str, Any]]):
-    """Campaign repository for campaign operations."""
-    
-    def __init__(self, session: AsyncSession):
-        """Initialize repository with session."""
-        super().__init__(session=session, model=Campaign)
-    
-    async def create_campaign(
-        self,
-        *,
-        name: str,
-        user_id: str,
-        description: Optional[str] = None,
-        scheduled_start_at: Optional[datetime] = None,
-        scheduled_end_at: Optional[datetime] = None,
-        settings: Optional[Dict[str, Any]] = None
-    ) -> Campaign:
-        """
-        Create a new campaign.
-        
-        Args:
-            name: Campaign name
-            user_id: User ID
-            description: Optional campaign description
-            scheduled_start_at: Optional scheduled start time
-            scheduled_end_at: Optional scheduled end time
-            settings: Optional campaign settings
-            
-        Returns:
-            Campaign: Created campaign
-        """
-        campaign_id = generate_prefixed_id(IDPrefix.CAMPAIGN)
-        campaign = Campaign(
-            id=campaign_id,
-            name=name,
-            description=description,
-            status="draft",
-            user_id=user_id,
-            scheduled_start_at=scheduled_start_at,
-            scheduled_end_at=scheduled_end_at,
-            settings=settings or {}
-        )
-        
-        self.session.add(campaign)
-        
-        return campaign
-    
-    async def update_campaign_status(
-        self,
-        *,
-        campaign_id: str,
-        status: str,
-        started_at: Optional[datetime] = None,
-        completed_at: Optional[datetime] = None
-    ) -> Optional[Campaign]:
-        """
-        Update campaign status with proper transaction handling.
-        
-        Args:
-            campaign_id: Campaign ID
-            status: New status
-            started_at: Optional start timestamp
-            completed_at: Optional completion timestamp
-            
-        Returns:
-            Campaign: Updated campaign or None
-        """
-        # Start a transaction
-        async with self.session.begin():
-            # Get campaign
-            campaign = await self.get_by_id(campaign_id)
-            if not campaign:
-                return None
-            
-            old_status = campaign.status
-            campaign.status = status
-            
-            if started_at:
-                campaign.started_at = started_at
-            
-            if completed_at:
-                campaign.completed_at = completed_at
-            
-            # If status is active and no start time, set it now
-            if status == "active" and not campaign.started_at:
-                campaign.started_at = datetime.now(timezone.utc)
-            
-            # If status is completed and no completion time, set it now
-            if status in ["completed", "cancelled", "failed"] and not campaign.completed_at:
-                campaign.completed_at = datetime.now(timezone.utc)
-            
-            # Add campaign to session
-            self.session.add(campaign)
-            
-            # If transitioning from draft to active, also update any pending messages
-            # that are associated with this campaign
-            if old_status == "draft" and status == "active":
-                from app.models.message import Message
-                from app.schemas.message import MessageStatus
-                
-                # Update messages
-                query = update(Message).where(
-                    and_(
-                        Message.campaign_id == campaign_id,
-                        Message.status == MessageStatus.PENDING,
-                        or_(
-                            Message.scheduled_at.is_(None),
-                            Message.scheduled_at <= datetime.now(timezone.utc)
-                        )
-                    )
-                ).values(
-                    status=MessageStatus.PROCESSED
-                )
-                
-                await self.session.execute(query)
-            
-            # Publish event about status change
-            from app.services.event_bus.bus import get_event_bus
-            from app.services.event_bus.events import EventType
-            
-            event_bus = get_event_bus()
-            event_type = None
-            
-            if status == "active":
-                event_type = EventType.CAMPAIGN_STARTED
-            elif status == "paused":
-                event_type = EventType.CAMPAIGN_PAUSED
-            elif status == "completed":
-                event_type = EventType.CAMPAIGN_COMPLETED
-            elif status == "cancelled":
-                event_type = EventType.CAMPAIGN_CANCELLED
-            elif status == "failed":
-                event_type = EventType.CAMPAIGN_FAILED
-                
-            if event_type:
-                await event_bus.publish(
-                    event_type,
-                    {
-                        "campaign_id": campaign_id,
-                        "previous_status": old_status,
-                        "new_status": status,
-                        "timestamp": datetime.now(timezone.utc).isoformat()
-                    }
-                )
-            
-            
-            
-            return campaign
-
-    async def update_campaign_stats(
-        self,
-        *,
-        campaign_id: str,
-        increment_sent: int = 0,
-        increment_delivered: int = 0,
-        increment_failed: int = 0
-    ) -> Optional[Campaign]:
-        """
-        Update campaign statistics.
-        
-        Args:
-            campaign_id: Campaign ID
-            increment_sent: Increment sent count
-            increment_delivered: Increment delivered count
-            increment_failed: Increment failed count
-            
-        Returns:
-            Campaign: Updated campaign or None
-        """
-        campaign = await self.get_by_id(campaign_id)
-        if not campaign:
-            return None
-        
-        # Update counts
-        campaign.sent_count += increment_sent
-        campaign.delivered_count += increment_delivered
-        campaign.failed_count += increment_failed
-        
-        # Check if campaign is complete
-        total_processed = campaign.sent_count + campaign.failed_count
-        if total_processed >= campaign.total_messages and campaign.total_messages > 0:
-            campaign.status = "completed"
-            campaign.completed_at = datetime.now(timezone.utc)
-        
-        self.session.add(campaign)
-        
-        return campaign
-    
-    async def get_campaigns_for_user(
-        self,
-        *,
-        user_id: str,
-        status: Optional[str] = None,
-        skip: int = 0,
-        limit: int = 20
-    ) -> Tuple[List[Campaign], int]:
-        """
-        Get campaigns for a user with optional filtering.
-        
-        Args:
-            user_id: User ID
-            status: Optional status filter
-            skip: Number of records to skip
-            limit: Maximum number of records to return
-            
-        Returns:
-            Tuple[List[Campaign], int]: List of campaigns and total count
-        """
-        # Base query
-        query = select(Campaign).where(Campaign.user_id == user_id)
-        count_query = select(func.count()).select_from(Campaign).where(Campaign.user_id == user_id)
-        
-        # Apply status filter
-        if status:
-            query = query.where(Campaign.status == status)
-            count_query = count_query.where(Campaign.status == status)
-        
-        # Order by created_at desc
-        query = query.order_by(desc(Campaign.created_at))
-        
-        # Apply pagination
-        query = query.offset(skip).limit(limit)
-        
-        # Execute queries
-        result = await self.session.execute(query)
-        count_result = await self.session.execute(count_query)
-        
-        campaigns = result.scalars().all()
-        total = count_result.scalar_one()
-        
-        return campaigns, total
-    
-    async def add_messages_to_campaign(
-        self,
-        *,
-        campaign_id: str,
-        phone_numbers: List[str],
-        message_text: str,
-        user_id: str
-    ) -> int:
-        """
-        Add messages to a campaign.
-        
-        Args:
-            campaign_id: Campaign ID
-            phone_numbers: List of recipient phone numbers
-            message_text: Message content
-            user_id: User ID
-            
-        Returns:
-            int: Number of messages added
-        """
-        from app.db.repositories.messages import MessageRepository
-        from app.utils.phone import validate_phone
-        
-        # Get campaign
-        campaign = await self.get_by_id(campaign_id)
-        if not campaign:
-            return 0
-        
-        # Validate campaign belongs to user
-        if campaign.user_id != user_id:
-            return 0
-        
-        # TODO: Implement bulk insertion for better performance
-        message_repo = MessageRepository(self.session)
-        added_count = 0
-        
-        for phone in phone_numbers:
-            # Basic validation
-            is_valid, formatted_number, error, _ = validate_phone(phone)
-            if is_valid:
-                # Add message to campaign
-                await message_repo.create_message(
-                    phone_number=formatted_number,
-                    message_text=message_text,
-                    user_id=user_id,
-                    scheduled_at=campaign.scheduled_start_at,
-                    metadata={"campaign_id": campaign_id},
-                    campaign_id=campaign_id  # Direct link to campaign
-                )
-                added_count += 1
-        
-        # Update campaign message count
-        if added_count > 0:
-            campaign.total_messages += added_count
-            self.session.add(campaign)
-        
-        return added_count
-</file>
-
 <file path="app/db/repositories/templates.py">
 # app/db/repositories/templates.py
 """
@@ -30115,6 +29787,377 @@ class APIKey(Base):
     
     # Relationships
     user = relationship("User", back_populates="api_keys")
+</file>
+
+<file path="app/services/campaigns/processor.py">
+# app/services/campaigns/processor.py
+import asyncio
+import logging
+from datetime import datetime, timezone
+from typing import List, Dict, Any, Optional
+import uuid
+
+from app.core.config import settings
+from app.db.repositories.campaigns import CampaignRepository
+from app.db.repositories.messages import MessageRepository
+from app.schemas.message import MessageStatus
+from app.services.event_bus.bus import get_event_bus
+from app.services.event_bus.events import EventType
+from app.services.sms.sender import SMSSender, get_sms_sender
+from app.services.campaigns.virtual_sender import VirtualCampaignSender, get_virtual_campaign_sender
+from app.db.session import get_repository_context
+
+logger = logging.getLogger("inboxerr.campaigns")
+
+class CampaignProcessor:
+    """
+    Service for processing SMS campaigns.
+    
+    Manages campaign execution, chunked processing, and status tracking.
+    Uses context managers for database operations to prevent connection leaks.
+    """
+
+    def __init__(
+        self,
+        sms_sender: SMSSender,
+        event_bus: Any,
+        virtual_sender: VirtualCampaignSender
+    ):
+        """
+        Initialize campaign processor with required dependencies.
+        
+        Removed repository dependencies to prevent long-lived connections.
+        The repositories will be created as needed using context managers.
+        
+        Args:
+            sms_sender: SMS sender service
+            event_bus: Event bus for publishing events
+            virtual_sender: Virtual campaign sender for template-based campaigns
+        """
+        self.sms_sender = sms_sender
+        self.event_bus = event_bus
+        self.virtual_sender = virtual_sender
+        self._processing_campaigns = set()
+        self._chunk_size = settings.BATCH_SIZE  # Default from settings
+        self._semaphore = asyncio.Semaphore(5)  # Limit concurrent campaigns
+    
+    async def start_campaign(self, campaign_id: str, user_id: str) -> bool:
+        """
+        Start a campaign.
+        
+        Args:
+            campaign_id: Campaign ID
+            user_id: User ID for authorization
+            
+        Returns:
+            bool: True if campaign was started, False otherwise
+        """
+        # Use context manager for repository access
+        async with get_repository_context(CampaignRepository) as campaign_repository:
+            # Get campaign
+            campaign = await campaign_repository.get_by_id(campaign_id)
+            if not campaign:
+                return False
+            
+            # Validate ownership
+            if campaign.user_id != user_id:
+                return False
+            
+            # Check if campaign can be started
+            if campaign.status != "draft" and campaign.status != "paused":
+                return False
+            
+            # Update status to active
+            updated = await campaign_repository.update_campaign_status(
+                campaign_id=campaign_id,
+                status="active",
+                started_at=datetime.now(timezone.utc)
+            )
+            
+            if not updated:
+                return False
+            
+            # Get total_messages for the event
+            total_messages = campaign.total_messages
+        
+        # Start processing in background
+        asyncio.create_task(self._process_campaign(campaign_id))
+        
+        # Publish event
+        await self.event_bus.publish(
+            EventType.BATCH_CREATED,
+            {
+                "campaign_id": campaign_id,
+                "user_id": user_id,
+                "total_messages": total_messages
+            }
+        )
+        
+        return True
+    
+    async def pause_campaign(self, campaign_id: str, user_id: str) -> bool:
+        """
+        Pause a campaign.
+        
+        Args:
+            campaign_id: Campaign ID
+            user_id: User ID for authorization
+            
+        Returns:
+            bool: True if campaign was paused, False otherwise
+        """
+        # Use context manager for repository access
+        async with get_repository_context(CampaignRepository) as campaign_repository:
+            # Get campaign
+            campaign = await campaign_repository.get_by_id(campaign_id)
+            if not campaign:
+                return False
+            
+            # Validate ownership
+            if campaign.user_id != user_id:
+                return False
+            
+            # Check if campaign can be paused
+            if campaign.status != "active":
+                return False
+            
+            # Update status to paused
+            updated = await campaign_repository.update_campaign_status(
+                campaign_id=campaign_id,
+                status="paused"
+            )
+            
+            return updated is not None
+    
+    async def cancel_campaign(self, campaign_id: str, user_id: str) -> bool:
+        """
+        Cancel a campaign.
+        
+        Args:
+            campaign_id: Campaign ID
+            user_id: User ID for authorization
+            
+        Returns:
+            bool: True if campaign was cancelled, False otherwise
+        """
+        # Use context manager for repository access
+        async with get_repository_context(CampaignRepository) as campaign_repository:
+            # Get campaign
+            campaign = await campaign_repository.get_by_id(campaign_id)
+            if not campaign:
+                return False
+            
+            # Validate ownership
+            if campaign.user_id != user_id:
+                return False
+            
+            # Check if campaign can be cancelled
+            if campaign.status in ["completed", "cancelled", "failed"]:
+                return False
+            
+            # Update status to cancelled
+            updated = await campaign_repository.update_campaign_status(
+                campaign_id=campaign_id,
+                status="cancelled",
+                completed_at=datetime.now(timezone.utc)
+            )
+            
+            return updated is not None
+    
+    async def _process_campaign(self, campaign_id: str) -> None:
+        """
+        Process a campaign in the background.
+        
+        Detects if campaign is virtual (template-based) or traditional (pre-created messages)
+        and routes to appropriate processing method.
+        
+        Args:
+            campaign_id: Campaign ID
+        """
+        if campaign_id in self._processing_campaigns:
+            logger.warning(f"Campaign {campaign_id} is already being processed")
+            return
+        
+        # Mark as processing
+        self._processing_campaigns.add(campaign_id)
+        
+        try:
+            # Check campaign status and type
+            is_virtual = False
+            async with get_repository_context(CampaignRepository) as campaign_repository:
+                campaign = await campaign_repository.get_by_id(campaign_id)
+                if not campaign or campaign.status != "active":
+                    return
+                
+                # Check if this is a virtual campaign
+                is_virtual = campaign.settings.get("virtual_messaging", False)
+                logger.info(f"Processing campaign {campaign_id} - Virtual: {is_virtual}")
+            
+            # Route to appropriate processor
+            async with self._semaphore:
+                if is_virtual:
+                    # Use virtual sender for template-based campaigns
+                    await self.virtual_sender.process_virtual_campaign(campaign_id)
+                else:
+                    # Use traditional method for pre-created message campaigns
+                    await self._process_campaign_chunks(campaign_id)
+                
+        except Exception as e:
+            logger.error(f"Error processing campaign {campaign_id}: {e}", exc_info=True)
+            # Update campaign status to failed with a new context manager
+            try:
+                async with get_repository_context(CampaignRepository) as campaign_repository:
+                    await campaign_repository.update_campaign_status(
+                        campaign_id=campaign_id,
+                        status="failed",
+                        completed_at=datetime.now(timezone.utc)
+                    )
+            except Exception as update_error:
+                logger.error(f"Failed to update campaign status: {update_error}")
+        finally:
+            # Remove from processing set
+            self._processing_campaigns.remove(campaign_id)
+    
+    async def _process_campaign_chunks(self, campaign_id: str) -> None:
+        """
+        Process campaign messages in chunks.
+        
+        Args:
+            campaign_id: Campaign ID
+        """
+        # Query pending messages in chunks
+        offset = 0
+        
+        while True:
+            # Check if campaign is still active with context manager
+            campaign = None
+            async with get_repository_context(CampaignRepository) as campaign_repository:
+                campaign = await campaign_repository.get_by_id(campaign_id)
+                if not campaign or campaign.status != "active":
+                    logger.info(f"Campaign {campaign_id} is no longer active, stopping processing")
+                    return
+            
+            # Get next chunk of messages with context manager
+            messages = []
+            total = 0
+            async with get_repository_context(MessageRepository) as message_repository:
+                messages, total = await message_repository.get_messages_for_campaign(
+                    campaign_id=campaign_id,
+                    status=MessageStatus.PENDING,
+                    skip=offset,
+                    limit=self._chunk_size
+                )
+            
+            # If no more messages, campaign is complete
+            if not messages:
+                logger.info(f"No more pending messages for campaign {campaign_id}")
+                async with get_repository_context(CampaignRepository) as campaign_repository:
+                    await campaign_repository.update_campaign_status(
+                        campaign_id=campaign_id,
+                        status="completed",
+                        completed_at=datetime.now(timezone.utc)
+                    )
+                return
+            
+            # Process this chunk
+            await self._process_message_chunk(campaign_id, messages)
+            
+            # Update offset for next chunk
+            offset += len(messages)
+            
+            # Small delay between chunks to avoid overloading
+            await asyncio.sleep(0.5)
+    
+    async def _process_message_chunk(self, campaign_id: str, messages: List[Any]) -> None:
+        """
+        Process a chunk of messages with proper context management.
+        
+        Args:
+            campaign_id: Campaign ID
+            messages: List of message objects
+        """
+        # Process each message in the chunk
+        success_count = 0
+        fail_count = 0
+        
+        for message in messages:
+            try:
+                # Use SMS sender to send the message
+                result = await self.sms_sender._send_to_gateway(
+                    phone_number=message.phone_number,
+                    message_text=message.message,
+                    custom_id=message.custom_id or str(uuid.uuid4())
+                )
+                
+                # Update message status with context manager
+                async with get_repository_context(MessageRepository) as message_repository:
+                    await message_repository.update_message_status(
+                        message_id=message.id,
+                        status=result.get("status", MessageStatus.PENDING),
+                        event_type="campaign_process",
+                        gateway_message_id=result.get("gateway_message_id"),
+                        data=result
+                    )
+                
+                success_count += 1
+                
+                # Add delay between messages to avoid overloading gateway
+                await asyncio.sleep(settings.DELAY_BETWEEN_SMS)
+                
+            except Exception as e:
+                logger.error(f"Error processing message {message.id}: {e}")
+                
+                # Update message status to failed with context manager
+                try:
+                    async with get_repository_context(MessageRepository) as message_repository:
+                        await message_repository.update_message_status(
+                            message_id=message.id,
+                            status=MessageStatus.FAILED,
+                            event_type="campaign_process_error",
+                            reason=str(e),
+                            data={"error": str(e)}
+                        )
+                except Exception as update_error:
+                    logger.error(f"Failed to update message status: {update_error}")
+                
+                fail_count += 1
+        
+        # Update campaign stats with context manager
+        if success_count > 0 or fail_count > 0:
+            try:
+                async with get_repository_context(CampaignRepository) as campaign_repository:
+                    await campaign_repository.update_campaign_stats(
+                        campaign_id=campaign_id,
+                        increment_sent=success_count,
+                        increment_failed=fail_count
+                    )
+            except Exception as update_error:
+                logger.error(f"Failed to update campaign stats: {update_error}")
+        
+        logger.info(f"Processed chunk for campaign {campaign_id}: {success_count} sent, {fail_count} failed")
+
+
+# Dependency injection function
+async def get_campaign_processor():
+    """
+    Get campaign processor service instance.
+    
+    Uses the SMS sender with its dedicated context management but doesn't create
+    long-lived repository instances. Each operation in the processor will
+    create repositories within context managers as needed.
+    """
+    from app.services.event_bus.bus import get_event_bus
+    from app.services.sms.sender import get_sms_sender
+    
+    sms_sender = await get_sms_sender()
+    event_bus = get_event_bus()
+    virtual_sender = await get_virtual_campaign_sender()
+    
+    return CampaignProcessor(
+        sms_sender=sms_sender,
+        event_bus=event_bus,
+        virtual_sender=virtual_sender
+    )
 </file>
 
 <file path="app/services/event_bus/events.py">
@@ -31350,6 +31393,320 @@ class Settings(BaseSettings):
 settings = Settings()
 </file>
 
+<file path="app/db/repositories/campaigns.py">
+# app/db/repositories/campaigns.py
+from datetime import datetime, timezone
+from typing import List, Optional, Dict, Any, Tuple
+from app.utils.ids import generate_prefixed_id, IDPrefix
+
+
+from sqlalchemy import select, update, and_, or_, desc, func
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db.repositories.base import BaseRepository
+from app.models.campaign import Campaign
+from app.models.message import Message
+
+
+class CampaignRepository(BaseRepository[Campaign, Dict[str, Any], Dict[str, Any]]):
+    """Campaign repository for campaign operations."""
+    
+    def __init__(self, session: AsyncSession):
+        """Initialize repository with session."""
+        super().__init__(session=session, model=Campaign)
+    
+    async def create_campaign(
+        self,
+        *,
+        name: str,
+        user_id: str,
+        description: Optional[str] = None,
+        message_content: Optional[str] = None,
+        template_id: Optional[str] = None,
+        total_messages: Optional[int] = None,
+        scheduled_start_at: Optional[datetime] = None,
+        scheduled_end_at: Optional[datetime] = None,
+        settings: Optional[Dict[str, Any]] = None
+    ) -> Campaign:
+        """
+        Create a new campaign.
+
+        Args:
+            name: Campaign name
+            user_id: User ID
+            description: Optional campaign description
+            message_content: Optional message template content
+            template_id: Optional template ID reference
+            total_messages: Optional total message count for virtual campaigns
+            scheduled_start_at: Optional scheduled start time
+            scheduled_end_at: Optional scheduled end time
+            settings: Optional campaign settings
+            
+        Returns:
+            Campaign: Created campaign
+        """
+        campaign_id = generate_prefixed_id(IDPrefix.CAMPAIGN)
+        campaign = Campaign(
+            id=campaign_id,
+            name=name,
+            description=description,
+            message_content=message_content,
+            template_id=template_id,
+            total_messages=total_messages or 0,
+            status="draft",
+            user_id=user_id,
+            scheduled_start_at=scheduled_start_at,
+            scheduled_end_at=scheduled_end_at,
+            settings=settings or {}
+        )
+        
+        self.session.add(campaign)
+        
+        return campaign
+    
+    async def update_campaign_status(
+        self,
+        *,
+        campaign_id: str,
+        status: str,
+        started_at: Optional[datetime] = None,
+        completed_at: Optional[datetime] = None
+    ) -> Optional[Campaign]:
+        """
+        Update campaign status with proper transaction handling.
+        
+        Args:
+            campaign_id: Campaign ID
+            status: New status
+            started_at: Optional start timestamp
+            completed_at: Optional completion timestamp
+            
+        Returns:
+            Campaign: Updated campaign or None
+        """
+        #
+        # Get campaign
+        campaign = await self.get_by_id(campaign_id)
+        if not campaign:
+            return None
+        
+        old_status = campaign.status
+        campaign.status = status
+        
+        if started_at:
+            campaign.started_at = started_at
+        
+        if completed_at:
+            campaign.completed_at = completed_at
+        
+        # If status is active and no start time, set it now
+        if status == "active" and not campaign.started_at:
+            campaign.started_at = datetime.now(timezone.utc)
+        
+        # If status is completed and no completion time, set it now
+        if status in ["completed", "cancelled", "failed"] and not campaign.completed_at:
+            campaign.completed_at = datetime.now(timezone.utc)
+        
+        # Add campaign to session
+        self.session.add(campaign)
+        
+        # If transitioning from draft to active, also update any pending messages
+        # that are associated with this campaign
+        if old_status == "draft" and status == "active":
+            from app.models.message import Message
+            from app.schemas.message import MessageStatus
+            
+            # Update messages
+            query = update(Message).where(
+                and_(
+                    Message.campaign_id == campaign_id,
+                    Message.status == MessageStatus.PENDING,
+                    or_(
+                        Message.scheduled_at.is_(None),
+                        Message.scheduled_at <= datetime.now(timezone.utc)
+                    )
+                )
+            ).values(
+                status=MessageStatus.PROCESSED
+            )
+            
+            await self.session.execute(query)
+        
+        # Publish event about status change
+        from app.services.event_bus.bus import get_event_bus
+        from app.services.event_bus.events import EventType
+        
+        event_bus = get_event_bus()
+        event_type = None
+        
+        if status == "active":
+            event_type = EventType.CAMPAIGN_STARTED
+        elif status == "paused":
+            event_type = EventType.CAMPAIGN_PAUSED
+        elif status == "completed":
+            event_type = EventType.CAMPAIGN_COMPLETED
+        elif status == "cancelled":
+            event_type = EventType.CAMPAIGN_CANCELLED
+        elif status == "failed":
+            event_type = EventType.CAMPAIGN_FAILED
+            
+        if event_type:
+            await event_bus.publish(
+                event_type,
+                {
+                    "campaign_id": campaign_id,
+                    "previous_status": old_status,
+                    "new_status": status,
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                }
+            )
+        
+        
+        
+        return campaign
+
+    async def update_campaign_stats(
+        self,
+        *,
+        campaign_id: str,
+        increment_sent: int = 0,
+        increment_delivered: int = 0,
+        increment_failed: int = 0
+    ) -> Optional[Campaign]:
+        """
+        Update campaign statistics.
+        
+        Args:
+            campaign_id: Campaign ID
+            increment_sent: Increment sent count
+            increment_delivered: Increment delivered count
+            increment_failed: Increment failed count
+            
+        Returns:
+            Campaign: Updated campaign or None
+        """
+        campaign = await self.get_by_id(campaign_id)
+        if not campaign:
+            return None
+        
+        # Update counts
+        campaign.sent_count += increment_sent
+        campaign.delivered_count += increment_delivered
+        campaign.failed_count += increment_failed
+        
+        # Check if campaign is complete
+        total_processed = campaign.sent_count + campaign.failed_count
+        if total_processed >= campaign.total_messages and campaign.total_messages > 0:
+            campaign.status = "completed"
+            campaign.completed_at = datetime.now(timezone.utc)
+        
+        self.session.add(campaign)
+        
+        return campaign
+    
+    async def get_campaigns_for_user(
+        self,
+        *,
+        user_id: str,
+        status: Optional[str] = None,
+        skip: int = 0,
+        limit: int = 20
+    ) -> Tuple[List[Campaign], int]:
+        """
+        Get campaigns for a user with optional filtering.
+        
+        Args:
+            user_id: User ID
+            status: Optional status filter
+            skip: Number of records to skip
+            limit: Maximum number of records to return
+            
+        Returns:
+            Tuple[List[Campaign], int]: List of campaigns and total count
+        """
+        # Base query
+        query = select(Campaign).where(Campaign.user_id == user_id)
+        count_query = select(func.count()).select_from(Campaign).where(Campaign.user_id == user_id)
+        
+        # Apply status filter
+        if status:
+            query = query.where(Campaign.status == status)
+            count_query = count_query.where(Campaign.status == status)
+        
+        # Order by created_at desc
+        query = query.order_by(desc(Campaign.created_at))
+        
+        # Apply pagination
+        query = query.offset(skip).limit(limit)
+        
+        # Execute queries
+        result = await self.session.execute(query)
+        count_result = await self.session.execute(count_query)
+        
+        campaigns = result.scalars().all()
+        total = count_result.scalar_one()
+        
+        return campaigns, total
+    
+    async def add_messages_to_campaign(
+        self,
+        *,
+        campaign_id: str,
+        phone_numbers: List[str],
+        message_text: str,
+        user_id: str
+    ) -> int:
+        """
+        Add messages to a campaign.
+        
+        Args:
+            campaign_id: Campaign ID
+            phone_numbers: List of recipient phone numbers
+            message_text: Message content
+            user_id: User ID
+            
+        Returns:
+            int: Number of messages added
+        """
+        from app.db.repositories.messages import MessageRepository
+        from app.utils.phone import validate_phone
+        
+        # Get campaign
+        campaign = await self.get_by_id(campaign_id)
+        if not campaign:
+            return 0
+        
+        # Validate campaign belongs to user
+        if campaign.user_id != user_id:
+            return 0
+        
+        # TODO: Implement bulk insertion for better performance
+        message_repo = MessageRepository(self.session)
+        added_count = 0
+        
+        for phone in phone_numbers:
+            # Basic validation
+            is_valid, formatted_number, error, _ = validate_phone(phone)
+            if is_valid:
+                # Add message to campaign
+                await message_repo.create_message(
+                    phone_number=formatted_number,
+                    message_text=message_text,
+                    user_id=user_id,
+                    scheduled_at=campaign.scheduled_start_at,
+                    metadata={"campaign_id": campaign_id},
+                    campaign_id=campaign_id  # Direct link to campaign
+                )
+                added_count += 1
+        
+        # Update campaign message count
+        if added_count > 0:
+            campaign.total_messages += added_count
+            self.session.add(campaign)
+        
+        return added_count
+</file>
+
 <file path="app/models/campaign.py">
 # app/models/campaign.py
 from datetime import datetime, timezone
@@ -32296,790 +32653,6 @@ watchfiles==1.0.5
 websockets==15.0.1
 </file>
 
-<file path="app/api/v1/endpoints/campaigns.py">
-# app/api/v1/endpoints/campaigns.py
-from typing import List, Optional, Dict, Any
-from fastapi import APIRouter, Depends, HTTPException, Query, Path, status
-from fastapi.responses import JSONResponse
-import logging
-
-from app.api.v1.dependencies import get_current_user, get_rate_limiter
-from app.core.exceptions import ValidationError, NotFoundError
-from app.schemas.campaign import (
-    CampaignCreate,
-    CampaignUpdate,
-    CampaignResponse,
-    CampaignStatus,
-)
-from app.schemas.user import User
-from app.schemas.message import MessageResponse, CampaignBulkDeleteRequest, BulkDeleteResponse
-from app.schemas.import_job import ImportJobResponse, ImportStatus
-from app.utils.pagination import PaginationParams, paginate_response, PaginatedResponse, PageInfo
-from app.services.campaigns.processor import get_campaign_processor
-from app.db.session import get_repository_context
-from app.utils.ids import generate_prefixed_id, IDPrefix
-from app.utils.datetime import utc_now
-
-# Import Repository classes
-from app.db.repositories.campaigns import CampaignRepository
-from app.db.repositories.messages import MessageRepository  
-from app.db.repositories.import_jobs import ImportJobRepository
-from app.db.repositories.contacts import ContactRepository
-
-router = APIRouter()
-logger = logging.getLogger("inboxerr.endpoint")
-
-@router.post("/", response_model=CampaignResponse, status_code=status.HTTP_201_CREATED)
-async def create_campaign(
-    campaign: CampaignCreate,
-    current_user: User = Depends(get_current_user),
-    rate_limiter = Depends(get_rate_limiter),
-):
-    """
-    Create a new campaign.
-    
-    This creates a campaign in draft status. Messages can be added later.
-    """
-    # Check rate limits
-    await rate_limiter.check_rate_limit(current_user.id, "create_campaign")
-    
-    try:
-        # Use repository context for proper connection management
-        from app.db.repositories.campaigns import CampaignRepository
-        
-        async with get_repository_context(CampaignRepository) as campaign_repo:
-            # Create campaign
-            result = await campaign_repo.create_campaign(
-                name=campaign.name,
-                description=campaign.description,
-                user_id=current_user.id,
-                scheduled_start_at=campaign.scheduled_start_at,
-                scheduled_end_at=campaign.scheduled_end_at,
-                settings=campaign.settings
-            )
-            
-            return result
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error creating campaign: {str(e)}")
-
-
-@router.post("/from-import/{import_job_id}", response_model=CampaignResponse, status_code=status.HTTP_201_CREATED)
-async def create_campaign_from_import(
-    import_job_id: str,
-    campaign: CampaignCreate,
-    message_template: str = Query(..., description="Message template for the campaign"),
-    current_user: User = Depends(get_current_user),
-    rate_limiter = Depends(get_rate_limiter),
-) -> CampaignResponse:
-    """
-    Create a campaign from an existing successful import job.
-
-    **Phase 2A Workflow:**
-    1. Upload CSV: POST /imports/upload (automatic processing)
-    2. Monitor Progress: GET /imports/jobs/{job_id}  
-    3. Create Campaign: POST /campaigns/from-import/{import_job_id} (this endpoint)
-    
-    This is the recommended approach for creating campaigns from CSV data.
-
-    """
-    # Check rate limits
-    await rate_limiter.check_rate_limit(current_user.id, "create_campaign")
-    
-    try:
-        async with get_repository_context(ImportJobRepository) as import_repo:
-            # Verify import job exists and is successful
-            import_job = await import_repo.get_by_id(import_job_id)
-            if not import_job:
-                raise NotFoundError(f"Import job {import_job_id} not found")
-            
-            # Check ownership
-            if import_job.owner_id != current_user.id:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Not authorized to use this import job"
-                )
-            
-            # Check import job status
-            if import_job.status != ImportStatus.SUCCESS:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Import job must be in SUCCESS status, currently {import_job.status.value}"
-                )
-        
-        async with get_repository_context(ContactRepository) as contact_repo:
-            # Count contacts from import
-            contact_count = await contact_repo.get_contacts_count_by_import(import_job_id)
-            
-            if contact_count == 0:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Import job has no contacts to create campaign from"
-                )
-        
-        async with get_repository_context(CampaignRepository) as campaign_repo:
-            # Create campaign with import reference
-            new_campaign = await campaign_repo.create_campaign(
-                name=campaign.name,
-                description=campaign.description,
-                message_content=message_template,
-                user_id=current_user.id,
-                scheduled_start_at=campaign.scheduled_start_at,
-                scheduled_end_at=campaign.scheduled_end_at,
-                settings={
-                    **campaign.settings,
-                    "import_job_id": import_job_id,
-                    "created_from_import": True
-                },
-                total_messages=contact_count
-            )
-        
-        # Create messages from contacts using separate context
-        async with get_repository_context() as session:
-            await create_messages_from_contacts(
-                session, new_campaign.id, import_job_id, message_template, current_user.id
-            )
-            await session.commit()
-        
-        # Get updated campaign
-        async with get_repository_context(CampaignRepository) as campaign_repo:
-            updated_campaign = await campaign_repo.get_by_id(new_campaign.id)
-        
-        logger.info(
-            f"Created campaign {new_campaign.id} from import job {import_job_id} "
-            f"with {contact_count} contacts"
-        )
-        
-        return updated_campaign
-        
-    except NotFoundError as e:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error creating campaign from import: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error creating campaign from import: {str(e)}"
-        )
-
-
-@router.get("/{campaign_id}/import-status", status_code=status.HTTP_200_OK)
-async def get_campaign_import_status(
-    campaign_id: str = Path(..., description="Campaign ID"),
-    current_user: User = Depends(get_current_user),
-) -> Dict[str, Any]:
-    """
-    Get import status for a campaign created from CSV.
-    """
-    try:
-        async with get_repository_context(CampaignRepository) as campaign_repo:
-            # Get campaign
-            campaign = await campaign_repo.get_by_id(campaign_id)
-            if not campaign:
-                raise NotFoundError(f"Campaign {campaign_id} not found")
-            
-            # Check ownership
-            if campaign.user_id != current_user.id:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Not authorized to access this campaign"
-                )
-            
-            # Check if campaign was created from import
-            import_job_id = campaign.settings.get("import_job_id") if campaign.settings else None
-            if not import_job_id:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Campaign was not created from CSV import"
-                )
-        
-        async with get_repository_context(ImportJobRepository) as import_repo:
-            # Get import job status
-            import_job = await import_repo.get_by_id(import_job_id)
-            if not import_job:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="Associated import job not found"
-                )
-            
-            return {
-                "campaign_id": campaign_id,
-                "import_job_id": import_job_id,
-                "import_status": import_job.status.value,
-                "progress_percentage": import_job.progress_percentage,
-                "rows_total": import_job.rows_total,
-                "rows_processed": import_job.rows_processed,
-                "error_count": import_job.error_count,
-                "has_errors": import_job.has_errors,
-                "created_from_csv": campaign.settings.get("created_from_csv", False),
-                "import_started_at": import_job.started_at.isoformat() if import_job.started_at else None,
-                "import_completed_at": import_job.completed_at.isoformat() if import_job.completed_at else None
-            }
-            
-    except NotFoundError as e:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error getting campaign import status: {str(e)}"
-        )
-
-
-@router.get("/", response_model=PaginatedResponse[CampaignResponse])
-async def list_campaigns(
-    pagination: PaginationParams = Depends(),
-    status: Optional[str] = Query(None, description="Filter by campaign status"),
-    current_user: User = Depends(get_current_user),
-):
-    """
-    List campaigns for the current user.
-    
-    Returns a paginated list of campaigns.
-    """
-    try:
-        # Use repository context for proper connection management
-        from app.db.repositories.campaigns import CampaignRepository
-        
-        async with get_repository_context(CampaignRepository) as campaign_repo:
-            # Get campaigns with pagination
-            campaigns, total = await campaign_repo.get_campaigns_for_user(
-                user_id=current_user.id,
-                status=status,
-                skip=pagination.skip,
-                limit=pagination.limit
-            )
-            
-            # Calculate pagination info
-            total_pages = (total + pagination.limit - 1) // pagination.limit
-            
-            # Return paginated response
-            return paginate_response(campaigns, total, pagination)
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error listing campaigns: {str(e)}")
-
-
-@router.get("/{campaign_id}", response_model=CampaignResponse)
-async def get_campaign(
-   campaign_id: str = Path(..., description="Campaign ID"),
-   current_user: User = Depends(get_current_user),
-):
-   """
-   Get details of a specific campaign.
-   """
-   try:
-       from app.db.repositories.campaigns import CampaignRepository
-       
-       async with get_repository_context(CampaignRepository) as campaign_repo:
-           # Get campaign
-           campaign = await campaign_repo.get_by_id(campaign_id)
-           if not campaign:
-               raise NotFoundError(message=f"Campaign {campaign_id} not found")
-           
-           # Check authorization
-           if campaign.user_id != current_user.id:
-               raise HTTPException(status_code=403, detail="Not authorized to access this campaign")
-           
-           return campaign
-       
-   except NotFoundError as e:
-       raise HTTPException(status_code=404, detail=str(e))
-   except Exception as e:
-       raise HTTPException(status_code=500, detail=f"Error retrieving campaign: {str(e)}")
-
-
-@router.put("/{campaign_id}", response_model=CampaignResponse)
-async def update_campaign(
-   campaign_update: CampaignUpdate,
-   campaign_id: str = Path(..., description="Campaign ID"),
-   current_user: User = Depends(get_current_user),
-):
-   """
-   Update campaign details.
-   
-   Only draft campaigns can be fully updated. Active campaigns can only have their description updated.
-   """
-   try:
-       from app.db.repositories.campaigns import CampaignRepository
-       
-       async with get_repository_context(CampaignRepository) as campaign_repo:
-           # Get campaign
-           campaign = await campaign_repo.get_by_id(campaign_id)
-           if not campaign:
-               raise NotFoundError(message=f"Campaign {campaign_id} not found")
-           
-           # Check authorization
-           if campaign.user_id != current_user.id:
-               raise HTTPException(status_code=403, detail="Not authorized to update this campaign")
-           
-           # Check if campaign can be updated
-           if campaign.status != "draft" and any([
-               campaign_update.scheduled_start_at is not None,
-               campaign_update.scheduled_end_at is not None,
-               campaign_update.name is not None
-           ]):
-               raise HTTPException(
-                   status_code=400, 
-                   detail="Only draft campaigns can have name or schedule updated"
-               )
-           
-           # Convert to dict and remove None values
-           update_data = {k: v for k, v in campaign_update.dict().items() if v is not None}
-           
-           # Update campaign
-           updated = await campaign_repo.update(id=campaign_id, obj_in=update_data)
-           if not updated:
-               raise HTTPException(status_code=500, detail="Failed to update campaign")
-           
-           return updated
-       
-   except NotFoundError as e:
-       raise HTTPException(status_code=404, detail=str(e))
-   except Exception as e:
-       raise HTTPException(status_code=500, detail=f"Error updating campaign: {str(e)}")
-
-
-@router.post("/{campaign_id}/start", response_model=CampaignResponse)
-async def start_campaign(
-   campaign_id: str = Path(..., description="Campaign ID"),
-   current_user: User = Depends(get_current_user),
-   campaign_processor = Depends(get_campaign_processor),
-):
-   """
-   Start a campaign.
-   
-   This will change the campaign status to active and begin sending messages.
-   """
-   try:
-       # Start campaign - campaign_processor already uses context managers internally
-       success = await campaign_processor.start_campaign(
-           campaign_id=campaign_id,
-           user_id=current_user.id
-       )
-       
-       if not success:
-           raise HTTPException(status_code=400, detail="Failed to start campaign")
-       
-       # Get updated campaign - use context manager for this separate operation
-       from app.db.repositories.campaigns import CampaignRepository
-       
-       async with get_repository_context(CampaignRepository) as campaign_repo:
-           campaign = await campaign_repo.get_by_id(campaign_id)
-           return campaign
-       
-   except Exception as e:
-       raise HTTPException(status_code=500, detail=f"Error starting campaign: {str(e)}")
-
-
-@router.post("/{campaign_id}/pause", response_model=CampaignResponse)
-async def pause_campaign(
-   campaign_id: str = Path(..., description="Campaign ID"),
-   current_user: User = Depends(get_current_user),
-   campaign_processor = Depends(get_campaign_processor),
-):
-   """
-   Pause a campaign.
-   
-   This will change the campaign status to paused and stop sending messages.
-   The campaign can be resumed later.
-   """
-   try:
-       # Pause campaign - campaign_processor already uses context managers internally
-       success = await campaign_processor.pause_campaign(
-           campaign_id=campaign_id,
-           user_id=current_user.id
-       )
-       
-       if not success:
-           raise HTTPException(status_code=400, detail="Failed to pause campaign")
-       
-       # Get updated campaign - use context manager for this separate operation
-       from app.db.repositories.campaigns import CampaignRepository
-       
-       async with get_repository_context(CampaignRepository) as campaign_repo:
-           campaign = await campaign_repo.get_by_id(campaign_id)
-           return campaign
-       
-   except Exception as e:
-       raise HTTPException(status_code=500, detail=f"Error pausing campaign: {str(e)}")
-
-
-@router.post("/{campaign_id}/cancel", response_model=CampaignResponse)
-async def cancel_campaign(
-   campaign_id: str = Path(..., description="Campaign ID"),
-   current_user: User = Depends(get_current_user),
-   campaign_processor = Depends(get_campaign_processor),
-):
-   """
-   Cancel a campaign.
-   
-   This will change the campaign status to cancelled and stop sending messages.
-   The campaign cannot be resumed after cancellation.
-   """
-   try:
-       # Cancel campaign - campaign_processor already uses context managers internally
-       success = await campaign_processor.cancel_campaign(
-           campaign_id=campaign_id,
-           user_id=current_user.id
-       )
-       
-       if not success:
-           raise HTTPException(status_code=400, detail="Failed to cancel campaign")
-       
-       # Get updated campaign - use context manager for this separate operation
-       from app.db.repositories.campaigns import CampaignRepository
-       
-       async with get_repository_context(CampaignRepository) as campaign_repo:
-           campaign = await campaign_repo.get_by_id(campaign_id)
-           return campaign
-       
-   except Exception as e:
-       raise HTTPException(status_code=500, detail=f"Error cancelling campaign: {str(e)}")
-
-
-@router.get("/{campaign_id}/messages", response_model=PaginatedResponse[MessageResponse])
-async def get_campaign_messages(
-   campaign_id: str = Path(..., description="Campaign ID"),
-   pagination: PaginationParams = Depends(),
-   status: Optional[str] = Query(None, description="Filter by message status"),
-   current_user: User = Depends(get_current_user),
-):
-   """
-   Get messages for a campaign.
-   
-   Returns a paginated list of messages for the specified campaign.
-   """
-   try:
-       # Use repository context for proper connection management
-       from app.db.repositories.campaigns import CampaignRepository
-       from app.db.repositories.messages import MessageRepository
-       
-       # First check if campaign exists and belongs to user
-       async with get_repository_context(CampaignRepository) as campaign_repo:
-           campaign = await campaign_repo.get_by_id(campaign_id)
-           
-           if not campaign:
-               raise NotFoundError(message=f"Campaign {campaign_id} not found")
-           
-           if campaign.user_id != current_user.id:
-               raise HTTPException(status_code=403, detail="Not authorized to access this campaign")
-       
-       # Get messages for campaign - in a separate context to avoid long transactions
-       async with get_repository_context(MessageRepository) as message_repo:
-           messages, total = await message_repo.get_messages_for_campaign(
-               campaign_id=campaign_id,
-               status=status,
-               skip=pagination.skip,
-               limit=pagination.limit
-           )
-
-           # Calculate proper pagination info
-           total_pages = (total + pagination.limit - 1) // pagination.limit
-
-           # Create proper PageInfo object
-           page_info = PageInfo(
-               current_page=pagination.page,
-               total_pages=total_pages,
-               page_size=pagination.limit,
-               total_items=total,
-               has_previous=pagination.page > 1,
-               has_next=pagination.page < total_pages
-           )
-           
-           # Return PaginatedResponse object
-           return PaginatedResponse(
-               items=messages,  # Direct Message objects - FastAPI will serialize them
-               page_info=page_info
-           )
-       
-   except NotFoundError as e:
-       raise HTTPException(status_code=404, detail=str(e))
-   except Exception as e:
-       raise HTTPException(status_code=500, detail=f"Error retrieving campaign messages: {str(e)}")
-
-
-@router.delete("/{campaign_id}", status_code=204)
-async def delete_campaign(
-   campaign_id: str = Path(..., description="Campaign ID"),
-   current_user: User = Depends(get_current_user),
-):
-   """
-   Delete a campaign.
-   
-   Only draft campaigns can be deleted. Active, paused, or completed campaigns cannot be deleted.
-   """
-   try:
-       from app.db.repositories.campaigns import CampaignRepository
-       
-       async with get_repository_context(CampaignRepository) as campaign_repo:
-           # Get campaign
-           campaign = await campaign_repo.get_by_id(campaign_id)
-           if not campaign:
-               raise NotFoundError(message=f"Campaign {campaign_id} not found")
-           
-           # Check authorization
-           if campaign.user_id != current_user.id:
-               raise HTTPException(status_code=403, detail="Not authorized to delete this campaign")
-           
-           # Check if campaign can be deleted
-           if campaign.status != "draft":
-               raise HTTPException(
-                   status_code=400, 
-                   detail="Only draft campaigns can be deleted"
-               )
-           
-           # Delete campaign
-           success = await campaign_repo.delete(id=campaign_id)
-           if not success:
-               raise HTTPException(status_code=500, detail="Failed to delete campaign")
-           
-           return JSONResponse(status_code=204, content=None)
-       
-   except NotFoundError as e:
-       raise HTTPException(status_code=404, detail=str(e))
-   except Exception as e:
-       raise HTTPException(status_code=500, detail=f"Error deleting campaign: {str(e)}")
-   
-
-@router.delete("/{campaign_id}/messages/bulk", response_model=BulkDeleteResponse)
-async def bulk_delete_campaign_messages(
-    request: CampaignBulkDeleteRequest,
-    campaign_id: str = Path(..., description="Campaign ID"),
-    current_user: User = Depends(get_current_user),
-    rate_limiter = Depends(get_rate_limiter),
-):
-    """
-    Bulk delete messages from a campaign with event safety and server stability.
-    
-    This endpoint efficiently deletes multiple messages belonging to a specific campaign
-    with optional filtering by status and date range. Enhanced with delivery event safety
-    checking and batched processing for high-volume operations handling 10K-30K messages.
-    
-    **Event Safety Features:**
-    - Pre-deletion check for delivery events
-    - Requires explicit confirmation to delete tracking data
-    - Clear warnings about data loss implications
-    - Two-phase deletion (events first, then messages)
-    
-    **Server Stability Features:**
-    - Batched processing prevents server overload
-    - Configurable batch sizes for different load scenarios
-    - Inter-batch delays prevent database lock contention
-    - Graceful handling of partial failures
-    
-    **Business Safety Features:**
-    - Campaign ownership validation
-    - User authorization checks  
-    - Active campaign protection
-    - Comprehensive audit logging
-    
-    **Performance:**
-    - Single SQL query per batch
-    - Optimized for large datasets
-    - 30K deletions in batches for stability
-    
-    **Business Use Cases:**
-    - Clean up failed messages from campaigns
-    - Remove test messages before campaign launch
-    - Compliance-driven message deletion (with event confirmation)
-    - Campaign optimization and cleanup
-    
-    Args:
-        campaign_id: ID of the campaign containing messages to delete
-        request: Bulk delete request with filters, confirmation, and force options
-        current_user: Authenticated user (injected by dependency)
-        rate_limiter: Rate limiting for bulk operations (injected by dependency)
-    
-    Returns:
-        BulkDeleteResponse: Detailed results including event safety information
-        
-    Raises:
-        HTTPException 400: Invalid request, campaign state, or missing confirmation
-        HTTPException 403: User not authorized for this campaign
-        HTTPException 404: Campaign not found
-        HTTPException 429: Rate limit exceeded
-        HTTPException 500: Database or internal server error
-    """
-    import time
-    
-    # Check rate limits for bulk operations
-    await rate_limiter.check_rate_limit(current_user.id, "bulk_delete_campaign")
-    
-    start_time = time.time()
-    
-    try:
-        # Use repository context for proper connection management
-        from app.db.repositories.campaigns import CampaignRepository
-        from app.db.repositories.messages import MessageRepository
-        
-        # First validate campaign exists and user has access
-        async with get_repository_context(CampaignRepository) as campaign_repo:
-            campaign = await campaign_repo.get_by_id(campaign_id)
-            
-            if not campaign:
-                raise NotFoundError(message=f"Campaign {campaign_id} not found")
-            
-            # Check authorization
-            if campaign.user_id != current_user.id:
-                raise HTTPException(
-                    status_code=403, 
-                    detail="Not authorized to delete messages from this campaign"
-                )
-            
-            # Safety check - prevent deletion from active campaigns unless force delete
-            if campaign.status == "active" and not request.force_delete:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Cannot bulk delete messages from active campaign. Pause the campaign first or use force_delete."
-                )
-        
-        # Perform bulk deletion with event safety
-        async with get_repository_context(MessageRepository) as message_repo:
-            # Convert datetime objects to ISO strings for repository method
-            from_date_str = request.from_date.isoformat() if request.from_date else None
-            to_date_str = request.to_date.isoformat() if request.to_date else None
-            
-            # Execute bulk deletion with enhanced safety
-            deleted_count, failed_message_ids, metadata = await message_repo.bulk_delete_campaign_messages(
-                campaign_id=campaign_id,
-                user_id=current_user.id,
-                status=request.status.value if request.status else None,
-                from_date=from_date_str,
-                to_date=to_date_str,
-                limit=request.limit,
-                force_delete=request.force_delete,
-                batch_size=request.batch_size
-            )
-            
-            # Calculate execution time
-            execution_time_ms = int((time.time() - start_time) * 1000)
-            
-            # Build applied filters for audit trail
-            filters_applied = {}
-            if request.status:
-                filters_applied["status"] = request.status.value
-            if request.from_date:
-                filters_applied["from_date"] = from_date_str
-            if request.to_date:
-                filters_applied["to_date"] = to_date_str
-            filters_applied["limit"] = request.limit
-            filters_applied["force_delete"] = request.force_delete
-            filters_applied["batch_size"] = request.batch_size
-            
-            # Build response with enhanced metadata
-            response = BulkDeleteResponse(
-                deleted_count=deleted_count,
-                campaign_id=campaign_id,
-                failed_count=len(failed_message_ids),
-                errors=[f"Failed to delete message: {msg_id}" for msg_id in failed_message_ids],
-                operation_type="campaign",
-                filters_applied=filters_applied,
-                execution_time_ms=execution_time_ms,
-                requires_confirmation=metadata.get("requires_confirmation", False),
-                events_count=metadata.get("events_count"),
-                events_deleted=metadata.get("events_deleted", 0),
-                safety_warnings=metadata.get("safety_warnings", []),
-                batch_info=metadata.get("batch_info")
-            )
-            
-            # Log successful operation for audit
-            logger.info(
-                f"User {current_user.id} bulk deleted {deleted_count} messages "
-                f"from campaign {campaign_id} in {execution_time_ms}ms "
-                f"with filters: {filters_applied}. Events deleted: {metadata.get('events_deleted', 0)}"
-            )
-            
-            return response
-            
-    except NotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except HTTPException:
-        # Re-raise HTTP exceptions as-is
-        raise
-    except Exception as e:
-        # Log error and return generic error message
-        logger.error(f"Error in bulk_delete_campaign_messages: {e}")
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Error performing bulk deletion: {str(e)}"
-        )
-    
-async def create_messages_from_contacts(
-    session,
-    campaign_id: str,
-    import_job_id: str,
-    message_template: str,
-    user_id: Optional[str] = None
-) -> int:
-    """
-    Create messages from imported contacts.
-    
-    **Phase 2A Pattern:** This function creates campaign messages from contacts
-    that were already imported via the /imports/upload pipeline.
-    """
-    try:
-        # Use proper repository classes
-        contact_repo = ContactRepository(session)
-        message_repo = MessageRepository(session)
-        
-        # Get all contacts from import
-        contacts, _ = await contact_repo.get_by_import_id(import_job_id, limit=10000)
-        
-        if not contacts:
-            logger.warning(f"No contacts found for import job {import_job_id}")
-            return 0
-        
-        # Get user_id from campaign if not provided
-        if not user_id:
-            from app.models.campaign import Campaign
-            from sqlalchemy import select
-            campaign_result = await session.execute(
-                select(Campaign.user_id).where(Campaign.id == campaign_id)
-            )
-            user_id = campaign_result.scalar()
-        
-        # Create messages with personalization
-        messages_created = 0
-        
-        for contact in contacts:
-            # Create personalized message using simple template substitution
-            personalized_message = message_template
-            
-            # Variable substitution
-            if contact.name:
-                personalized_message = personalized_message.replace("{{name}}", contact.name)
-                personalized_message = personalized_message.replace("{{contact_name}}", contact.name)
-            
-            personalized_message = personalized_message.replace("{{phone}}", contact.phone)
-            
-            # Create message using repository
-            await message_repo.create_message(
-                phone_number=contact.phone,
-                message_text=personalized_message,
-                user_id=user_id,
-                campaign_id=campaign_id,
-                metadata={
-                    "contact_name": contact.name,
-                    "import_job_id": import_job_id,
-                    "contact_tags": contact.tags or []
-                }
-            )
-            messages_created += 1
-        
-        logger.info(
-            f"Created {messages_created} messages from {len(contacts)} contacts "
-            f"for campaign {campaign_id}"
-        )
-        return messages_created
-        
-    except Exception as e:
-        logger.error(f"Error creating messages from contacts: {str(e)}")
-        raise
-</file>
-
 <file path="app/api/v1/endpoints/messages.py">
 """
 API endpoints for SMS message management.
@@ -33576,6 +33149,865 @@ async def _send_batch_background(
         logger.info(f"Background batch send completed for task {task_id} (batch {batch_id}): {result.get('batch_id', 'unknown')}")
     except Exception as e:
         logger.error(f"Background batch send failed for task {task_id} (batch {batch_id}): {str(e)}")
+</file>
+
+<file path="app/api/v1/endpoints/campaigns.py">
+# app/api/v1/endpoints/campaigns.py
+from typing import List, Optional, Dict, Any
+from fastapi import APIRouter, Depends, HTTPException, Query, Path, status
+from fastapi.responses import JSONResponse
+import logging
+
+from app.api.v1.dependencies import get_current_user, get_rate_limiter
+from app.core.exceptions import ValidationError, NotFoundError
+from app.schemas.campaign import (
+    CampaignCreate,
+    CampaignUpdate,
+    CampaignResponse,
+    CampaignStatus,
+)
+from app.schemas.user import User
+from app.schemas.message import MessageResponse, CampaignBulkDeleteRequest, BulkDeleteResponse
+from app.schemas.import_job import ImportJobResponse, ImportStatus
+from app.utils.pagination import PaginationParams, paginate_response, PaginatedResponse, PageInfo
+from app.services.campaigns.processor import get_campaign_processor
+from app.db.session import get_repository_context
+from app.utils.ids import generate_prefixed_id, IDPrefix
+from app.utils.datetime import utc_now
+
+# Import Repository classes
+from app.db.repositories.campaigns import CampaignRepository
+from app.db.repositories.messages import MessageRepository  
+from app.db.repositories.import_jobs import ImportJobRepository
+from app.db.repositories.contacts import ContactRepository
+from app.db.repositories.templates import TemplateRepository
+
+
+router = APIRouter()
+logger = logging.getLogger("inboxerr.campaign.endpoint")
+
+@router.post("/", response_model=CampaignResponse, status_code=status.HTTP_201_CREATED)
+async def create_campaign(
+    campaign: CampaignCreate,
+    current_user: User = Depends(get_current_user),
+    rate_limiter = Depends(get_rate_limiter),
+):
+    """
+    Create a new campaign.
+    
+    This creates a campaign in draft status. Messages can be added later.
+    """
+    # Check rate limits
+    await rate_limiter.check_rate_limit(current_user.id, "create_campaign")
+    
+    try:
+        # Use repository context for proper connection management
+        from app.db.repositories.campaigns import CampaignRepository
+        
+        async with get_repository_context(CampaignRepository) as campaign_repo:
+            # Create campaign
+            result = await campaign_repo.create_campaign(
+                name=campaign.name,
+                description=campaign.description,
+                user_id=current_user.id,
+                scheduled_start_at=campaign.scheduled_start_at,
+                scheduled_end_at=campaign.scheduled_end_at,
+                settings=campaign.settings
+            )
+            
+            return result
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error creating campaign: {str(e)}")
+
+
+@router.post("/from-import/{import_job_id}", response_model=CampaignResponse, status_code=status.HTTP_201_CREATED)
+async def create_campaign_from_import(
+    import_job_id: str,
+    campaign: CampaignCreate,
+    message_template: str = Query(..., description="Message template for the campaign"),
+    current_user: User = Depends(get_current_user),
+    rate_limiter = Depends(get_rate_limiter),
+) -> CampaignResponse:
+    """
+    Create a campaign from an existing successful import job.
+
+    **Phase 2A Workflow:**
+    1. Upload CSV: POST /imports/upload (automatic processing)
+    2. Monitor Progress: GET /imports/jobs/{job_id}  
+    3. Create Campaign: POST /campaigns/from-import/{import_job_id} (this endpoint)
+    
+    This is the recommended approach for creating campaigns from CSV data.
+
+    """
+    # Check rate limits
+    await rate_limiter.check_rate_limit(current_user.id, "create_campaign")
+    
+    try:
+        async with get_repository_context(ImportJobRepository) as import_repo:
+            # Verify import job exists and is successful
+            import_job = await import_repo.get_by_id(import_job_id)
+            if not import_job:
+                raise NotFoundError(f"Import job {import_job_id} not found")
+            
+            # Check ownership
+            if import_job.owner_id != current_user.id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Not authorized to use this import job"
+                )
+            
+            # Check import job status
+            if import_job.status != ImportStatus.SUCCESS:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Import job must be in SUCCESS status, currently {import_job.status.value}"
+                )
+        
+        async with get_repository_context(ContactRepository) as contact_repo:
+            # Count contacts from import
+            contact_count = await contact_repo.get_contacts_count_by_import(import_job_id)
+            
+            if contact_count == 0:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Import job has no contacts to create campaign from"
+                )
+        
+        # Step 1: Create template for the campaign
+        template = None
+        async with get_repository_context(TemplateRepository) as template_repo:
+            template = await template_repo.create_template(
+                name=f"{campaign.name} - Template",
+                content=message_template,
+                description=f"Auto-generated template for campaign {campaign.name}",
+                user_id=current_user.id,
+                is_active=True
+            )
+        
+        # Step 2: Create campaign with template reference (virtual messaging)
+        async with get_repository_context(CampaignRepository) as campaign_repo:
+            new_campaign = await campaign_repo.create_campaign(
+                name=campaign.name,
+                description=campaign.description,
+                message_content=message_template,
+                template_id=template.id,
+                total_messages=contact_count,
+                user_id=current_user.id,
+                scheduled_start_at=campaign.scheduled_start_at,
+                scheduled_end_at=campaign.scheduled_end_at,
+                settings={
+                    **campaign.settings,
+                    "import_job_id": import_job_id,
+                    "created_from_import": True,
+                    "virtual_messaging": True  # Flag for virtual messaging
+                }
+            )
+        
+        # No more physical message creation - they'll be generated on-demand during sending
+        logger.info(
+            f"Created virtual campaign {new_campaign.id} from import job {import_job_id} "
+            f"with template {template.id} for {contact_count} contacts (no pre-created messages)"
+        )
+        
+        return new_campaign
+        
+    except NotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating campaign from import: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error creating campaign from import: {str(e)}"
+        )
+
+
+@router.get("/{campaign_id}/import-status", status_code=status.HTTP_200_OK)
+async def get_campaign_import_status(
+    campaign_id: str = Path(..., description="Campaign ID"),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """
+    Get import status for a campaign created from CSV.
+    """
+    try:
+        async with get_repository_context(CampaignRepository) as campaign_repo:
+            # Get campaign
+            campaign = await campaign_repo.get_by_id(campaign_id)
+            if not campaign:
+                raise NotFoundError(f"Campaign {campaign_id} not found")
+            
+            # Check ownership
+            if campaign.user_id != current_user.id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Not authorized to access this campaign"
+                )
+            
+            # Check if campaign was created from import
+            import_job_id = campaign.settings.get("import_job_id") if campaign.settings else None
+            if not import_job_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Campaign was not created from CSV import"
+                )
+        
+        async with get_repository_context(ImportJobRepository) as import_repo:
+            # Get import job status
+            import_job = await import_repo.get_by_id(import_job_id)
+            if not import_job:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Associated import job not found"
+                )
+            
+            return {
+                "campaign_id": campaign_id,
+                "import_job_id": import_job_id,
+                "import_status": import_job.status.value,
+                "progress_percentage": import_job.progress_percentage,
+                "rows_total": import_job.rows_total,
+                "rows_processed": import_job.rows_processed,
+                "error_count": import_job.error_count,
+                "has_errors": import_job.has_errors,
+                "created_from_csv": campaign.settings.get("created_from_csv", False),
+                "import_started_at": import_job.started_at.isoformat() if import_job.started_at else None,
+                "import_completed_at": import_job.completed_at.isoformat() if import_job.completed_at else None
+            }
+            
+    except NotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error getting campaign import status: {str(e)}"
+        )
+
+
+@router.get("/", response_model=PaginatedResponse[CampaignResponse])
+async def list_campaigns(
+    pagination: PaginationParams = Depends(),
+    status: Optional[str] = Query(None, description="Filter by campaign status"),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    List campaigns for the current user.
+    
+    Returns a paginated list of campaigns.
+    """
+    try:
+        # Use repository context for proper connection management
+        from app.db.repositories.campaigns import CampaignRepository
+        
+        async with get_repository_context(CampaignRepository) as campaign_repo:
+            # Get campaigns with pagination
+            campaigns, total = await campaign_repo.get_campaigns_for_user(
+                user_id=current_user.id,
+                status=status,
+                skip=pagination.skip,
+                limit=pagination.limit
+            )
+            
+            # Calculate pagination info
+            total_pages = (total + pagination.limit - 1) // pagination.limit
+            
+            # Return paginated response
+            return paginate_response(campaigns, total, pagination)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error listing campaigns: {str(e)}")
+
+
+@router.get("/{campaign_id}", response_model=CampaignResponse)
+async def get_campaign(
+   campaign_id: str = Path(..., description="Campaign ID"),
+   current_user: User = Depends(get_current_user),
+):
+   """
+   Get details of a specific campaign.
+   """
+   try:
+       from app.db.repositories.campaigns import CampaignRepository
+       
+       async with get_repository_context(CampaignRepository) as campaign_repo:
+           # Get campaign
+           campaign = await campaign_repo.get_by_id(campaign_id)
+           if not campaign:
+               raise NotFoundError(message=f"Campaign {campaign_id} not found")
+           
+           # Check authorization
+           if campaign.user_id != current_user.id:
+               raise HTTPException(status_code=403, detail="Not authorized to access this campaign")
+           
+           return campaign
+       
+   except NotFoundError as e:
+       raise HTTPException(status_code=404, detail=str(e))
+   except Exception as e:
+       raise HTTPException(status_code=500, detail=f"Error retrieving campaign: {str(e)}")
+
+
+@router.put("/{campaign_id}", response_model=CampaignResponse)
+async def update_campaign(
+   campaign_update: CampaignUpdate,
+   campaign_id: str = Path(..., description="Campaign ID"),
+   current_user: User = Depends(get_current_user),
+):
+   """
+   Update campaign details.
+   
+   Only draft campaigns can be fully updated. Active campaigns can only have their description updated.
+   """
+   try:
+       from app.db.repositories.campaigns import CampaignRepository
+       
+       async with get_repository_context(CampaignRepository) as campaign_repo:
+           # Get campaign
+           campaign = await campaign_repo.get_by_id(campaign_id)
+           if not campaign:
+               raise NotFoundError(message=f"Campaign {campaign_id} not found")
+           
+           # Check authorization
+           if campaign.user_id != current_user.id:
+               raise HTTPException(status_code=403, detail="Not authorized to update this campaign")
+           
+           # Check if campaign can be updated
+           if campaign.status != "draft" and any([
+               campaign_update.scheduled_start_at is not None,
+               campaign_update.scheduled_end_at is not None,
+               campaign_update.name is not None
+           ]):
+               raise HTTPException(
+                   status_code=400, 
+                   detail="Only draft campaigns can have name or schedule updated"
+               )
+           
+           # Convert to dict and remove None values
+           update_data = {k: v for k, v in campaign_update.dict().items() if v is not None}
+           
+           # Update campaign
+           updated = await campaign_repo.update(id=campaign_id, obj_in=update_data)
+           if not updated:
+               raise HTTPException(status_code=500, detail="Failed to update campaign")
+           
+           return updated
+       
+   except NotFoundError as e:
+       raise HTTPException(status_code=404, detail=str(e))
+   except Exception as e:
+       raise HTTPException(status_code=500, detail=f"Error updating campaign: {str(e)}")
+
+
+@router.post("/{campaign_id}/start", response_model=CampaignResponse)
+async def start_campaign(
+   campaign_id: str = Path(..., description="Campaign ID"),
+   current_user: User = Depends(get_current_user),
+   campaign_processor = Depends(get_campaign_processor),
+):
+   """
+   Start a campaign.
+   
+   This will change the campaign status to active and begin sending messages.
+   """
+   try:
+       # Start campaign - campaign_processor already uses context managers internally
+       success = await campaign_processor.start_campaign(
+           campaign_id=campaign_id,
+           user_id=current_user.id
+       )
+       
+       if not success:
+           raise HTTPException(status_code=400, detail="Failed to start campaign")
+       
+       # Get updated campaign - use context manager for this separate operation
+       from app.db.repositories.campaigns import CampaignRepository
+       
+       async with get_repository_context(CampaignRepository) as campaign_repo:
+           campaign = await campaign_repo.get_by_id(campaign_id)
+           return campaign
+       
+   except Exception as e:
+       raise HTTPException(status_code=500, detail=f"Error starting campaign: {str(e)}")
+
+
+@router.post("/{campaign_id}/pause", response_model=CampaignResponse)
+async def pause_campaign(
+   campaign_id: str = Path(..., description="Campaign ID"),
+   current_user: User = Depends(get_current_user),
+   campaign_processor = Depends(get_campaign_processor),
+):
+   """
+   Pause a campaign.
+   
+   This will change the campaign status to paused and stop sending messages.
+   The campaign can be resumed later.
+   """
+   try:
+       # Pause campaign - campaign_processor already uses context managers internally
+       success = await campaign_processor.pause_campaign(
+           campaign_id=campaign_id,
+           user_id=current_user.id
+       )
+       
+       if not success:
+           raise HTTPException(status_code=400, detail="Failed to pause campaign")
+       
+       # Get updated campaign - use context manager for this separate operation
+       from app.db.repositories.campaigns import CampaignRepository
+       
+       async with get_repository_context(CampaignRepository) as campaign_repo:
+           campaign = await campaign_repo.get_by_id(campaign_id)
+           return campaign
+       
+   except Exception as e:
+       raise HTTPException(status_code=500, detail=f"Error pausing campaign: {str(e)}")
+
+
+@router.post("/{campaign_id}/cancel", response_model=CampaignResponse)
+async def cancel_campaign(
+   campaign_id: str = Path(..., description="Campaign ID"),
+   current_user: User = Depends(get_current_user),
+   campaign_processor = Depends(get_campaign_processor),
+):
+   """
+   Cancel a campaign.
+   
+   This will change the campaign status to cancelled and stop sending messages.
+   The campaign cannot be resumed after cancellation.
+   """
+   try:
+       # Cancel campaign - campaign_processor already uses context managers internally
+       success = await campaign_processor.cancel_campaign(
+           campaign_id=campaign_id,
+           user_id=current_user.id
+       )
+       
+       if not success:
+           raise HTTPException(status_code=400, detail="Failed to cancel campaign")
+       
+       # Get updated campaign - use context manager for this separate operation
+       from app.db.repositories.campaigns import CampaignRepository
+       
+       async with get_repository_context(CampaignRepository) as campaign_repo:
+           campaign = await campaign_repo.get_by_id(campaign_id)
+           return campaign
+       
+   except Exception as e:
+       raise HTTPException(status_code=500, detail=f"Error cancelling campaign: {str(e)}")
+
+@router.post("/{campaign_id}/restart", response_model=CampaignResponse)
+async def restart_campaign(
+    campaign_id: str = Path(..., description="Campaign ID"),
+    current_user: User = Depends(get_current_user),
+    campaign_processor = Depends(get_campaign_processor),
+    rate_limiter = Depends(get_rate_limiter),
+):
+    """
+    Restart a campaign that is **paused** or **failed**.
+
+    • If the campaign is **paused**: simply call start.  
+    • If the campaign is **failed**: reset `status → paused` and clear `completed_at`,
+      then start.  
+    • Active, completed, or cancelled campaigns are rejected.
+
+    NOTE ─ Restarting a virtual-messaging campaign re-processes *all* contacts
+    that were **not** previously sent (because sent_count is respected inside the
+    stats update). If you paused midway, duplicates are avoided; if you failed
+    early, you get a clean second run.
+    """
+    # ➋ protect against hammering
+    await rate_limiter.check_rate_limit(current_user.id, "restart_campaign")
+
+    try:
+        # 1 Fetch campaign and verify ownership
+        async with get_repository_context(CampaignRepository) as campaign_repo:
+            campaign = await campaign_repo.get_by_id(campaign_id)
+            if not campaign:
+                raise HTTPException(status_code=404, detail="Campaign not found")
+            if campaign.user_id != current_user.id:
+                raise HTTPException(status_code=403, detail="Not authorized")
+
+            # 2 Check allowed states
+            if campaign.status not in ("paused", "failed"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Restart allowed only for paused/failed campaigns (current: {campaign.status})",
+                )
+
+            # 3 If previously failed, move to paused first
+            if campaign.status == "failed":
+                await campaign_repo.update_campaign_status(
+                    campaign_id=campaign_id,
+                    status="paused",
+                    completed_at=None,
+                )
+
+        # 4 Start the campaign (uses its own context managers)
+        started = await campaign_processor.start_campaign(
+            campaign_id=campaign_id,
+            user_id=current_user.id,
+        )
+        
+        if not started:
+            # Another worker is already processing → conflict
+            raise HTTPException(
+                status_code=409,
+                detail="Campaign is already being processed or could not be restarted",
+            )
+
+        # 5 Return fresh campaign data
+        async with get_repository_context(CampaignRepository) as campaign_repo:
+            return await campaign_repo.get_by_id(campaign_id)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error restarting campaign {campaign_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error restarting campaign: {str(e)}")
+
+
+@router.get("/{campaign_id}/messages", response_model=PaginatedResponse[MessageResponse])
+async def get_campaign_messages(
+   campaign_id: str = Path(..., description="Campaign ID"),
+   pagination: PaginationParams = Depends(),
+   status: Optional[str] = Query(None, description="Filter by message status"),
+   current_user: User = Depends(get_current_user),
+):
+   """
+   Get messages for a campaign.
+   
+   Returns a paginated list of messages for the specified campaign.
+   """
+   try:
+       # Use repository context for proper connection management
+       from app.db.repositories.campaigns import CampaignRepository
+       from app.db.repositories.messages import MessageRepository
+       
+       # First check if campaign exists and belongs to user
+       async with get_repository_context(CampaignRepository) as campaign_repo:
+           campaign = await campaign_repo.get_by_id(campaign_id)
+           
+           if not campaign:
+               raise NotFoundError(message=f"Campaign {campaign_id} not found")
+           
+           if campaign.user_id != current_user.id:
+               raise HTTPException(status_code=403, detail="Not authorized to access this campaign")
+       
+       # Get messages for campaign - in a separate context to avoid long transactions
+       async with get_repository_context(MessageRepository) as message_repo:
+           messages, total = await message_repo.get_messages_for_campaign(
+               campaign_id=campaign_id,
+               status=status,
+               skip=pagination.skip,
+               limit=pagination.limit
+           )
+
+           # Calculate proper pagination info
+           total_pages = (total + pagination.limit - 1) // pagination.limit
+
+           # Create proper PageInfo object
+           page_info = PageInfo(
+               current_page=pagination.page,
+               total_pages=total_pages,
+               page_size=pagination.limit,
+               total_items=total,
+               has_previous=pagination.page > 1,
+               has_next=pagination.page < total_pages
+           )
+           
+           # Return PaginatedResponse object
+           return PaginatedResponse(
+               items=messages,  # Direct Message objects - FastAPI will serialize them
+               page_info=page_info
+           )
+       
+   except NotFoundError as e:
+       raise HTTPException(status_code=404, detail=str(e))
+   except Exception as e:
+       raise HTTPException(status_code=500, detail=f"Error retrieving campaign messages: {str(e)}")
+
+
+@router.delete("/{campaign_id}", status_code=204)
+async def delete_campaign(
+   campaign_id: str = Path(..., description="Campaign ID"),
+   current_user: User = Depends(get_current_user),
+):
+   """
+   Delete a campaign.
+   
+   Only draft campaigns can be deleted. Active, paused, or completed campaigns cannot be deleted.
+   """
+   try:
+       from app.db.repositories.campaigns import CampaignRepository
+       
+       async with get_repository_context(CampaignRepository) as campaign_repo:
+           # Get campaign
+           campaign = await campaign_repo.get_by_id(campaign_id)
+           if not campaign:
+               raise NotFoundError(message=f"Campaign {campaign_id} not found")
+           
+           # Check authorization
+           if campaign.user_id != current_user.id:
+               raise HTTPException(status_code=403, detail="Not authorized to delete this campaign")
+           
+           # Check if campaign can be deleted
+           if campaign.status != "draft":
+               raise HTTPException(
+                   status_code=400, 
+                   detail="Only draft campaigns can be deleted"
+               )
+           
+           # Delete campaign
+           success = await campaign_repo.delete(id=campaign_id)
+           if not success:
+               raise HTTPException(status_code=500, detail="Failed to delete campaign")
+           
+           return JSONResponse(status_code=204, content=None)
+       
+   except NotFoundError as e:
+       raise HTTPException(status_code=404, detail=str(e))
+   except Exception as e:
+       raise HTTPException(status_code=500, detail=f"Error deleting campaign: {str(e)}")
+   
+
+@router.delete("/{campaign_id}/messages/bulk", response_model=BulkDeleteResponse)
+async def bulk_delete_campaign_messages(
+    request: CampaignBulkDeleteRequest,
+    campaign_id: str = Path(..., description="Campaign ID"),
+    current_user: User = Depends(get_current_user),
+    rate_limiter = Depends(get_rate_limiter),
+):
+    """
+    Bulk delete messages from a campaign with event safety and server stability.
+    
+    This endpoint efficiently deletes multiple messages belonging to a specific campaign
+    with optional filtering by status and date range. Enhanced with delivery event safety
+    checking and batched processing for high-volume operations handling 10K-30K messages.
+    
+    **Event Safety Features:**
+    - Pre-deletion check for delivery events
+    - Requires explicit confirmation to delete tracking data
+    - Clear warnings about data loss implications
+    - Two-phase deletion (events first, then messages)
+    
+    **Server Stability Features:**
+    - Batched processing prevents server overload
+    - Configurable batch sizes for different load scenarios
+    - Inter-batch delays prevent database lock contention
+    - Graceful handling of partial failures
+    
+    **Business Safety Features:**
+    - Campaign ownership validation
+    - User authorization checks  
+    - Active campaign protection
+    - Comprehensive audit logging
+    
+    **Performance:**
+    - Single SQL query per batch
+    - Optimized for large datasets
+    - 30K deletions in batches for stability
+    
+    **Business Use Cases:**
+    - Clean up failed messages from campaigns
+    - Remove test messages before campaign launch
+    - Compliance-driven message deletion (with event confirmation)
+    - Campaign optimization and cleanup
+    
+    Args:
+        campaign_id: ID of the campaign containing messages to delete
+        request: Bulk delete request with filters, confirmation, and force options
+        current_user: Authenticated user (injected by dependency)
+        rate_limiter: Rate limiting for bulk operations (injected by dependency)
+    
+    Returns:
+        BulkDeleteResponse: Detailed results including event safety information
+        
+    Raises:
+        HTTPException 400: Invalid request, campaign state, or missing confirmation
+        HTTPException 403: User not authorized for this campaign
+        HTTPException 404: Campaign not found
+        HTTPException 429: Rate limit exceeded
+        HTTPException 500: Database or internal server error
+    """
+    import time
+    
+    # Check rate limits for bulk operations
+    await rate_limiter.check_rate_limit(current_user.id, "bulk_delete_campaign")
+    
+    start_time = time.time()
+    
+    try:
+        # Use repository context for proper connection management
+        from app.db.repositories.campaigns import CampaignRepository
+        from app.db.repositories.messages import MessageRepository
+        
+        # First validate campaign exists and user has access
+        async with get_repository_context(CampaignRepository) as campaign_repo:
+            campaign = await campaign_repo.get_by_id(campaign_id)
+            
+            if not campaign:
+                raise NotFoundError(message=f"Campaign {campaign_id} not found")
+            
+            # Check authorization
+            if campaign.user_id != current_user.id:
+                raise HTTPException(
+                    status_code=403, 
+                    detail="Not authorized to delete messages from this campaign"
+                )
+            
+            # Safety check - prevent deletion from active campaigns unless force delete
+            if campaign.status == "active" and not request.force_delete:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Cannot bulk delete messages from active campaign. Pause the campaign first or use force_delete."
+                )
+        
+        # Perform bulk deletion with event safety
+        async with get_repository_context(MessageRepository) as message_repo:
+            # Convert datetime objects to ISO strings for repository method
+            from_date_str = request.from_date.isoformat() if request.from_date else None
+            to_date_str = request.to_date.isoformat() if request.to_date else None
+            
+            # Execute bulk deletion with enhanced safety
+            deleted_count, failed_message_ids, metadata = await message_repo.bulk_delete_campaign_messages(
+                campaign_id=campaign_id,
+                user_id=current_user.id,
+                status=request.status.value if request.status else None,
+                from_date=from_date_str,
+                to_date=to_date_str,
+                limit=request.limit,
+                force_delete=request.force_delete,
+                batch_size=request.batch_size
+            )
+            
+            # Calculate execution time
+            execution_time_ms = int((time.time() - start_time) * 1000)
+            
+            # Build applied filters for audit trail
+            filters_applied = {}
+            if request.status:
+                filters_applied["status"] = request.status.value
+            if request.from_date:
+                filters_applied["from_date"] = from_date_str
+            if request.to_date:
+                filters_applied["to_date"] = to_date_str
+            filters_applied["limit"] = request.limit
+            filters_applied["force_delete"] = request.force_delete
+            filters_applied["batch_size"] = request.batch_size
+            
+            # Build response with enhanced metadata
+            response = BulkDeleteResponse(
+                deleted_count=deleted_count,
+                campaign_id=campaign_id,
+                failed_count=len(failed_message_ids),
+                errors=[f"Failed to delete message: {msg_id}" for msg_id in failed_message_ids],
+                operation_type="campaign",
+                filters_applied=filters_applied,
+                execution_time_ms=execution_time_ms,
+                requires_confirmation=metadata.get("requires_confirmation", False),
+                events_count=metadata.get("events_count"),
+                events_deleted=metadata.get("events_deleted", 0),
+                safety_warnings=metadata.get("safety_warnings", []),
+                batch_info=metadata.get("batch_info")
+            )
+            
+            # Log successful operation for audit
+            logger.info(
+                f"User {current_user.id} bulk deleted {deleted_count} messages "
+                f"from campaign {campaign_id} in {execution_time_ms}ms "
+                f"with filters: {filters_applied}. Events deleted: {metadata.get('events_deleted', 0)}"
+            )
+            
+            return response
+            
+    except NotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
+    except Exception as e:
+        # Log error and return generic error message
+        logger.error(f"Error in bulk_delete_campaign_messages: {e}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Error performing bulk deletion: {str(e)}"
+        )
+    
+async def create_messages_from_contacts(
+    session,
+    campaign_id: str,
+    import_job_id: str,
+    message_template: str,
+    user_id: Optional[str] = None
+) -> int:
+    """
+    Create messages from imported contacts.
+    
+    **Phase 2A Pattern:** This function creates campaign messages from contacts
+    that were already imported via the /imports/upload pipeline.
+    """
+    try:
+        # Use proper repository classes
+        contact_repo = ContactRepository(session)
+        message_repo = MessageRepository(session)
+        
+        # Get all contacts from import
+        contacts, _ = await contact_repo.get_by_import_id(import_job_id, limit=10000)
+        
+        if not contacts:
+            logger.warning(f"No contacts found for import job {import_job_id}")
+            return 0
+        
+        # Get user_id from campaign if not provided
+        if not user_id:
+            from app.models.campaign import Campaign
+            from sqlalchemy import select
+            campaign_result = await session.execute(
+                select(Campaign.user_id).where(Campaign.id == campaign_id)
+            )
+            user_id = campaign_result.scalar()
+        
+        # Create messages with personalization
+        messages_created = 0
+        
+        for contact in contacts:
+            # Create personalized message using simple template substitution
+            personalized_message = message_template
+            
+            # Variable substitution
+            if contact.name:
+                personalized_message = personalized_message.replace("{{name}}", contact.name)
+                personalized_message = personalized_message.replace("{{contact_name}}", contact.name)
+            
+            personalized_message = personalized_message.replace("{{phone}}", contact.phone)
+            
+            # Create message using repository
+            await message_repo.create_message(
+                phone_number=contact.phone,
+                message_text=personalized_message,
+                user_id=user_id,
+                campaign_id=campaign_id,
+                metadata={
+                    "contact_name": contact.name,
+                    "import_job_id": import_job_id,
+                    "contact_tags": contact.tags or []
+                }
+            )
+            messages_created += 1
+        
+        logger.info(
+            f"Created {messages_created} messages from {len(contacts)} contacts "
+            f"for campaign {campaign_id}"
+        )
+        return messages_created
+        
+    except Exception as e:
+        logger.error(f"Error creating messages from contacts: {str(e)}")
+        raise
 </file>
 
 <file path="app/services/sms/sender.py">
@@ -35199,6 +35631,8 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
         """
         Create a new message with related objects in a single transaction.
         """
+
+        
         # Set initial status based on scheduling
         initial_status = MessageStatus.SCHEDULED if scheduled_at else MessageStatus.PENDING
         
@@ -35699,6 +36133,16 @@ class MessageRepository(BaseRepository[Message, MessageCreate, Dict[str, Any]]):
         
         return messages, total
     
+    async def count_messages_for_campaign(self, campaign_id: str) -> int:
+        """
+        Return an exact count of messages that belong to one campaign.
+        """
+        result = await self.session.execute(
+            select(func.count()).select_from(Message)
+            .where(Message.campaign_id == campaign_id)
+        )
+        return result.scalar_one()
+
     async def get_by_id(self, id: str) -> Optional[Message]:
         """
         Get a message by ID with eager loading of relationships.

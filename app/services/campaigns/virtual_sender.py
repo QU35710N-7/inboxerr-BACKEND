@@ -143,13 +143,28 @@ class VirtualCampaignSender:
             
             if not contacts:
                 logger.info(f"No more contacts for campaign {campaign_id}")
+                # ── Count the real number of messages once ───────────────────────────
+                async with get_repository_context(MessageRepository) as msg_repo:
+                    real_total = await msg_repo.count_messages_for_campaign(campaign_id)
+
                 # Mark campaign as completed
                 async with get_repository_context(CampaignRepository) as campaign_repo:
-                    await campaign_repo.update_campaign_status(
-                        campaign_id=campaign_id,
-                        status="completed",
-                        completed_at=datetime.now(timezone.utc)
-                    )
+                    # Re-read (FOR UPDATE) in case another worker finished first
+                    campaign = await campaign_repo.get_by_id(campaign_id)
+                    if campaign and campaign.status != "completed":
+                        await campaign_repo.update(
+                            id=campaign_id,
+                            obj_in={
+                                "status": "completed",
+                                "completed_at": datetime.now(timezone.utc),
+                                "total_messages": real_total
+                            }
+                        )
+                        logger.info(
+                            "Campaign %s completed · sent=%d · total_messages=%d",
+                            campaign_id, campaign.sent_count, real_total
+                        )
+
                 return
             
             # Generate and send virtual messages for this chunk
@@ -188,6 +203,13 @@ class VirtualCampaignSender:
         
         for contact in contacts:
             try:
+                
+                # DEDUPLICATION CHECK Check if already sent to this contact
+                already_sent = await self._check_already_sent(campaign_id, contact.phone)
+                if already_sent:
+                    logger.debug(f"Skipping {contact.phone} - already processed for campaign {campaign_id}")
+                    continue
+
                 # Generate virtual message
                 virtual_message = self._generate_virtual_message(
                     contact, template_content, campaign_id, user_id
@@ -265,6 +287,40 @@ class VirtualCampaignSender:
             user_id=user_id
         )
     
+
+    async def _check_already_sent(self, campaign_id: str, phone_number: str) -> bool:
+        """
+        Check if we've already sent a message to this phone number for this campaign.
+        
+        Industry standard: Idempotency check to prevent duplicate sends.
+        
+        Args:
+            campaign_id: Campaign ID
+            phone_number: Phone number to check
+            
+        Returns:
+            bool: True if already sent, False if safe to send
+        """
+        try:
+            async with get_repository_context(MessageRepository) as message_repo:
+                # Check if any message exists for this campaign + phone combination
+                # This covers SENT, FAILED, PENDING - any status means "already processed"
+                existing_message = await message_repo.get_message_by_campaign_and_phone(
+                    campaign_id=campaign_id,
+                    phone_number=phone_number
+                )
+                
+                if existing_message:
+                    logger.debug(f"Already sent to {phone_number} in campaign {campaign_id}")
+                    return True
+                    
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error checking duplicate send: {e}")
+            # On error, assume already sent to be safe (fail-safe approach)
+            return True
+    
     async def _create_message_record(
         self, 
         virtual_message: VirtualMessage, 
@@ -275,12 +331,12 @@ class VirtualCampaignSender:
         
         try:
             async with get_repository_context(MessageRepository) as message_repo:
-                await message_repo.create_message(
+                #insert – repo auto-sets PENDING/SCHEDULED
+                message = await message_repo.create_message(
                     phone_number=virtual_message.phone_number,
                     message_text=virtual_message.message_text,
                     user_id=virtual_message.user_id,
                     campaign_id=virtual_message.campaign_id,
-                    status=status,
                     custom_id=virtual_message.custom_id,
                     metadata={
                         "contact_name": virtual_message.contact_name,
@@ -289,6 +345,16 @@ class VirtualCampaignSender:
                         "send_result": send_result
                     }
                 )
+
+                # 2) bump status so dashboards are current
+                await message_repo.update_message_status(
+                    message_id=message.id,
+                    status=status,
+                    event_type="virtual_send",
+                    gateway_message_id=send_result.get("gateway_message_id"),
+                    data=send_result,
+                )
+
         except Exception as e:
             logger.error(f"Failed to create message record: {e}")
             # Don't fail the whole operation if record creation fails

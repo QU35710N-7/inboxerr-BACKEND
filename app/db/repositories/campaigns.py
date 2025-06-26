@@ -88,87 +88,86 @@ class CampaignRepository(BaseRepository[Campaign, Dict[str, Any], Dict[str, Any]
         Returns:
             Campaign: Updated campaign or None
         """
-        # Start a transaction
-        async with self.session.begin():
-            # Get campaign
-            campaign = await self.get_by_id(campaign_id)
-            if not campaign:
-                return None
+        #
+        # Get campaign
+        campaign = await self.get_by_id(campaign_id)
+        if not campaign:
+            return None
+        
+        old_status = campaign.status
+        campaign.status = status
+        
+        if started_at:
+            campaign.started_at = started_at
+        
+        if completed_at:
+            campaign.completed_at = completed_at
+        
+        # If status is active and no start time, set it now
+        if status == "active" and not campaign.started_at:
+            campaign.started_at = datetime.now(timezone.utc)
+        
+        # If status is completed and no completion time, set it now
+        if status in ["completed", "cancelled", "failed"] and not campaign.completed_at:
+            campaign.completed_at = datetime.now(timezone.utc)
+        
+        # Add campaign to session
+        self.session.add(campaign)
+        
+        # If transitioning from draft to active, also update any pending messages
+        # that are associated with this campaign
+        if old_status == "draft" and status == "active":
+            from app.models.message import Message
+            from app.schemas.message import MessageStatus
             
-            old_status = campaign.status
-            campaign.status = status
-            
-            if started_at:
-                campaign.started_at = started_at
-            
-            if completed_at:
-                campaign.completed_at = completed_at
-            
-            # If status is active and no start time, set it now
-            if status == "active" and not campaign.started_at:
-                campaign.started_at = datetime.now(timezone.utc)
-            
-            # If status is completed and no completion time, set it now
-            if status in ["completed", "cancelled", "failed"] and not campaign.completed_at:
-                campaign.completed_at = datetime.now(timezone.utc)
-            
-            # Add campaign to session
-            self.session.add(campaign)
-            
-            # If transitioning from draft to active, also update any pending messages
-            # that are associated with this campaign
-            if old_status == "draft" and status == "active":
-                from app.models.message import Message
-                from app.schemas.message import MessageStatus
-                
-                # Update messages
-                query = update(Message).where(
-                    and_(
-                        Message.campaign_id == campaign_id,
-                        Message.status == MessageStatus.PENDING,
-                        or_(
-                            Message.scheduled_at.is_(None),
-                            Message.scheduled_at <= datetime.now(timezone.utc)
-                        )
+            # Update messages
+            query = update(Message).where(
+                and_(
+                    Message.campaign_id == campaign_id,
+                    Message.status == MessageStatus.PENDING,
+                    or_(
+                        Message.scheduled_at.is_(None),
+                        Message.scheduled_at <= datetime.now(timezone.utc)
                     )
-                ).values(
-                    status=MessageStatus.PROCESSED
                 )
-                
-                await self.session.execute(query)
+            ).values(
+                status=MessageStatus.PROCESSED
+            )
             
-            # Publish event about status change
-            from app.services.event_bus.bus import get_event_bus
-            from app.services.event_bus.events import EventType
+            await self.session.execute(query)
+        
+        # Publish event about status change
+        from app.services.event_bus.bus import get_event_bus
+        from app.services.event_bus.events import EventType
+        
+        event_bus = get_event_bus()
+        event_type = None
+        
+        if status == "active":
+            event_type = EventType.CAMPAIGN_STARTED
+        elif status == "paused":
+            event_type = EventType.CAMPAIGN_PAUSED
+        elif status == "completed":
+            event_type = EventType.CAMPAIGN_COMPLETED
+        elif status == "cancelled":
+            event_type = EventType.CAMPAIGN_CANCELLED
+        elif status == "failed":
+            event_type = EventType.CAMPAIGN_FAILED
             
-            event_bus = get_event_bus()
-            event_type = None
-            
-            if status == "active":
-                event_type = EventType.CAMPAIGN_STARTED
-            elif status == "paused":
-                event_type = EventType.CAMPAIGN_PAUSED
-            elif status == "completed":
-                event_type = EventType.CAMPAIGN_COMPLETED
-            elif status == "cancelled":
-                event_type = EventType.CAMPAIGN_CANCELLED
-            elif status == "failed":
-                event_type = EventType.CAMPAIGN_FAILED
-                
-            if event_type:
-                await event_bus.publish(
-                    event_type,
-                    {
-                        "campaign_id": campaign_id,
-                        "previous_status": old_status,
-                        "new_status": status,
-                        "timestamp": datetime.now(timezone.utc).isoformat()
-                    }
-                )
-            
-            
-            
-            return campaign
+        if event_type:
+            await event_bus.publish(
+                event_type,
+                {
+                    "campaign_id": campaign_id,
+                    "previous_status": old_status,
+                    "new_status": status,
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                }
+            )
+        
+        
+        
+        return campaign
 
     async def update_campaign_stats(
         self,

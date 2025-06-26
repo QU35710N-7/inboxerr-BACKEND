@@ -1,4 +1,4 @@
-# scripts/create_admin.py
+# app/scripts/create_admin.py
 import asyncio
 import sys
 from pathlib import Path
@@ -6,7 +6,7 @@ from pathlib import Path
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
 
-from app.db.session import async_session_factory, initialize_database
+from app.db.session import get_repository_context, initialize_database
 from app.db.repositories.users import UserRepository
 from app.core.security import get_password_hash
 
@@ -16,15 +16,13 @@ async def create_admin_user():
     await initialize_database()
     
     # Use session properly with context manager
-    async with async_session_factory() as session:
-        # Create repository with session
-        user_repo = UserRepository(session)
-        
+    async with get_repository_context(UserRepository) as user_repo:
+
         # Check if admin exists
         admin = await user_repo.get_by_email("admin@inboxerr.com")
         
         if admin:
-            print("Admin user already exists")
+            print("✅ Admin user already exists (id:", admin.id, ")")
             return
         
         # Create admin user
@@ -39,9 +37,9 @@ async def create_admin_user():
             role="admin"
         )
         
-        print(f"Admin user created with ID: {admin.id}")
-        print(f"Email: admin@inboxerr.com")
-        print(f"Password: {password}")
+    print(f"Admin user created with ID: {admin.id}")
+    print(f"Email: admin@inboxerr.com")
+    print(f"Password: {password}")
 
 if __name__ == "__main__":
     asyncio.run(create_admin_user())

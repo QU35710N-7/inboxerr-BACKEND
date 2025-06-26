@@ -426,3 +426,34 @@ class ContactRepository(BaseRepository[Contact, ContactCreate, ContactUpdate]):
         
         logger.info(f"Cleaned up {deleted_count} orphaned contacts")
         return deleted_count
+    
+
+
+
+    async def get_processable_contacts_count(self, import_id: str) -> int:
+        """
+        Get count of contacts that can actually be processed for virtual campaigns.
+        
+        This method applies the same filtering logic as the virtual sender to ensure
+        accurate campaign total_messages count. Excludes duplicates and invalid data.
+        
+        Args:
+            import_id: Import job ID
+            
+        Returns:
+            int: Number of processable contacts (matches virtual sender logic)
+        """
+        # Use same logic as virtual sender - get unique, valid contacts
+        query = select(func.count(func.distinct(Contact.phone))).where(
+            and_(
+                Contact.import_id == import_id,
+                Contact.phone.isnot(None),  # Exclude null phones
+                Contact.phone != "",        # Exclude empty phones
+            )
+        )
+        
+        result = await self.session.execute(query)
+        processable_count = result.scalar() or 0
+        
+        logger.info(f"Import {import_id}: {processable_count} processable contacts")
+        return processable_count

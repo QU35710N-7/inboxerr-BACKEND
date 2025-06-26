@@ -4,7 +4,7 @@ Database models for SMS messages.
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
 
-from sqlalchemy import Column, String, DateTime, Boolean, JSON, Integer, ForeignKey, Text
+from sqlalchemy import Column, String, DateTime, Boolean, JSON, Integer, ForeignKey, Text, UniqueConstraint
 from sqlalchemy.orm import relationship
 
 from app.models.base import Base
@@ -49,6 +49,12 @@ class Message(Base):
     batch_id = Column(String, ForeignKey("messagebatch.id"), nullable=True, index=True)
     batch = relationship("MessageBatch", back_populates="messages")
     import_job = relationship("ImportJob")  # NEW: Reference to import job
+
+
+    # Constraints - prevent duplicate sends per campaign
+    __table_args__ = (
+        UniqueConstraint('campaign_id', 'phone_number', name='uix_campaign_phone'),
+    )
 
 
 
