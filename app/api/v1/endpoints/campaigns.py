@@ -348,7 +348,7 @@ async def update_campaign(
        raise HTTPException(status_code=500, detail=f"Error updating campaign: {str(e)}")
 
 
-@router.post("/{campaign_id}/start", response_model=CampaignResponse)
+@router.post("/{campaign_id}/start", status_code=status.HTTP_202_ACCEPTED)
 async def start_campaign(
    campaign_id: str = Path(..., description="Campaign ID"),
    current_user: User = Depends(get_current_user),
@@ -358,6 +358,7 @@ async def start_campaign(
    Start a campaign.
    
    This will change the campaign status to active and begin sending messages.
+   Returns 202 immediately while processing continues in background.
    """
    try:
        # Start campaign - campaign_processor already uses context managers internally
@@ -369,18 +370,18 @@ async def start_campaign(
        if not success:
            raise HTTPException(status_code=400, detail="Failed to start campaign")
        
-       # Get updated campaign - use context manager for this separate operation
-       from app.db.repositories.campaigns import CampaignRepository
-       
-       async with get_repository_context(CampaignRepository) as campaign_repo:
-           campaign = await campaign_repo.get_by_id(campaign_id)
-           return campaign
+       # Return 202 immediately - don't wait for status update
+       return {
+           "status": "accepted",
+           "message": "Campaign start initiated",
+           "campaign_id": campaign_id,
+           "processing": True
+       }
        
    except Exception as e:
        raise HTTPException(status_code=500, detail=f"Error starting campaign: {str(e)}")
 
-
-@router.post("/{campaign_id}/pause", response_model=CampaignResponse)
+@router.post("/{campaign_id}/pause", status_code=status.HTTP_202_ACCEPTED)
 async def pause_campaign(
    campaign_id: str = Path(..., description="Campaign ID"),
    current_user: User = Depends(get_current_user),
@@ -390,7 +391,7 @@ async def pause_campaign(
    Pause a campaign.
    
    This will change the campaign status to paused and stop sending messages.
-   The campaign can be resumed later.
+   The campaign can be resumed later. Returns 202 immediately.
    """
    try:
        # Pause campaign - campaign_processor already uses context managers internally
@@ -402,18 +403,18 @@ async def pause_campaign(
        if not success:
            raise HTTPException(status_code=400, detail="Failed to pause campaign")
        
-       # Get updated campaign - use context manager for this separate operation
-       from app.db.repositories.campaigns import CampaignRepository
-       
-       async with get_repository_context(CampaignRepository) as campaign_repo:
-           campaign = await campaign_repo.get_by_id(campaign_id)
-           return campaign
+       # Return 202 immediately - don't wait for status update
+       return {
+           "status": "accepted",
+           "message": "Campaign pause initiated",
+           "campaign_id": campaign_id,
+           "processing": True
+       }
        
    except Exception as e:
        raise HTTPException(status_code=500, detail=f"Error pausing campaign: {str(e)}")
 
-
-@router.post("/{campaign_id}/cancel", response_model=CampaignResponse)
+@router.post("/{campaign_id}/cancel", status_code=status.HTTP_202_ACCEPTED)
 async def cancel_campaign(
    campaign_id: str = Path(..., description="Campaign ID"),
    current_user: User = Depends(get_current_user),
@@ -423,7 +424,7 @@ async def cancel_campaign(
    Cancel a campaign.
    
    This will change the campaign status to cancelled and stop sending messages.
-   The campaign cannot be resumed after cancellation.
+   The campaign cannot be resumed after cancellation. Returns 202 immediately.
    """
    try:
        # Cancel campaign - campaign_processor already uses context managers internally
@@ -435,17 +436,18 @@ async def cancel_campaign(
        if not success:
            raise HTTPException(status_code=400, detail="Failed to cancel campaign")
        
-       # Get updated campaign - use context manager for this separate operation
-       from app.db.repositories.campaigns import CampaignRepository
-       
-       async with get_repository_context(CampaignRepository) as campaign_repo:
-           campaign = await campaign_repo.get_by_id(campaign_id)
-           return campaign
+       # Return 202 immediately - don't wait for status update
+       return {
+           "status": "accepted",
+           "message": "Campaign cancellation initiated",
+           "campaign_id": campaign_id,
+           "processing": True
+       }
        
    except Exception as e:
        raise HTTPException(status_code=500, detail=f"Error cancelling campaign: {str(e)}")
 
-@router.post("/{campaign_id}/restart", response_model=CampaignResponse)
+@router.post("/{campaign_id}/restart", status_code=status.HTTP_202_ACCEPTED)
 async def restart_campaign(
     campaign_id: str = Path(..., description="Campaign ID"),
     current_user: User = Depends(get_current_user),
@@ -464,12 +466,14 @@ async def restart_campaign(
     that were **not** previously sent (because sent_count is respected inside the
     stats update). If you paused midway, duplicates are avoided; if you failed
     early, you get a clean second run.
+    
+    Returns 202 immediately while processing continues in background.
     """
-    # ➋ protect against hammering
+    # Protect against hammering
     await rate_limiter.check_rate_limit(current_user.id, "restart_campaign")
 
     try:
-        # 1 Fetch campaign and verify ownership
+        # 1. Fetch campaign and verify ownership
         async with get_repository_context(CampaignRepository) as campaign_repo:
             campaign = await campaign_repo.get_by_id(campaign_id)
             if not campaign:
@@ -477,14 +481,14 @@ async def restart_campaign(
             if campaign.user_id != current_user.id:
                 raise HTTPException(status_code=403, detail="Not authorized")
 
-            # 2 Check allowed states
+            # 2. Check allowed states
             if campaign.status not in ("paused", "failed"):
                 raise HTTPException(
                     status_code=400,
                     detail=f"Restart allowed only for paused/failed campaigns (current: {campaign.status})",
                 )
 
-            # 3 If previously failed, move to paused first
+            # 3. If previously failed, move to paused first
             if campaign.status == "failed":
                 await campaign_repo.update_campaign_status(
                     campaign_id=campaign_id,
@@ -492,7 +496,7 @@ async def restart_campaign(
                     completed_at=None,
                 )
 
-        # 4 Start the campaign (uses its own context managers)
+        # 4. Start the campaign (uses its own context managers)
         started = await campaign_processor.start_campaign(
             campaign_id=campaign_id,
             user_id=current_user.id,
@@ -505,9 +509,13 @@ async def restart_campaign(
                 detail="Campaign is already being processed or could not be restarted",
             )
 
-        # 5 Return fresh campaign data
-        async with get_repository_context(CampaignRepository) as campaign_repo:
-            return await campaign_repo.get_by_id(campaign_id)
+        # 5. Return 202 immediately - don't wait for status update
+        return {
+            "status": "accepted",
+            "message": "Campaign restart initiated",
+            "campaign_id": campaign_id,
+            "processing": True
+        }
 
     except HTTPException:
         raise

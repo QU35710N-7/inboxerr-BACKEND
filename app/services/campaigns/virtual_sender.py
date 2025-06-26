@@ -1,10 +1,10 @@
 # app/services/campaigns/virtual_sender.py
 import asyncio
 import logging
-from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional, AsyncGenerator
+from datetime import datetime, timezone, timedelta
+from typing import List, Dict, Any, Optional
 import uuid
-import re
+from enum import Enum
 
 from app.core.config import settings
 from app.db.repositories.campaigns import CampaignRepository
@@ -18,6 +18,58 @@ from app.services.sms.sender import SMSSender, get_sms_sender
 from app.db.session import get_repository_context
 
 logger = logging.getLogger("inboxerr.virtual_sender")
+
+class CircuitBreakerState(Enum):
+    """Circuit breaker states."""
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+class CircuitBreaker:
+    """Simple circuit breaker for SMS gateway protection."""
+    
+    def __init__(self, failure_threshold: int = 5, timeout: int = 60):
+        self.failure_threshold = failure_threshold
+        self.timeout = timeout
+        self.failure_count = 0
+        self.last_failure_time = None
+        self.state = CircuitBreakerState.CLOSED
+        
+    async def call(self, func, *args, **kwargs):
+        """Execute function with circuit breaker protection."""
+        if self.state == CircuitBreakerState.OPEN:
+            if self._should_attempt_reset():
+                self.state = CircuitBreakerState.HALF_OPEN
+                logger.info("Circuit breaker: Testing recovery (HALF_OPEN)")
+            else:
+                raise Exception("Circuit breaker OPEN - SMS gateway unavailable")
+        
+        try:
+            result = await func(*args, **kwargs)
+            self._on_success()
+            return result
+        except Exception as e:
+            self._on_failure()
+            raise e
+    
+    def _should_attempt_reset(self) -> bool:
+        if self.last_failure_time is None:
+            return True
+        return datetime.now() - self.last_failure_time >= timedelta(seconds=self.timeout)
+    
+    def _on_success(self):
+        self.failure_count = 0
+        if self.state == CircuitBreakerState.HALF_OPEN:
+            self.state = CircuitBreakerState.CLOSED
+            logger.info("Circuit breaker: Reset to CLOSED")
+    
+    def _on_failure(self):
+        self.failure_count += 1
+        self.last_failure_time = datetime.now()
+        
+        if self.failure_count >= self.failure_threshold:
+            self.state = CircuitBreakerState.OPEN
+            logger.error(f"Circuit breaker OPENED after {self.failure_count} failures")
 
 class VirtualMessage:
     """Virtual message object for on-demand generation."""
@@ -41,29 +93,45 @@ class VirtualMessage:
 
 class VirtualCampaignSender:
     """
-    Service for sending campaigns using virtual messaging approach.
+    Focused virtual campaign sender - generates and sends messages.
     
-    Generates messages on-demand from templates and contacts without
-    pre-creating message records in the database.
+    Responsibilities:
+    - Generate messages from templates and contacts
+    - Send via SMS gateway with rate limiting
+    - Circuit breaker protection
+    - Create tracking records
+    
+    NOT responsible for:
+    - Retries (handled by dedicated retry engine)
+    - Complex error recovery
+    - Queue management
     """
     
     def __init__(self, sms_sender: SMSSender, event_bus: Any):
         """Initialize with SMS sender and event bus."""
         self.sms_sender = sms_sender
         self.event_bus = event_bus
+        
+        # Production settings
         self._chunk_size = settings.BATCH_SIZE or 100
+        self._micro_batch_size = getattr(settings, 'VIRTUAL_SENDER_MICRO_BATCH_SIZE', 10)
+        self._max_concurrent = getattr(settings, 'VIRTUAL_SENDER_MAX_CONCURRENT', 2)
+        self._rate_limit_delay = getattr(settings, 'VIRTUAL_SENDER_RATE_LIMIT_DELAY', 0.2)
+        
+        # Concurrency controls
         self._semaphore = asyncio.Semaphore(5)
+        self._send_semaphore = asyncio.Semaphore(self._max_concurrent)
+        
+        # Circuit breaker for gateway protection
+        self._circuit_breaker = CircuitBreaker(
+            failure_threshold=getattr(settings, 'VIRTUAL_SENDER_CIRCUIT_BREAKER_THRESHOLD', 5),
+            timeout=getattr(settings, 'VIRTUAL_SENDER_CIRCUIT_BREAKER_TIMEOUT', 60)
+        )
+        
+        logger.info(f"VirtualCampaignSender: concurrent={self._max_concurrent}, micro_batch={self._micro_batch_size}")
     
     async def process_virtual_campaign(self, campaign_id: str) -> bool:
-        """
-        Process a virtual campaign by generating messages on-demand.
-        
-        Args:
-            campaign_id: Campaign ID
-            
-        Returns:
-            bool: True if processing started successfully
-        """
+        """Process a virtual campaign by generating messages on-demand."""
         try:
             # Get campaign details
             async with get_repository_context(CampaignRepository) as campaign_repo:
@@ -71,10 +139,9 @@ class VirtualCampaignSender:
                 if not campaign or campaign.status != "active":
                     return False
                 
-                # Check if this is a virtual campaign
                 is_virtual = campaign.settings.get("virtual_messaging", False)
                 if not is_virtual:
-                    logger.warning(f"Campaign {campaign_id} is not a virtual campaign")
+                    logger.warning(f"Campaign {campaign_id} is not virtual")
                     return False
                 
                 import_job_id = campaign.settings.get("import_job_id")
@@ -82,7 +149,7 @@ class VirtualCampaignSender:
                     logger.error(f"Campaign {campaign_id} missing import_job_id")
                     return False
             
-            # Process in chunks with semaphore
+            # Process with semaphore
             async with self._semaphore:
                 await self._process_virtual_campaign_chunks(
                     campaign_id, import_job_id, campaign.template_id, campaign.user_id
@@ -92,7 +159,7 @@ class VirtualCampaignSender:
             
         except Exception as e:
             logger.error(f"Error processing virtual campaign {campaign_id}: {e}", exc_info=True)
-            # Update campaign status to failed
+            # Mark as failed - retry engine will handle recovery
             try:
                 async with get_repository_context(CampaignRepository) as campaign_repo:
                     await campaign_repo.update_campaign_status(
@@ -121,10 +188,7 @@ class VirtualCampaignSender:
                 raise ValueError(f"Template {template_id} not found")
             template_content = template.content
         
-        # Process contacts in chunks
         offset = 0
-        total_sent = 0
-        total_failed = 0
         
         while True:
             # Check if campaign is still active
@@ -142,14 +206,11 @@ class VirtualCampaignSender:
                 )
             
             if not contacts:
-                logger.info(f"No more contacts for campaign {campaign_id}")
-                # ── Count the real number of messages once ───────────────────────────
+                # Mark campaign as completed
                 async with get_repository_context(MessageRepository) as msg_repo:
                     real_total = await msg_repo.count_messages_for_campaign(campaign_id)
 
-                # Mark campaign as completed
                 async with get_repository_context(CampaignRepository) as campaign_repo:
-                    # Re-read (FOR UPDATE) in case another worker finished first
                     campaign = await campaign_repo.get_by_id(campaign_id)
                     if campaign and campaign.status != "completed":
                         await campaign_repo.update(
@@ -160,20 +221,13 @@ class VirtualCampaignSender:
                                 "total_messages": real_total
                             }
                         )
-                        logger.info(
-                            "Campaign %s completed · sent=%d · total_messages=%d",
-                            campaign_id, campaign.sent_count, real_total
-                        )
-
+                        logger.info(f"Campaign {campaign_id} completed: {real_total} total messages")
                 return
             
-            # Generate and send virtual messages for this chunk
+            # Process chunk with micro-batching
             chunk_sent, chunk_failed = await self._process_contact_chunk(
                 contacts, template_content, campaign_id, user_id
             )
-            
-            total_sent += chunk_sent
-            total_failed += chunk_failed
             
             # Update campaign statistics
             async with get_repository_context(CampaignRepository) as campaign_repo:
@@ -183,11 +237,8 @@ class VirtualCampaignSender:
                     increment_failed=chunk_failed
                 )
             
-            # Move to next chunk
             offset += len(contacts)
-            
-            # Small delay between chunks
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.5)  # Breathing room between chunks
     
     async def _process_contact_chunk(
         self, 
@@ -196,46 +247,81 @@ class VirtualCampaignSender:
         campaign_id: str,
         user_id: str
     ) -> tuple[int, int]:
-        """Process a chunk of contacts and send virtual messages."""
+        """Process contacts in memory-efficient micro-batches."""
         
-        sent_count = 0
-        failed_count = 0
+        total_sent = 0
+        total_failed = 0
         
-        for contact in contacts:
+        # Process in micro-batches to limit memory and DB connections
+        for i in range(0, len(contacts), self._micro_batch_size):
+            micro_batch = contacts[i:i + self._micro_batch_size]
+            
+            # Create parallel tasks for micro-batch
+            tasks = []
+            for contact in micro_batch:
+                task = asyncio.create_task(
+                    self._process_single_contact(contact, template_content, campaign_id, user_id)
+                )
+                tasks.append(task)
+            
+            # Wait for all tasks with error isolation
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Count results
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    logger.error(f"Contact {micro_batch[i].phone} failed: {result}")
+                    total_failed += 1
+                elif result == "sent":
+                    total_sent += 1
+                elif result == "failed":
+                    total_failed += 1
+                # "skipped" doesn't count as failure
+            
+            # Small delay between micro-batches
+            await asyncio.sleep(0.1)
+        
+        return total_sent, total_failed
+    
+    async def _process_single_contact(
+        self,
+        contact: Any,
+        template_content: str,
+        campaign_id: str,
+        user_id: str
+    ) -> str:
+        """Process single contact - send once, let retry engine handle failures."""
+        
+        async with self._send_semaphore:  # Rate limiting
             try:
-                
-                # DEDUPLICATION CHECK Check if already sent to this contact
+                # Check for duplicates
                 already_sent = await self._check_already_sent(campaign_id, contact.phone)
                 if already_sent:
-                    logger.debug(f"Skipping {contact.phone} - already processed for campaign {campaign_id}")
-                    continue
+                    return "skipped"
 
-                # Generate virtual message
+                # Generate message
                 virtual_message = self._generate_virtual_message(
                     contact, template_content, campaign_id, user_id
                 )
                 
-                # Send message using SMS sender
-                result = await self.sms_sender._send_to_gateway(
+                # Send with circuit breaker protection
+                result = await self._circuit_breaker.call(
+                    self.sms_sender._send_to_gateway,
                     phone_number=virtual_message.phone_number,
                     message_text=virtual_message.message_text,
                     custom_id=virtual_message.custom_id
                 )
                 
-                # Create message record after successful send
-                await self._create_message_record(
-                    virtual_message, result, MessageStatus.SENT
-                )
+                # Create success record
+                await self._create_message_record(virtual_message, result, MessageStatus.SENT)
                 
-                sent_count += 1
+                # Rate limiting
+                await asyncio.sleep(self._rate_limit_delay)
                 
-                # Delay between messages
-                await asyncio.sleep(settings.DELAY_BETWEEN_SMS)
+                return "sent"
                 
             except Exception as e:
-                logger.error(f"Error sending virtual message to {contact.phone}: {e}")
-                
-                # Create failed message record
+                # Create failed record - retry engine will handle retry
                 try:
                     virtual_message = self._generate_virtual_message(
                         contact, template_content, campaign_id, user_id
@@ -244,12 +330,9 @@ class VirtualCampaignSender:
                         virtual_message, {"error": str(e)}, MessageStatus.FAILED
                     )
                 except Exception as record_error:
-                    logger.error(f"Failed to create failed message record: {record_error}")
+                    logger.error(f"Failed to create failed record: {record_error}")
                 
-                failed_count += 1
-        
-        logger.info(f"Processed chunk: {sent_count} sent, {failed_count} failed")
-        return sent_count, failed_count
+                return "failed"
     
     def _generate_virtual_message(
         self, 
@@ -258,19 +341,18 @@ class VirtualCampaignSender:
         campaign_id: str,
         user_id: str
     ) -> VirtualMessage:
-        """Generate a virtual message from contact and template."""
+        """Generate virtual message from contact and template."""
         
-        # Perform template substitution
         personalized_message = template_content
         
-        # Replace variables
+        # Simple template substitution
         if contact.name:
             personalized_message = personalized_message.replace("{{name}}", contact.name)
             personalized_message = personalized_message.replace("{{contact_name}}", contact.name)
         
         personalized_message = personalized_message.replace("{{phone}}", contact.phone)
         
-        # Additional contact data substitution if available
+        # Additional custom fields if available
         if hasattr(contact, 'custom_fields') and contact.custom_fields:
             for key, value in contact.custom_fields.items():
                 personalized_message = personalized_message.replace(f"{{{{{key}}}}}", str(value))
@@ -279,47 +361,23 @@ class VirtualCampaignSender:
             phone_number=contact.phone,
             message_text=personalized_message,
             contact_name=contact.name,
-            contact_data={
-                "name": contact.name,
-                "tags": contact.tags or []
-            },
+            contact_data={"name": contact.name, "tags": contact.tags or []},
             campaign_id=campaign_id,
             user_id=user_id
         )
     
-
     async def _check_already_sent(self, campaign_id: str, phone_number: str) -> bool:
-        """
-        Check if we've already sent a message to this phone number for this campaign.
-        
-        Industry standard: Idempotency check to prevent duplicate sends.
-        
-        Args:
-            campaign_id: Campaign ID
-            phone_number: Phone number to check
-            
-        Returns:
-            bool: True if already sent, False if safe to send
-        """
+        """Check for duplicate sends."""
         try:
             async with get_repository_context(MessageRepository) as message_repo:
-                # Check if any message exists for this campaign + phone combination
-                # This covers SENT, FAILED, PENDING - any status means "already processed"
                 existing_message = await message_repo.get_message_by_campaign_and_phone(
-                    campaign_id=campaign_id,
-                    phone_number=phone_number
+                    campaign_id=campaign_id, phone_number=phone_number
                 )
-                
-                if existing_message:
-                    logger.debug(f"Already sent to {phone_number} in campaign {campaign_id}")
-                    return True
-                    
-                return False
+                return existing_message is not None
                 
         except Exception as e:
-            logger.error(f"Error checking duplicate send: {e}")
-            # On error, assume already sent to be safe (fail-safe approach)
-            return True
+            logger.error(f"Error checking duplicate: {e}")
+            return True  # Fail-safe: assume already sent
     
     async def _create_message_record(
         self, 
@@ -327,11 +385,10 @@ class VirtualCampaignSender:
         send_result: Dict[str, Any],
         status: MessageStatus
     ) -> None:
-        """Create message record after sending (for tracking/analytics)."""
+        """Create message record for tracking."""
         
         try:
             async with get_repository_context(MessageRepository) as message_repo:
-                #insert – repo auto-sets PENDING/SCHEDULED
                 message = await message_repo.create_message(
                     phone_number=virtual_message.phone_number,
                     message_text=virtual_message.message_text,
@@ -346,7 +403,6 @@ class VirtualCampaignSender:
                     }
                 )
 
-                # 2) bump status so dashboards are current
                 await message_repo.update_message_status(
                     message_id=message.id,
                     status=status,
@@ -357,7 +413,6 @@ class VirtualCampaignSender:
 
         except Exception as e:
             logger.error(f"Failed to create message record: {e}")
-            # Don't fail the whole operation if record creation fails
 
 # Dependency injection
 async def get_virtual_campaign_sender() -> VirtualCampaignSender:

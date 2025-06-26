@@ -51,6 +51,16 @@ class Settings(BaseSettings):
     RETRY_ENABLED: bool = False
     RETRY_MAX_ATTEMPTS: int = 3
     RETRY_INTERVAL_SECONDS: int = 60
+
+
+    # Virtual Campaign Sender Settings (Production Optimized)
+    VIRTUAL_SENDER_MAX_CONCURRENT: int = 2  # Conservative for production
+    VIRTUAL_SENDER_MICRO_BATCH_SIZE: int = 10  # Process 10 contacts at a time
+    VIRTUAL_SENDER_RATE_LIMIT_DELAY: float = 0.2  # Delay between sends
+    VIRTUAL_SENDER_CIRCUIT_BREAKER_THRESHOLD: int = 5  # Failures before opening circuit
+    VIRTUAL_SENDER_CIRCUIT_BREAKER_TIMEOUT: int = 60  # Seconds before retry
+    VIRTUAL_SENDER_MAX_RETRIES: int = 3  # Max retries per contact
+    VIRTUAL_SENDER_DB_POOL_LIMIT: int = 20  # Max DB connections for virtual sender
     
     # Metrics
     METRICS_ENABLED: bool = True

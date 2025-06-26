@@ -967,7 +967,7 @@ class SMSSender:
         # Check if gateway client is available or mock mode enabled
         if not SMS_GATEWAY_AVAILABLE or getattr(settings, "SMS_GATEWAY_MOCK", False):
             # Simulate sending for development/testing
-            logger.info(f"[MOCK] Sending SMS to {phone_number}: {message_text[:30]}...")
+            logger.debug(f"[MOCK] Sending SMS to {phone_number}: {message_text[:30]}...")
             # Fast simulation for high volume
             await asyncio.sleep(0.05)
             
